@@ -177,7 +177,7 @@ class ImageConveyor:
         }
 
     @classmethod
-    def IS_CHANGED(cls, state_json: Any, ui_state_json: Any, queue_item_json: Any):
+    def IS_CHANGED(cls, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
         del ui_state_json
         state = _normalize_state(state_json)
         if not state["items"]:
@@ -195,7 +195,7 @@ class ImageConveyor:
         return hasher.hexdigest()
 
     @classmethod
-    def VALIDATE_INPUTS(cls, state_json: Any, ui_state_json: Any, queue_item_json: Any):
+    def VALIDATE_INPUTS(cls, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
         del ui_state_json
         state = _normalize_state(state_json)
         if not state["items"]:
@@ -211,7 +211,7 @@ class ImageConveyor:
 
         return True
 
-    def load_next(self, state_json: Any, ui_state_json: Any, queue_item_json: Any):
+    def load_next(self, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
         del ui_state_json
         state = _normalize_state(state_json)
         index, item = _select_item(state, queue_item_json)
@@ -249,8 +249,10 @@ class ImageConveyor:
 
 NODE_CLASS_MAPPINGS = {
     "ImageConveyor": ImageConveyor,
+    "SequentialBatchImageLoader": ImageConveyor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "ImageConveyor": "Image Conveyor",
     "SequentialBatchImageLoader": "Image Conveyor",
 }

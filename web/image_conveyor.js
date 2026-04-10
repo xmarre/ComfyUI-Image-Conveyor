@@ -917,12 +917,10 @@ function initializeNode(node, widget) {
 
   uiStateWidget.hidden = true
   uiStateWidget.options.hidden = true
-  uiStateWidget.options.serialize = false
   uiStateWidget.serialize = false
 
   queueWidget.hidden = true
   queueWidget.options.hidden = true
-  queueWidget.options.serialize = false
   queueWidget.serialize = false
 
   const oldSize = node.size || [420, 700]
