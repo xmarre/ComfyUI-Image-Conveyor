@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Test and type checker caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# JavaScript
+node_modules/
+
+# Editors and local tooling
+.codex
+.vs/
+v17/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
