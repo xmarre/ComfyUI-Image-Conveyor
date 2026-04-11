@@ -1,0 +1,18 @@
+[project]
+name = "image-conveyor"
+description = "A sequential drag-and-drop image queue node for ComfyUI."
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = []
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/xmarre/ComfyUI-Image-Conveyor"
+Documentation = "https://github.com/xmarre/ComfyUI-Image-Conveyor#readme"
+"Bug Tracker" = "https://github.com/xmarre/ComfyUI-Image-Conveyor/issues"
+
+[tool.comfy]
+PublisherId = "xmarre"
+DisplayName = "ComfyUI-Image-Conveyor"
