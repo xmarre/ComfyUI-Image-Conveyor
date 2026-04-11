@@ -7,7 +7,7 @@ A sequential drag-and-drop image queue node for ComfyUI.
 - Drag and drop any number of images into the node
 - Shows the queued images directly in the node UI with thumbnails
 - Processes one image per prompt execution in queue order
-- If you queue 4 prompt runs, the next 4 pending images are reserved and then processed sequentially
+- If you queue multiple prompt runs, the next pending images are reserved and then processed sequentially
 - Marks processed images automatically when the loader node executes successfully
 - Lets you manually reset items to pending, force them to processed, delete them, reorder them, and sort them
 
@@ -16,6 +16,7 @@ A sequential drag-and-drop image queue node for ComfyUI.
 This package is **VueNodes-compatible** with the ComfyUI frontend.
 
 Implementation detail:
+
 - it uses the frontend's supported **custom widget + DOMWidget** path
 - in VueNodes mode, the frontend renders that widget through its Vue-side `WidgetDOM` bridge
 
@@ -50,11 +51,14 @@ So this is not a compiled custom `.vue` SFC shipped from the extension, but it i
 
 ## Installation
 
-Copy this folder into `ComfyUI/custom_nodes/` and restart ComfyUI.
+### Option 1: ComfyUI-Manager
 
-## Notes
+Install **ComfyUI Image Conveyor** through **ComfyUI-Manager**, then restart ComfyUI.
 
-- Uploaded files are stored under `input/image_conveyor/`.
-- Deleting an item from the node does **not** delete the file from disk.
-- If a prompt reserves an image but fails before this loader node executes, that item can remain `queued`. Use **Clear queued** to release those reservations.
-- Empty MIME drag/drop is handled by extension fallback, so common image extensions still upload correctly.
+### Option 2: Manual install
+
+Clone this repository into `ComfyUI/custom_nodes/`:
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/xmarre/ComfyUI-Image-Conveyor.git
