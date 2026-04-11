@@ -1021,7 +1021,7 @@ function buildDom(node) {
 
   const dropzone = document.createElement('div')
   dropzone.className = 'bil-dropzone'
-  dropzone.textContent = 'Click or drop images or folders'
+  dropzone.textContent = 'Click to add images, or drop images/folders'
 
   const fileInput = document.createElement('input')
   fileInput.type = 'file'
@@ -1169,7 +1169,7 @@ function buildDom(node) {
       }
       updateState(node, state, uiState)
     } finally {
-      dropzone.textContent = 'Click or drop images or folders'
+      dropzone.textContent = 'Click to add images, or drop images/folders'
       fileInput.value = ''
     }
   }
@@ -1214,11 +1214,11 @@ function buildDom(node) {
   root.addEventListener(
     'drop',
     async (event) => {
+      consumeExternalFileDrag(event)
       const files = await getDroppedImageFiles(event)
       externalDragDepth = 0
       setExternalDragActive(false)
       if (!files.length) return
-      consumeExternalFileDrag(event)
       await handleFiles(files)
     },
     true
@@ -1347,7 +1347,7 @@ async function uploadViaNode(node, files) {
     updateState(node, state, uiState)
     return true
   } finally {
-    ctx.dropzone.textContent = 'Click or drop images or folders'
+    ctx.dropzone.textContent = 'Click to add images, or drop images/folders'
   }
 }
 
@@ -1384,9 +1384,9 @@ function initializeNode(node, widget) {
   }
 
   node.onDragDrop = async (event) => {
+    consumeExternalFileDrag(event)
     const files = await getDroppedImageFiles(event)
     if (!files.length) return false
-    consumeExternalFileDrag(event)
     return await uploadViaNode(node, files)
   }
 
