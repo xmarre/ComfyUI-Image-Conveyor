@@ -493,24 +493,28 @@ async function getDroppedImageFiles(event) {
   if (items.length) {
     const snapshots = items
       .map((item) => {
+        let entry = null
         try {
-          const entry = getTransferItemEntry(item)
-          if (entry) return { entry }
+          entry = getTransferItemEntry(item)
         } catch {
-          // fall back to plain file extraction when directory traversal fails
+          // fall back to plain file extraction when entry lookup fails
         }
 
         const file = getTransferItemFile(item)
-        if (file) return { file }
-        return null
+        if (!entry && !file) return null
+        return { entry, file }
       })
       .filter(Boolean)
 
     const expanded = []
     for (const snapshot of snapshots) {
       if (snapshot.entry) {
-        expanded.push(...(await collectImageFilesFromEntry(snapshot.entry)))
-        continue
+        try {
+          expanded.push(...(await collectImageFilesFromEntry(snapshot.entry)))
+          continue
+        } catch {
+          // fall back to plain file extraction when directory traversal fails
+        }
       }
       if (isProbablyImageFile(snapshot.file)) {
         expanded.push({ file: snapshot.file, relativeSubfolder: '' })
