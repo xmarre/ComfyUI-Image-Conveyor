@@ -636,9 +636,12 @@ function buildRow(node, ctx, item, index, selected) {
     ctx.draggedId = null
   })
 
+  const itemLabel = item.filename || item.annotated
+
   const checkbox = document.createElement('input')
   checkbox.type = 'checkbox'
   checkbox.checked = selected.has(item.id)
+  checkbox.setAttribute('aria-label', `Select ${itemLabel}`)
   checkbox.addEventListener('change', () => {
     const { state: liveState, uiState: liveUiState } = getCurrentState(node)
     applySelectionToggle(liveUiState, item.id, checkbox.checked)
@@ -647,7 +650,7 @@ function buildRow(node, ctx, item, index, selected) {
 
   const thumb = document.createElement('img')
   thumb.className = 'bil-thumb'
-  thumb.alt = item.filename || item.annotated
+  thumb.alt = itemLabel
   thumb.loading = 'lazy'
   thumb.decoding = 'async'
   thumb.src = filePreviewUrl(item)
@@ -657,7 +660,7 @@ function buildRow(node, ctx, item, index, selected) {
 
   const name = document.createElement('div')
   name.className = 'bil-name'
-  name.textContent = item.filename || item.annotated
+  name.textContent = itemLabel
 
   const path = document.createElement('div')
   path.className = 'bil-path'
@@ -685,6 +688,7 @@ function buildRow(node, ctx, item, index, selected) {
   pendingBtn.className = 'bil-mini-btn'
   pendingBtn.type = 'button'
   pendingBtn.textContent = 'Pending'
+  pendingBtn.setAttribute('aria-label', `Mark ${itemLabel} as pending`)
   pendingBtn.addEventListener('click', () => {
     const { state: liveState, uiState: liveUiState } = getCurrentState(node)
     const liveItem = liveState.items.find((entry) => entry.id === item.id)
@@ -697,6 +701,7 @@ function buildRow(node, ctx, item, index, selected) {
   processedBtn.className = 'bil-mini-btn'
   processedBtn.type = 'button'
   processedBtn.textContent = 'Done'
+  processedBtn.setAttribute('aria-label', `Mark ${itemLabel} as done`)
   processedBtn.addEventListener('click', () => {
     const { state: liveState, uiState: liveUiState } = getCurrentState(node)
     const liveItem = liveState.items.find((entry) => entry.id === item.id)
@@ -710,6 +715,7 @@ function buildRow(node, ctx, item, index, selected) {
   deleteBtn.className = 'bil-mini-btn'
   deleteBtn.type = 'button'
   deleteBtn.textContent = 'Delete'
+  deleteBtn.setAttribute('aria-label', `Delete ${itemLabel}`)
   deleteBtn.addEventListener('click', () => {
     const { state: liveState, uiState: liveUiState } = getCurrentState(node)
     liveState.items = liveState.items.filter((entry) => entry.id !== item.id)
