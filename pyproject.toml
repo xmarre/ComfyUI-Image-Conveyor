@@ -1,7 +1,7 @@
 [project]
 name = "image-conveyor"
 description = "A sequential drag-and-drop image queue node for ComfyUI."
-version = "1.0.1"
+version = "1.0.2"
 license = { file = "LICENSE" }
 dependencies = []
 classifiers = [
