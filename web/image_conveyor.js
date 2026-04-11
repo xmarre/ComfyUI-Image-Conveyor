@@ -794,8 +794,10 @@ function renderVisibleRows(node) {
   const selected = getSelectedIds(uiState)
 
   if (!state.items.length) {
-    ctx.listInner.style.height = '0px'
-    ctx.listWindow.style.height = '0px'
+    ctx.listInner.style.height = 'auto'
+    ctx.listInner.style.minHeight = '0px'
+    ctx.listWindow.style.height = 'auto'
+    ctx.listWindow.style.minHeight = '0px'
     hideUnusedRowSlots(ctx, 0)
     ctx.renderedRangeKey = ''
     return
@@ -806,6 +808,8 @@ function renderVisibleRows(node) {
   if (ctx.renderedRangeKey === rangeKey) return
 
   const needed = end - start
+  ctx.listInner.style.minHeight = ''
+  ctx.listWindow.style.minHeight = ''
   ctx.listInner.style.height = `${height}px`
   ctx.listWindow.style.height = `${height}px`
   ensureRowPool(node, needed)
@@ -847,8 +851,10 @@ function renderNode(node) {
     : 'Next: none'
 
   if (!state.items.length) {
-    ctx.listInner.style.height = '0px'
-    ctx.listWindow.style.height = '0px'
+    ctx.listInner.style.height = 'auto'
+    ctx.listInner.style.minHeight = '0px'
+    ctx.listWindow.style.height = 'auto'
+    ctx.listWindow.style.minHeight = '0px'
     hideUnusedRowSlots(ctx, 0)
     ctx.renderedRangeKey = ''
     if (!ctx.empty) {
@@ -857,10 +863,12 @@ function renderNode(node) {
       ctx.empty.textContent = 'Drop images here or click the drop area to add them.'
     }
     ctx.empty.hidden = false
-    if (ctx.empty.parentElement !== ctx.list) {
-      ctx.list.appendChild(ctx.empty)
+    if (ctx.empty.parentElement !== ctx.listWindow) {
+      ctx.listWindow.appendChild(ctx.empty)
     }
   } else {
+    ctx.listInner.style.minHeight = ''
+    ctx.listWindow.style.minHeight = ''
     ctx.empty?.remove()
     renderVisibleRows(node)
   }
