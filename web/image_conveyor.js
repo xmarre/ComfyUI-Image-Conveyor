@@ -215,6 +215,40 @@ function isProbablyImageFile(file) {
   return IMAGE_EXTENSIONS.has(getFileExtension(file.name))
 }
 
+function hasExternalFileDrag(event) {
+  const transfer = event?.dataTransfer
+  if (!transfer) return false
+
+  const files = Array.from(transfer.files ?? [])
+  if (files.some((file) => isProbablyImageFile(file))) {
+    return true
+  }
+
+  const types = Array.from(transfer.types ?? [])
+  return types.includes('Files')
+}
+
+function getDroppedImageFiles(event) {
+  return Array.from(event?.dataTransfer?.files ?? []).filter((file) =>
+    isProbablyImageFile(file)
+  )
+}
+
+function consumeExternalFileDrag(event) {
+  if (!hasExternalFileDrag(event)) return false
+  event.preventDefault()
+  event.stopPropagation()
+  event.stopImmediatePropagation?.()
+  if (event.dataTransfer) {
+    try {
+      event.dataTransfer.dropEffect = 'copy'
+    } catch {
+      // ignore browser-specific dropEffect failures
+    }
+  }
+  return true
+}
+
 function filePreviewUrl(item) {
   const params = new URLSearchParams()
   params.set(
@@ -290,6 +324,12 @@ function ensureStyles() {
       font: 12px/1.35 system-ui, sans-serif;
       box-sizing: border-box;
       padding: 2px 0;
+    }
+    .bil-root.bil-dragover {
+      outline: 1px dashed rgba(120,180,255,0.9);
+      outline-offset: -2px;
+      border-radius: 10px;
+      background: rgba(120,180,255,0.06);
     }
     .bil-toolbar, .bil-subtoolbar, .bil-summary {
       display: flex;
@@ -751,6 +791,12 @@ function buildDom(node) {
     render: () => renderNode(node)
   }
 
+  let externalDragDepth = 0
+  const setExternalDragActive = (active) => {
+    root.classList.toggle('bil-dragover', active)
+    dropzone.classList.toggle('bil-dragover', active)
+  }
+
   const handleFiles = async (fileList) => {
     const files = Array.from(fileList ?? []).filter((file) => isProbablyImageFile(file))
     if (!files.length) return
@@ -773,18 +819,61 @@ function buildDom(node) {
   dropzone.addEventListener('click', () => fileInput.click())
   fileInput.addEventListener('change', () => handleFiles(fileInput.files))
 
-  dropzone.addEventListener('dragover', (event) => {
-    event.preventDefault()
-    dropzone.classList.add('bil-dragover')
-  })
-  dropzone.addEventListener('dragleave', () => {
-    dropzone.classList.remove('bil-dragover')
-  })
-  dropzone.addEventListener('drop', async (event) => {
-    event.preventDefault()
-    dropzone.classList.remove('bil-dragover')
-    await handleFiles(event.dataTransfer?.files)
-  })
+  root.addEventListener(
+    'dragenter',
+    (event) => {
+      if (!consumeExternalFileDrag(event)) return
+      externalDragDepth += 1
+      setExternalDragActive(true)
+    },
+    true
+  )
+
+  root.addEventListener(
+    'dragover',
+    (event) => {
+      if (!consumeExternalFileDrag(event)) return
+      setExternalDragActive(true)
+    },
+    true
+  )
+
+  root.addEventListener(
+    'dragleave',
+    (event) => {
+      if (!(externalDragDepth > 0 || hasExternalFileDrag(event))) return
+      event.preventDefault()
+      event.stopPropagation()
+      event.stopImmediatePropagation?.()
+      externalDragDepth = Math.max(0, externalDragDepth - 1)
+      if (externalDragDepth === 0) {
+        setExternalDragActive(false)
+      }
+    },
+    true
+  )
+
+  root.addEventListener(
+    'drop',
+    async (event) => {
+      const files = getDroppedImageFiles(event)
+      externalDragDepth = 0
+      setExternalDragActive(false)
+      if (!files.length) return
+      consumeExternalFileDrag(event)
+      await handleFiles(files)
+    },
+    true
+  )
+
+  root.addEventListener(
+    'dragend',
+    () => {
+      externalDragDepth = 0
+      setExternalDragActive(false)
+    },
+    true
+  )
 
   selectAllBtn.addEventListener('click', () => {
     const { state, uiState } = getCurrentState(node)
@@ -929,12 +1018,17 @@ function initializeNode(node, widget) {
   attachQueueLifecycle(node)
 
   node.onDragOver = (event) => {
-    const files = Array.from(event.dataTransfer?.files ?? [])
-    return files.some((file) => isProbablyImageFile(file))
+    if (!hasExternalFileDrag(event)) return false
+    event.preventDefault?.()
+    event.stopPropagation?.()
+    event.stopImmediatePropagation?.()
+    return true
   }
 
   node.onDragDrop = async (event) => {
-    const files = Array.from(event.dataTransfer?.files ?? [])
+    const files = getDroppedImageFiles(event)
+    if (!files.length) return false
+    consumeExternalFileDrag(event)
     return await uploadViaNode(node, files)
   }
 
