@@ -4,15 +4,35 @@ A sequential drag-and-drop image queue node for ComfyUI.
 
 <img width="538" height="728" alt="image" src="https://github.com/user-attachments/assets/5dc146c5-1971-493f-8311-12d93b867a05" />
 
-
 ## What it does
 
 - Drag and drop any number of images into the node
+- Drag and drop folders onto the node to enqueue supported images recursively
 - Shows the queued images directly in the node UI with thumbnails
 - Processes one image per prompt execution in queue order
 - If you queue multiple prompt runs, the next pending images are reserved and then processed sequentially
 - Marks processed images automatically when the loader node executes successfully
 - Lets you manually reset items to pending, force them to processed, delete them, reorder them, and sort them
+
+## Why this exists
+
+This node is for **sequential in-graph image queueing**.
+
+The main use case is dropping in a set of images, keeping the queue visible directly on the node, and consuming them **one prompt execution at a time** without relying on an external folder iterator workflow.
+
+Existing batch image loaders generally solve a different problem. Many are oriented around folder iteration, one-shot batch loading, or less explicit queue state. Image Conveyor is meant to give you a **visible in-graph queue**, **clear item state**, **manual intervention when needed**, and **predictable sequential consumption across queued prompt runs**.
+
+## Queue / state behavior
+
+Each item has a status:
+
+- `pending`
+- `queued`
+- `processed`
+
+This makes it easier to distinguish between items that are still waiting, items already reserved by queued prompt runs, and items that are done.
+
+If a prompt reserves an image but fails before the loader node executes, that item can remain `queued`. There is a **Clear queued** action to release those reservations.
 
 ## Frontend integration
 
@@ -23,12 +43,12 @@ Implementation detail:
 - it uses the frontend's supported **custom widget + DOMWidget** path
 - in VueNodes mode, the frontend renders that widget through its Vue-side `WidgetDOM` bridge
 
-So this is not a compiled custom `.vue` SFC shipped from the extension, but it is wired into the supported VueNodes rendering path rather than using an ad-hoc nodeCreated-only canvas hack.
+So this is not a compiled custom `.vue` SFC shipped from the extension, and not a brittle ad-hoc canvas-only hack. It is wired into the supported VueNodes rendering path.
 
 ## Features
 
-- multi-image upload from click or drag/drop
-- thumbnail list in-node
+- click to add images, or drag/drop images and folders
+- thumbnail list directly in-node
 - per-item status: `pending`, `queued`, `processed`
 - per-item quick actions: pending, done, delete
 - bulk actions:
@@ -44,12 +64,18 @@ So this is not a compiled custom `.vue` SFC shipped from the extension, but it i
   - name ascending / descending
   - newest / oldest
   - status
-- outputs:
-  - `image`
-  - `mask`
-  - `path`
-  - `index`
-  - `remaining_pending`
+
+## Outputs
+
+The node exposes:
+
+- `image`
+- `mask`
+- `path`
+- `index`
+- `remaining_pending`
+
+So it can be used both as a simple sequential loader and as part of queue-driven workflows that need metadata and queue state.
 
 ## Installation
 
