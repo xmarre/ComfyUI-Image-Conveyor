@@ -10,9 +10,9 @@ A sequential drag-and-drop image queue node for ComfyUI.
 - Drag and drop folders onto the node to enqueue supported images recursively
 - Shows the queued images directly in the node UI with thumbnails
 - Processes one image per prompt execution in queue order
-- If you queue multiple prompt runs, the next pending images are reserved and then processed sequentially
-- Optional **Auto queue all pending** mode can expand a single queue click into one queued prompt per pending image
-- Marks processed images automatically when the loader node executes successfully
+- If you queue multiple prompt runs, the next pending items are reserved and then processed sequentially
+- Optional **Auto queue all pending** mode can expand a single queue action into one queued prompt per pending image
+- Marks processed items automatically when the loader node executes successfully
 - Lets you manually reset items to pending, force them to processed, delete them, reorder them, and sort them
 
 ## Why this exists
@@ -31,7 +31,7 @@ Each item has a status:
 - `queued`
 - `processed`
 
-This makes it easier to distinguish between items that are still waiting, items already reserved by queued prompt runs, and items that are done.
+This makes it easy to distinguish between items that are still waiting, items already reserved by queued prompt runs, and items that are done.
 
 If a prompt reserves an image but fails before the loader node executes, that item can remain `queued`. There is a **Clear queued** action to release those reservations.
 
@@ -44,7 +44,7 @@ Implementation detail:
 - it uses the frontend's supported **custom widget + DOMWidget** path
 - in VueNodes mode, the frontend renders that widget through its Vue-side `WidgetDOM` bridge
 
-So this is not a compiled custom `.vue` SFC shipped from the extension, and not a brittle ad-hoc canvas-only hack. It is wired into the supported VueNodes rendering path.
+So this is not a compiled custom `.vue` SFC shipped by the extension, and not a brittle ad-hoc canvas-only hack. It is wired into the supported frontend rendering path.
 
 ## Features
 
