@@ -257,23 +257,159 @@ function isProbablyImageFile(file) {
   return IMAGE_EXTENSIONS.has(getFileExtension(file.name))
 }
 
+function normalizeRelativeSubfolder(path) {
+  return String(path ?? '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .map((segment) => segment.trim())
+    .filter((segment) => segment && segment !== '.' && segment !== '..')
+    .join('/')
+}
+
+function buildUploadSubfolder(relativeSubfolder = '') {
+  const normalized = normalizeRelativeSubfolder(relativeSubfolder)
+  return normalized ? `${DEFAULT_SUBFOLDER}/${normalized}` : DEFAULT_SUBFOLDER
+}
+
+function normalizeUploadFiles(files) {
+  return Array.from(files ?? [])
+    .map((entry) => {
+      if (entry instanceof File) {
+        return { file: entry, relativeSubfolder: '' }
+      }
+      if (entry?.file instanceof File) {
+        return {
+          file: entry.file,
+          relativeSubfolder: normalizeRelativeSubfolder(entry.relativeSubfolder)
+        }
+      }
+      return null
+    })
+    .filter((entry) => entry && isProbablyImageFile(entry.file))
+}
+
+function getTransferItemEntry(item) {
+  if (!item || typeof item.webkitGetAsEntry !== 'function') return null
+  try {
+    return item.webkitGetAsEntry()
+  } catch {
+    return null
+  }
+}
+
+function getTransferItemFile(item) {
+  if (!item || typeof item.getAsFile !== 'function') return null
+  try {
+    return item.getAsFile()
+  } catch {
+    return null
+  }
+}
+
 function hasExternalFileDrag(event) {
   const transfer = event?.dataTransfer
   if (!transfer) return false
 
-  const files = Array.from(transfer.files ?? [])
-  if (files.some((file) => isProbablyImageFile(file))) {
+  const items = Array.from(transfer.items ?? []).filter((item) => item?.kind === 'file')
+  if (
+    items.some((item) => {
+      const entry = getTransferItemEntry(item)
+      if (entry?.isDirectory) return true
+      return isProbablyImageFile(getTransferItemFile(item))
+    })
+  ) {
     return true
   }
 
-  const types = Array.from(transfer.types ?? [])
-  return types.includes('Files')
+  const files = Array.from(transfer.files ?? [])
+  return files.some((file) => isProbablyImageFile(file))
 }
 
-function getDroppedImageFiles(event) {
-  return Array.from(event?.dataTransfer?.files ?? []).filter((file) =>
-    isProbablyImageFile(file)
+function readDirectoryEntries(reader) {
+  return new Promise((resolve, reject) => {
+    const entries = []
+
+    const pump = () => {
+      reader.readEntries(
+        (batch) => {
+          if (!batch.length) {
+            resolve(entries)
+            return
+          }
+          entries.push(...batch)
+          pump()
+        },
+        (error) => reject(error)
+      )
+    }
+
+    pump()
+  })
+}
+
+function compareFileSystemEntryNames(left, right) {
+  return String(left?.name ?? '').localeCompare(String(right?.name ?? ''), undefined, {
+    numeric: true,
+    sensitivity: 'base'
+  })
+}
+
+async function collectImageFilesFromEntry(entry, parentPath = '') {
+  if (!entry) return []
+
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) => {
+      entry.file(resolve, reject)
+    })
+    if (!isProbablyImageFile(file)) return []
+    return [
+      {
+        file,
+        relativeSubfolder: normalizeRelativeSubfolder(parentPath)
+      }
+    ]
+  }
+
+  if (!entry.isDirectory || typeof entry.createReader !== 'function') return []
+
+  const directoryPath = normalizeRelativeSubfolder(
+    parentPath ? `${parentPath}/${entry.name}` : entry.name
   )
+  const reader = entry.createReader()
+  const children = await readDirectoryEntries(reader)
+  children.sort(compareFileSystemEntryNames)
+
+  const files = []
+  for (const child of children) {
+    files.push(...(await collectImageFilesFromEntry(child, directoryPath)))
+  }
+  return files
+}
+
+async function getDroppedImageFiles(event) {
+  const items = Array.from(event?.dataTransfer?.items ?? []).filter((item) => item?.kind === 'file')
+  if (items.length) {
+    const expanded = []
+    for (const item of items) {
+      try {
+        const entry = getTransferItemEntry(item)
+        if (entry) {
+          expanded.push(...(await collectImageFilesFromEntry(entry)))
+          continue
+        }
+      } catch {
+        // fall back to plain file extraction when directory traversal fails
+      }
+
+      const file = getTransferItemFile(item)
+      if (isProbablyImageFile(file)) {
+        expanded.push({ file, relativeSubfolder: '' })
+      }
+    }
+    if (expanded.length) return expanded
+  }
+
+  return normalizeUploadFiles(event?.dataTransfer?.files)
 }
 
 function consumeExternalFileDrag(event) {
@@ -328,12 +464,11 @@ function makeItemFromUploadResponse(data) {
 
 async function uploadFiles(files) {
   const uploaded = []
-  for (const file of files) {
-    if (!isProbablyImageFile(file)) continue
+  for (const { file, relativeSubfolder } of normalizeUploadFiles(files)) {
     const body = new FormData()
     body.append('image', file)
     body.append('type', 'input')
-    body.append('subfolder', DEFAULT_SUBFOLDER)
+    body.append('subfolder', buildUploadSubfolder(relativeSubfolder))
     const response = await api.fetchApi('/upload/image', {
       method: 'POST',
       body
@@ -860,7 +995,7 @@ function renderNode(node) {
     if (!ctx.empty) {
       ctx.empty = document.createElement('div')
       ctx.empty.className = 'bil-empty'
-      ctx.empty.textContent = 'Drop images here or click the drop area to add them.'
+      ctx.empty.textContent = 'Drop images or folders here, or click the drop area to add images.'
     }
     ctx.empty.hidden = false
     if (ctx.empty.parentElement !== ctx.listWindow) {
@@ -886,7 +1021,7 @@ function buildDom(node) {
 
   const dropzone = document.createElement('div')
   dropzone.className = 'bil-dropzone'
-  dropzone.textContent = 'Click or drop one or more images'
+  dropzone.textContent = 'Click to add images, or drop images/folders'
 
   const fileInput = document.createElement('input')
   fileInput.type = 'file'
@@ -1021,7 +1156,7 @@ function buildDom(node) {
   }
 
   const handleFiles = async (fileList) => {
-    const files = Array.from(fileList ?? []).filter((file) => isProbablyImageFile(file))
+    const files = normalizeUploadFiles(fileList)
     if (!files.length) return
 
     dropzone.textContent = `Uploading ${files.length} image${files.length === 1 ? '' : 's'}…`
@@ -1034,7 +1169,7 @@ function buildDom(node) {
       }
       updateState(node, state, uiState)
     } finally {
-      dropzone.textContent = 'Click or drop one or more images'
+      dropzone.textContent = 'Click to add images, or drop images/folders'
       fileInput.value = ''
     }
   }
@@ -1079,11 +1214,11 @@ function buildDom(node) {
   root.addEventListener(
     'drop',
     async (event) => {
-      const files = getDroppedImageFiles(event)
+      consumeExternalFileDrag(event)
+      const files = await getDroppedImageFiles(event)
       externalDragDepth = 0
       setExternalDragActive(false)
       if (!files.length) return
-      consumeExternalFileDrag(event)
       await handleFiles(files)
     },
     true
@@ -1198,7 +1333,7 @@ function buildDom(node) {
 async function uploadViaNode(node, files) {
   const ctx = node.__bil
   if (!ctx) return false
-  const validFiles = files.filter((file) => isProbablyImageFile(file))
+  const validFiles = normalizeUploadFiles(files)
   if (!validFiles.length) return false
 
   ctx.dropzone.textContent = `Uploading ${validFiles.length} image${validFiles.length === 1 ? '' : 's'}…`
@@ -1212,7 +1347,7 @@ async function uploadViaNode(node, files) {
     updateState(node, state, uiState)
     return true
   } finally {
-    ctx.dropzone.textContent = 'Click or drop one or more images'
+    ctx.dropzone.textContent = 'Click to add images, or drop images/folders'
   }
 }
 
@@ -1249,9 +1384,9 @@ function initializeNode(node, widget) {
   }
 
   node.onDragDrop = async (event) => {
-    const files = getDroppedImageFiles(event)
-    if (!files.length) return false
     consumeExternalFileDrag(event)
+    const files = await getDroppedImageFiles(event)
+    if (!files.length) return false
     return await uploadViaNode(node, files)
   }
 
