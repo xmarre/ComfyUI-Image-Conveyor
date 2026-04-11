@@ -24,6 +24,10 @@ const IMAGE_EXTENSIONS = new Set([
   'tiff',
   'avif'
 ])
+const ROW_HEIGHT = 66
+const ROW_GAP = 6
+const ROW_STRIDE = ROW_HEIGHT + ROW_GAP
+const LIST_OVERSCAN = 6
 
 function structuredCloneCompat(value) {
   if (typeof structuredClone === 'function') return structuredClone(value)
@@ -167,13 +171,51 @@ function getCurrentState(node) {
   return { state, uiState }
 }
 
+function cacheRenderableState(node, state, uiState) {
+  const ctx = node.__bil
+  if (!ctx) return
+  ctx.state = state
+  ctx.uiState = uiState
+  ctx.renderVersion = (ctx.renderVersion || 0) + 1
+}
+
+function getRenderableState(node) {
+  const ctx = node.__bil
+  if (ctx?.state && ctx?.uiState) {
+    return { state: ctx.state, uiState: ctx.uiState }
+  }
+  const snapshot = getCurrentState(node)
+  cacheRenderableState(node, snapshot.state, snapshot.uiState)
+  return snapshot
+}
+
 function updateState(node, state, uiState, { rerender = true } = {}) {
   const { stateWidget, uiStateWidget } = getWidgets(node)
   if (!stateWidget || !uiStateWidget) return
   setWidgetValue(stateWidget, serializeState(state))
   setWidgetValue(uiStateWidget, serializeUiState(uiState))
+  cacheRenderableState(node, state, uiState)
   markNodeDirty(node)
-  if (rerender) node.__bil?.render?.()
+  if (rerender) scheduleRenderNode(node)
+}
+
+function scheduleRenderNode(node, { viewportOnly = false } = {}) {
+  const ctx = node.__bil
+  if (!ctx) return
+  ctx.renderViewportOnly = ctx.renderFrame
+    ? Boolean(ctx.renderViewportOnly && viewportOnly)
+    : Boolean(viewportOnly)
+  if (ctx.renderFrame) return
+  ctx.renderFrame = requestAnimationFrame(() => {
+    const renderViewportOnly = ctx.renderViewportOnly
+    ctx.renderFrame = 0
+    ctx.renderViewportOnly = false
+    if (renderViewportOnly) {
+      renderVisibleRows(node)
+    } else {
+      renderNode(node)
+    }
+  })
 }
 
 function updateQueueWidget(node, payload) {
@@ -369,14 +411,25 @@ function ensureStyles() {
       opacity: 0.9;
     }
     .bil-list {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
+      position: relative;
       min-height: 180px;
       max-height: 100%;
       overflow: auto;
       padding-right: 2px;
       flex: 1 1 auto;
+      contain: layout paint style;
+    }
+    .bil-list-inner {
+      position: relative;
+      min-height: 100%;
+    }
+    .bil-list-window {
+      position: absolute;
+      inset: 0 2px auto 0;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      will-change: transform;
     }
     .bil-empty {
       padding: 14px 10px;
@@ -390,10 +443,14 @@ function ensureStyles() {
       grid-template-columns: 24px 52px minmax(0,1fr) auto auto;
       gap: 8px;
       align-items: center;
+      height: 66px;
       padding: 6px;
+      box-sizing: border-box;
+      overflow: hidden;
       border: 1px solid rgba(255,255,255,0.10);
       border-radius: 8px;
       background: rgba(0,0,0,0.16);
+      contain: content;
     }
     .bil-row.bil-selected {
       border-color: rgba(120,180,255,0.85);
@@ -526,18 +583,191 @@ function chainNodeCallback(node, key, handler) {
   }
 }
 
+function getVisibleRowRange(list, totalItems) {
+  if (!totalItems) return { start: 0, end: 0, offset: 0, height: 0 }
+
+  const viewportHeight = Math.max(list.clientHeight || 0, ROW_STRIDE)
+  const scrollTop = Math.max(list.scrollTop || 0, 0)
+  const visibleCount = Math.max(1, Math.ceil(viewportHeight / ROW_STRIDE))
+  const rawStart = Math.max(0, Math.floor(scrollTop / ROW_STRIDE) - LIST_OVERSCAN)
+  const maxStart = Math.max(0, totalItems - (visibleCount + LIST_OVERSCAN * 2))
+  const start = Math.min(rawStart, maxStart)
+  const end = Math.min(totalItems, start + visibleCount + LIST_OVERSCAN * 2)
+  const height = Math.max(0, totalItems * ROW_STRIDE - ROW_GAP)
+  return {
+    start,
+    end,
+    offset: start * ROW_STRIDE,
+    height
+  }
+}
+
+function buildRow(node, ctx, item, index, selected) {
+  const row = document.createElement('div')
+  row.className = 'bil-row'
+  row.draggable = true
+  row.dataset.itemId = item.id
+
+  if (selected.has(item.id)) row.classList.add('bil-selected')
+
+  row.addEventListener('dragstart', () => {
+    ctx.draggedId = item.id
+  })
+  row.addEventListener('dragend', () => {
+    ctx.draggedId = null
+    row.classList.remove('bil-drag-target')
+  })
+  row.addEventListener('dragover', (event) => {
+    event.preventDefault()
+    row.classList.add('bil-drag-target')
+  })
+  row.addEventListener('dragleave', () => {
+    row.classList.remove('bil-drag-target')
+  })
+  row.addEventListener('drop', (event) => {
+    event.preventDefault()
+    row.classList.remove('bil-drag-target')
+    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
+    if (moveItems(liveState, ctx.draggedId, item.id)) {
+      updateState(node, liveState, liveUiState)
+    }
+    ctx.draggedId = null
+  })
+
+  const checkbox = document.createElement('input')
+  checkbox.type = 'checkbox'
+  checkbox.checked = selected.has(item.id)
+  checkbox.addEventListener('change', () => {
+    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
+    applySelectionToggle(liveUiState, item.id, checkbox.checked)
+    updateState(node, liveState, liveUiState)
+  })
+
+  const thumb = document.createElement('img')
+  thumb.className = 'bil-thumb'
+  thumb.alt = item.filename || item.annotated
+  thumb.loading = 'lazy'
+  thumb.decoding = 'async'
+  thumb.src = filePreviewUrl(item)
+
+  const meta = document.createElement('div')
+  meta.className = 'bil-meta'
+
+  const name = document.createElement('div')
+  name.className = 'bil-name'
+  name.textContent = item.filename || item.annotated
+
+  const path = document.createElement('div')
+  path.className = 'bil-path'
+  path.textContent = item.annotated
+
+  meta.append(name, path)
+
+  const right = document.createElement('div')
+  right.className = 'bil-right'
+
+  const badge = document.createElement('div')
+  badge.className = `bil-badge bil-badge-${item.status}`
+  badge.textContent = item.status
+
+  const indexText = document.createElement('div')
+  indexText.className = 'bil-index'
+  indexText.textContent = `#${index + 1}`
+
+  right.append(badge, indexText)
+
+  const actions = document.createElement('div')
+  actions.className = 'bil-row-actions'
+
+  const pendingBtn = document.createElement('button')
+  pendingBtn.className = 'bil-mini-btn'
+  pendingBtn.type = 'button'
+  pendingBtn.textContent = 'Pending'
+  pendingBtn.addEventListener('click', () => {
+    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
+    const liveItem = liveState.items.find((entry) => entry.id === item.id)
+    if (!liveItem) return
+    liveItem.status = 'pending'
+    updateState(node, liveState, liveUiState)
+  })
+
+  const processedBtn = document.createElement('button')
+  processedBtn.className = 'bil-mini-btn'
+  processedBtn.type = 'button'
+  processedBtn.textContent = 'Done'
+  processedBtn.addEventListener('click', () => {
+    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
+    const liveItem = liveState.items.find((entry) => entry.id === item.id)
+    if (!liveItem) return
+    liveItem.status = 'processed'
+    liveItem.last_processed_at = Date.now()
+    updateState(node, liveState, liveUiState)
+  })
+
+  const deleteBtn = document.createElement('button')
+  deleteBtn.className = 'bil-mini-btn'
+  deleteBtn.type = 'button'
+  deleteBtn.textContent = 'Delete'
+  deleteBtn.addEventListener('click', () => {
+    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
+    liveState.items = liveState.items.filter((entry) => entry.id !== item.id)
+    liveUiState.selected_ids = liveUiState.selected_ids.filter(
+      (id) => id !== item.id
+    )
+    updateState(node, liveState, liveUiState)
+  })
+
+  actions.append(pendingBtn, processedBtn, deleteBtn)
+  row.append(checkbox, thumb, meta, right, actions)
+  return row
+}
+
+function renderVisibleRows(node) {
+  const ctx = node.__bil
+  if (!ctx) return
+
+  const { state, uiState } = getRenderableState(node)
+  const selected = getSelectedIds(uiState)
+
+  if (!state.items.length) {
+    ctx.listWindow.replaceChildren()
+    ctx.listInner.style.height = '0px'
+    ctx.listWindow.style.transform = 'translateY(0px)'
+    ctx.renderedRangeKey = ''
+    return
+  }
+
+  const { start, end, offset, height } = getVisibleRowRange(ctx.list, state.items.length)
+  const rangeKey = `${ctx.renderVersion}:${start}:${end}:${offset}:${selected.size}`
+  if (ctx.renderedRangeKey === rangeKey) return
+
+  ctx.listInner.style.height = `${height}px`
+  ctx.listWindow.style.transform = `translateY(${offset}px)`
+  ctx.listWindow.replaceChildren(
+    ...state.items
+      .slice(start, end)
+      .map((item, localIndex) => buildRow(node, ctx, item, start + localIndex, selected))
+  )
+  ctx.renderedRangeKey = rangeKey
+}
+
 function renderNode(node) {
   const ctx = node.__bil
   if (!ctx) return
 
-  const { state, uiState } = getCurrentState(node)
+  const snapshot = getCurrentState(node)
+  cacheRenderableState(node, snapshot.state, snapshot.uiState)
+  const { state, uiState } = snapshot
   const selected = getSelectedIds(uiState)
 
-  const pendingCount = state.items.filter((item) => item.status === 'pending').length
-  const queuedCount = state.items.filter((item) => item.status === 'queued').length
-  const processedCount = state.items.filter(
-    (item) => item.status === 'processed'
-  ).length
+  let pendingCount = 0
+  let queuedCount = 0
+  let processedCount = 0
+  for (const item of state.items) {
+    if (item.status === 'pending') pendingCount += 1
+    else if (item.status === 'queued') queuedCount += 1
+    else if (item.status === 'processed') processedCount += 1
+  }
   const nextItem = findFirstByStatus(state, ['pending', 'queued'])
 
   ctx.summary.textContent = `Total ${state.items.length} · Pending ${pendingCount} · Queued ${queuedCount} · Processed ${processedCount}`
@@ -545,131 +775,23 @@ function renderNode(node) {
     ? `Next: ${nextItem.filename || nextItem.annotated}`
     : 'Next: none'
 
-  ctx.list.replaceChildren()
-
   if (!state.items.length) {
-    const empty = document.createElement('div')
-    empty.className = 'bil-empty'
-    empty.textContent = 'Drop images here or click the drop area to add them.'
-    ctx.list.appendChild(empty)
+    ctx.listWindow.replaceChildren()
+    ctx.listInner.style.height = '0px'
+    ctx.listWindow.style.transform = 'translateY(0px)'
+    ctx.renderedRangeKey = ''
+    if (!ctx.empty) {
+      ctx.empty = document.createElement('div')
+      ctx.empty.className = 'bil-empty'
+      ctx.empty.textContent = 'Drop images here or click the drop area to add them.'
+    }
+    ctx.empty.hidden = false
+    if (ctx.empty.parentElement !== ctx.listInner) {
+      ctx.listInner.appendChild(ctx.empty)
+    }
   } else {
-    state.items.forEach((item, index) => {
-      const row = document.createElement('div')
-      row.className = 'bil-row'
-      row.draggable = true
-      row.dataset.itemId = item.id
-      if (selected.has(item.id)) row.classList.add('bil-selected')
-
-      row.addEventListener('dragstart', () => {
-        ctx.draggedId = item.id
-      })
-      row.addEventListener('dragend', () => {
-        ctx.draggedId = null
-        row.classList.remove('bil-drag-target')
-      })
-      row.addEventListener('dragover', (event) => {
-        event.preventDefault()
-        row.classList.add('bil-drag-target')
-      })
-      row.addEventListener('dragleave', () => {
-        row.classList.remove('bil-drag-target')
-      })
-      row.addEventListener('drop', (event) => {
-        event.preventDefault()
-        row.classList.remove('bil-drag-target')
-        const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-        if (moveItems(liveState, ctx.draggedId, item.id)) {
-          updateState(node, liveState, liveUiState)
-        }
-        ctx.draggedId = null
-      })
-
-      const checkbox = document.createElement('input')
-      checkbox.type = 'checkbox'
-      checkbox.checked = selected.has(item.id)
-      checkbox.addEventListener('change', () => {
-        const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-        applySelectionToggle(liveUiState, item.id, checkbox.checked)
-        updateState(node, liveState, liveUiState)
-      })
-
-      const thumb = document.createElement('img')
-      thumb.className = 'bil-thumb'
-      thumb.alt = item.filename || item.annotated
-      thumb.loading = 'lazy'
-      thumb.src = filePreviewUrl(item)
-
-      const meta = document.createElement('div')
-      meta.className = 'bil-meta'
-
-      const name = document.createElement('div')
-      name.className = 'bil-name'
-      name.textContent = item.filename || item.annotated
-
-      const path = document.createElement('div')
-      path.className = 'bil-path'
-      path.textContent = item.annotated
-
-      meta.append(name, path)
-
-      const right = document.createElement('div')
-      right.className = 'bil-right'
-
-      const badge = document.createElement('div')
-      badge.className = `bil-badge bil-badge-${item.status}`
-      badge.textContent = item.status
-
-      const indexText = document.createElement('div')
-      indexText.className = 'bil-index'
-      indexText.textContent = `#${index + 1}`
-
-      right.append(badge, indexText)
-
-      const actions = document.createElement('div')
-      actions.className = 'bil-row-actions'
-
-      const pendingBtn = document.createElement('button')
-      pendingBtn.className = 'bil-mini-btn'
-      pendingBtn.type = 'button'
-      pendingBtn.textContent = 'Pending'
-      pendingBtn.addEventListener('click', () => {
-        const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-        const liveItem = liveState.items.find((entry) => entry.id === item.id)
-        if (!liveItem) return
-        liveItem.status = 'pending'
-        updateState(node, liveState, liveUiState)
-      })
-
-      const processedBtn = document.createElement('button')
-      processedBtn.className = 'bil-mini-btn'
-      processedBtn.type = 'button'
-      processedBtn.textContent = 'Done'
-      processedBtn.addEventListener('click', () => {
-        const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-        const liveItem = liveState.items.find((entry) => entry.id === item.id)
-        if (!liveItem) return
-        liveItem.status = 'processed'
-        liveItem.last_processed_at = Date.now()
-        updateState(node, liveState, liveUiState)
-      })
-
-      const deleteBtn = document.createElement('button')
-      deleteBtn.className = 'bil-mini-btn'
-      deleteBtn.type = 'button'
-      deleteBtn.textContent = 'Delete'
-      deleteBtn.addEventListener('click', () => {
-        const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-        liveState.items = liveState.items.filter((entry) => entry.id !== item.id)
-        liveUiState.selected_ids = liveUiState.selected_ids.filter(
-          (id) => id !== item.id
-        )
-        updateState(node, liveState, liveUiState)
-      })
-
-      actions.append(pendingBtn, processedBtn, deleteBtn)
-      row.append(checkbox, thumb, meta, right, actions)
-      ctx.list.appendChild(row)
-    })
+    ctx.empty?.remove()
+    renderVisibleRows(node)
   }
 
   ctx.setPendingBtn.disabled = selected.size === 0
@@ -775,6 +897,15 @@ function buildDom(node) {
   const list = document.createElement('div')
   list.className = 'bil-list'
 
+  const listInner = document.createElement('div')
+  listInner.className = 'bil-list-inner'
+
+  const listWindow = document.createElement('div')
+  listWindow.className = 'bil-list-window'
+
+  listInner.appendChild(listWindow)
+  list.appendChild(listInner)
+
   root.append(fileInput, dropzone, toolbar, subtoolbar, summary, list)
 
   node.__bil = {
@@ -784,12 +915,24 @@ function buildDom(node) {
     summary: summaryText,
     nextText,
     list,
+    listInner,
+    listWindow,
     setPendingBtn,
     setProcessedBtn,
     deleteSelectedBtn,
     draggedId: null,
-    render: () => renderNode(node)
+    empty: null,
+    state: null,
+    uiState: null,
+    renderVersion: 0,
+    renderedRangeKey: '',
+    renderFrame: 0,
+    renderViewportOnly: false
   }
+
+  list.addEventListener('scroll', () => scheduleRenderNode(node, { viewportOnly: true }), {
+    passive: true
+  })
 
   let externalDragDepth = 0
   const setExternalDragActive = (active) => {
@@ -1043,12 +1186,28 @@ function initializeNode(node, widget) {
   })
 
   chainNodeCallback(node, 'onConfigure', function () {
-    queueMicrotask(() => node.__bil?.render?.())
-    requestAnimationFrame(() => node.__bil?.render?.())
+    const snapshot = getCurrentState(node)
+    cacheRenderableState(node, snapshot.state, snapshot.uiState)
+    queueMicrotask(() => scheduleRenderNode(node))
+    requestAnimationFrame(() => scheduleRenderNode(node))
   })
 
-  queueMicrotask(() => node.__bil?.render?.())
-  requestAnimationFrame(() => node.__bil?.render?.())
+  chainNodeCallback(node, 'onResize', function () {
+    scheduleRenderNode(node, { viewportOnly: true })
+  })
+
+  chainNodeCallback(node, 'onRemoved', function () {
+    const ctx = node.__bil
+    if (!ctx?.renderFrame) return
+    cancelAnimationFrame(ctx.renderFrame)
+    ctx.renderFrame = 0
+    ctx.renderViewportOnly = false
+  })
+
+  const snapshot = getCurrentState(node)
+  cacheRenderableState(node, snapshot.state, snapshot.uiState)
+  queueMicrotask(() => scheduleRenderNode(node))
+  requestAnimationFrame(() => scheduleRenderNode(node))
   return widget
 }
 
