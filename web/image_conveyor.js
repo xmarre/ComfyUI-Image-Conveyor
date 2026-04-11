@@ -357,6 +357,8 @@ function ensureStyles() {
     .bil-root {
       --comfy-widget-min-height: 540px;
       --comfy-widget-max-height: 540px;
+      --bil-row-height: ${ROW_HEIGHT}px;
+      --bil-row-gap: ${ROW_GAP}px;
       display: flex;
       flex-direction: column;
       gap: 8px;
@@ -428,7 +430,7 @@ function ensureStyles() {
       inset: 0 2px auto 0;
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      gap: var(--bil-row-gap);
       will-change: transform;
     }
     .bil-empty {
@@ -443,7 +445,7 @@ function ensureStyles() {
       grid-template-columns: 24px 52px minmax(0,1fr) auto auto;
       gap: 8px;
       align-items: center;
-      height: 66px;
+      height: var(--bil-row-height);
       padding: 6px;
       box-sizing: border-box;
       overflow: hidden;
@@ -1189,7 +1191,6 @@ function initializeNode(node, widget) {
     const snapshot = getCurrentState(node)
     cacheRenderableState(node, snapshot.state, snapshot.uiState)
     queueMicrotask(() => scheduleRenderNode(node))
-    requestAnimationFrame(() => scheduleRenderNode(node))
   })
 
   chainNodeCallback(node, 'onResize', function () {
@@ -1207,7 +1208,6 @@ function initializeNode(node, widget) {
   const snapshot = getCurrentState(node)
   cacheRenderableState(node, snapshot.state, snapshot.uiState)
   queueMicrotask(() => scheduleRenderNode(node))
-  requestAnimationFrame(() => scheduleRenderNode(node))
   return widget
 }
 
