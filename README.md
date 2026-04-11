@@ -2,6 +2,9 @@
 
 A sequential drag-and-drop image queue node for ComfyUI.
 
+<img width="538" height="728" alt="image" src="https://github.com/user-attachments/assets/5dc146c5-1971-493f-8311-12d93b867a05" />
+
+
 ## What it does
 
 - Drag and drop any number of images into the node
@@ -24,7 +27,6 @@ So this is not a compiled custom `.vue` SFC shipped from the extension, but it i
 
 ## Features
 
-- compatibility alias for old saved workflows (`SequentialBatchImageLoader` still resolves)
 - multi-image upload from click or drag/drop
 - thumbnail list in-node
 - per-item status: `pending`, `queued`, `processed`
