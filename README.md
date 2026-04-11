@@ -11,6 +11,7 @@ A sequential drag-and-drop image queue node for ComfyUI.
 - Shows the queued images directly in the node UI with thumbnails
 - Processes one image per prompt execution in queue order
 - If you queue multiple prompt runs, the next pending images are reserved and then processed sequentially
+- Optional **Auto queue all pending** mode can expand a single queue click into one queued prompt per pending image
 - Marks processed images automatically when the loader node executes successfully
 - Lets you manually reset items to pending, force them to processed, delete them, reorder them, and sort them
 
@@ -64,6 +65,7 @@ So this is not a compiled custom `.vue` SFC shipped from the extension, and not 
   - name ascending / descending
   - newest / oldest
   - status
+- optional **Auto queue all pending** toggle in the node UI
 
 ## Outputs
 

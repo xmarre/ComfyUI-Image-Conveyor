@@ -17,6 +17,7 @@ def _default_state() -> Dict[str, Any]:
     return {
         "version": _STATE_VERSION,
         "items": [],
+        "auto_queue": False,
     }
 
 
@@ -75,6 +76,7 @@ def _normalize_state(raw: Any) -> Dict[str, Any]:
     return {
         "version": _STATE_VERSION,
         "items": items,
+        "auto_queue": bool(state.get("auto_queue", False)) if isinstance(state, dict) else False,
     }
 
 
