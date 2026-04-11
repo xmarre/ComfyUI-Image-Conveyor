@@ -486,29 +486,44 @@ async function collectImageFilesFromEntry(entry, parentPath = '') {
 }
 
 async function getDroppedImageFiles(event) {
-  const items = Array.from(event?.dataTransfer?.items ?? []).filter((item) => item?.kind === 'file')
-  if (items.length) {
-    const expanded = []
-    for (const item of items) {
-      try {
-        const entry = getTransferItemEntry(item)
-        if (entry) {
-          expanded.push(...(await collectImageFilesFromEntry(entry)))
-          continue
-        }
-      } catch {
-        // fall back to plain file extraction when directory traversal fails
-      }
+  const transfer = event?.dataTransfer
+  const fallbackFiles = Array.from(transfer?.files ?? [])
+  const items = Array.from(transfer?.items ?? []).filter((item) => item?.kind === 'file')
 
-      const file = getTransferItemFile(item)
-      if (isProbablyImageFile(file)) {
-        expanded.push({ file, relativeSubfolder: '' })
+  if (items.length) {
+    const snapshots = items
+      .map((item) => {
+        let entry = null
+        try {
+          entry = getTransferItemEntry(item)
+        } catch {
+          // fall back to plain file extraction when entry lookup fails
+        }
+
+        const file = getTransferItemFile(item)
+        if (!entry && !file) return null
+        return { entry, file }
+      })
+      .filter(Boolean)
+
+    const expanded = []
+    for (const snapshot of snapshots) {
+      if (snapshot.entry) {
+        try {
+          expanded.push(...(await collectImageFilesFromEntry(snapshot.entry)))
+          continue
+        } catch {
+          // fall back to plain file extraction when directory traversal fails
+        }
+      }
+      if (isProbablyImageFile(snapshot.file)) {
+        expanded.push({ file: snapshot.file, relativeSubfolder: '' })
       }
     }
     if (expanded.length) return expanded
   }
 
-  return normalizeUploadFiles(event?.dataTransfer?.files)
+  return normalizeUploadFiles(fallbackFiles)
 }
 
 function consumeExternalFileDrag(event) {
