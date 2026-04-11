@@ -49,7 +49,8 @@ function safeJsonParse(raw, fallback) {
 function defaultState() {
   return {
     version: STATE_VERSION,
-    items: []
+    items: [],
+    auto_queue: false
   }
 }
 
@@ -91,7 +92,8 @@ function parseState(raw) {
     : []
   return {
     version: STATE_VERSION,
-    items
+    items,
+    auto_queue: Boolean(state.auto_queue)
   }
 }
 
@@ -107,7 +109,15 @@ function parseUiState(raw) {
 }
 
 function serializeState(state) {
-  return JSON.stringify({ version: STATE_VERSION, items: state.items }, null, 0)
+  return JSON.stringify(
+    {
+      version: STATE_VERSION,
+      items: state.items,
+      auto_queue: Boolean(state.auto_queue)
+    },
+    null,
+    0
+  )
 }
 
 function serializeUiState(uiState) {
@@ -226,6 +236,95 @@ function updateQueueWidget(node, payload) {
 
 function findFirstByStatus(state, statuses) {
   return state.items.find((item) => statuses.includes(item.status)) ?? null
+}
+
+function countItemsByStatus(state, status) {
+  let count = 0
+  for (const item of state.items) {
+    if (item.status === status) count += 1
+  }
+  return count
+}
+
+const autoQueueCoordinator = {
+  nodes: new Set(),
+  listenerAttached: false,
+  pendingInternalQueueRequests: 0,
+  warnedAboutMultipleNodes: false,
+
+  registerNode(node) {
+    this.nodes.add(node)
+    this.attach()
+  },
+
+  unregisterNode(node) {
+    this.nodes.delete(node)
+    if (!this.nodes.size) {
+      this.warnedAboutMultipleNodes = false
+    }
+  },
+
+  attach() {
+    if (this.listenerAttached) return
+    this.listenerAttached = true
+    api.addEventListener('promptQueueing', (event) => {
+      this.handlePromptQueueing(event)
+    })
+  },
+
+  getEligibleNodes() {
+    const eligible = []
+    for (const node of this.nodes) {
+      if (!node?.graph || !node.__bilInitialized) continue
+      const { state } = getCurrentState(node)
+      if (!state.auto_queue) continue
+      const pendingCount = countItemsByStatus(state, 'pending')
+      if (pendingCount <= 0) continue
+      eligible.push({ node, pendingCount })
+    }
+    return eligible
+  },
+
+  handlePromptQueueing(event) {
+    if (this.pendingInternalQueueRequests > 0) {
+      this.pendingInternalQueueRequests -= 1
+      return
+    }
+
+    const eligibleNodes = this.getEligibleNodes()
+    if (eligibleNodes.length !== 1) {
+      if (eligibleNodes.length > 1 && !this.warnedAboutMultipleNodes) {
+        this.warnedAboutMultipleNodes = true
+        console.warn(
+          'Image Conveyor: auto-queue is only applied when exactly one conveyor node with pending items has auto-queue enabled.'
+        )
+      }
+      if (eligibleNodes.length <= 1) {
+        this.warnedAboutMultipleNodes = false
+      }
+      return
+    }
+
+    this.warnedAboutMultipleNodes = false
+
+    const requestedBatchCount = Math.max(
+      1,
+      Math.floor(Number(event?.detail?.batchCount) || 1)
+    )
+    const { pendingCount } = eligibleNodes[0]
+    const extraCount = pendingCount - requestedBatchCount
+    if (extraCount <= 0) return
+
+    this.pendingInternalQueueRequests += 1
+    queueMicrotask(() => {
+      void app.queuePrompt(0, extraCount).catch((error) => {
+        console.error(
+          'Image Conveyor: failed to auto-queue remaining pending images.',
+          error
+        )
+      })
+    })
+  }
 }
 
 function applySelectionToggle(uiState, itemId, checked) {
@@ -515,6 +614,19 @@ function ensureStyles() {
       flex-wrap: wrap;
       gap: 6px;
       align-items: center;
+    }
+    .bil-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 6px;
+      background: rgba(255,255,255,0.06);
+      user-select: none;
+    }
+    .bil-toggle input {
+      margin: 0;
     }
     .bil-dropzone {
       border: 1px dashed rgba(255,255,255,0.25);
@@ -970,17 +1082,15 @@ function renderNode(node) {
   const { state, uiState } = snapshot
   const selected = getSelectedIds(uiState)
 
-  let pendingCount = 0
-  let queuedCount = 0
-  let processedCount = 0
-  for (const item of state.items) {
-    if (item.status === 'pending') pendingCount += 1
-    else if (item.status === 'queued') queuedCount += 1
-    else if (item.status === 'processed') processedCount += 1
-  }
+  const pendingCount = countItemsByStatus(state, 'pending')
+  const queuedCount = countItemsByStatus(state, 'queued')
+  const processedCount = countItemsByStatus(state, 'processed')
   const nextItem = findFirstByStatus(state, ['pending', 'queued'])
 
   ctx.summary.textContent = `Total ${state.items.length} · Pending ${pendingCount} · Queued ${queuedCount} · Processed ${processedCount}`
+  if (ctx.autoQueueCheckbox) {
+    ctx.autoQueueCheckbox.checked = Boolean(state.auto_queue)
+  }
   ctx.nextText.textContent = nextItem
     ? `Next: ${nextItem.filename || nextItem.annotated}`
     : 'Next: none'
@@ -1063,7 +1173,16 @@ function buildDom(node) {
   sortBtn.type = 'button'
   sortBtn.textContent = 'Apply sort'
 
-  toolbar.append(selectAllBtn, selectNoneBtn, sortSelect, sortBtn)
+  const autoQueueLabel = document.createElement('label')
+  autoQueueLabel.className = 'bil-toggle'
+  const autoQueueCheckbox = document.createElement('input')
+  autoQueueCheckbox.type = 'checkbox'
+  autoQueueCheckbox.setAttribute('aria-label', 'Auto queue all pending images')
+  const autoQueueText = document.createElement('span')
+  autoQueueText.textContent = 'Auto queue all pending'
+  autoQueueLabel.append(autoQueueCheckbox, autoQueueText)
+
+  toolbar.append(selectAllBtn, selectNoneBtn, sortSelect, sortBtn, autoQueueLabel)
 
   const subtoolbar = document.createElement('div')
   subtoolbar.className = 'bil-subtoolbar'
@@ -1134,6 +1253,7 @@ function buildDom(node) {
     setPendingBtn,
     setProcessedBtn,
     deleteSelectedBtn,
+    autoQueueCheckbox,
     draggedId: null,
     empty: null,
     state: null,
@@ -1242,6 +1362,12 @@ function buildDom(node) {
   selectNoneBtn.addEventListener('click', () => {
     const { state, uiState } = getCurrentState(node)
     uiState.selected_ids = []
+    updateState(node, state, uiState)
+  })
+
+  autoQueueCheckbox.addEventListener('change', () => {
+    const { state, uiState } = getCurrentState(node)
+    state.auto_queue = autoQueueCheckbox.checked
     updateState(node, state, uiState)
   })
 
@@ -1374,6 +1500,7 @@ function initializeNode(node, widget) {
   node.setSize?.([Math.max(oldSize[0], 520), Math.max(oldSize[1], 760)])
 
   attachQueueLifecycle(node)
+  autoQueueCoordinator.registerNode(node)
 
   node.onDragOver = (event) => {
     if (!hasExternalFileDrag(event)) return false
@@ -1411,6 +1538,7 @@ function initializeNode(node, widget) {
   })
 
   chainNodeCallback(node, 'onRemoved', function () {
+    autoQueueCoordinator.unregisterNode(node)
     const ctx = node.__bil
     if (!ctx?.renderFrame) return
     cancelAnimationFrame(ctx.renderFrame)
