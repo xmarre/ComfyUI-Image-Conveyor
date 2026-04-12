@@ -424,6 +424,28 @@ function hasExternalFileDrag(event) {
   return files.some((file) => isProbablyImageFile(file))
 }
 
+function hasPotentialExternalFileDrag(event) {
+  const transfer = event?.dataTransfer
+  if (!transfer) return false
+  if (hasExternalFileDrag(event)) return true
+
+  const types = Array.from(transfer.types ?? [])
+  return types.includes('Files')
+}
+
+function finalizeExternalFileDrag(event) {
+  event.preventDefault()
+  event.stopPropagation()
+  event.stopImmediatePropagation?.()
+  if (event.dataTransfer) {
+    try {
+      event.dataTransfer.dropEffect = 'copy'
+    } catch {
+      // ignore browser-specific dropEffect failures
+    }
+  }
+}
+
 function readDirectoryEntries(reader) {
   return new Promise((resolve, reject) => {
     const entries = []
@@ -528,9 +550,13 @@ async function getDroppedImageFiles(event) {
 
 function consumeExternalFileDrag(event) {
   if (!hasExternalFileDrag(event)) return false
+  finalizeExternalFileDrag(event)
+  return true
+}
+
+function activatePotentialExternalFileDrag(event) {
+  if (!hasPotentialExternalFileDrag(event)) return false
   event.preventDefault()
-  event.stopPropagation()
-  event.stopImmediatePropagation?.()
   if (event.dataTransfer) {
     try {
       event.dataTransfer.dropEffect = 'copy'
@@ -1321,7 +1347,7 @@ function buildDom(node) {
   root.addEventListener(
     'dragenter',
     (event) => {
-      if (!consumeExternalFileDrag(event)) return
+      if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return
       externalDragDepth += 1
       setExternalDragActive(true)
     },
@@ -1331,7 +1357,7 @@ function buildDom(node) {
   root.addEventListener(
     'dragover',
     (event) => {
-      if (!consumeExternalFileDrag(event)) return
+      if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return
       setExternalDragActive(true)
     },
     true
@@ -1355,11 +1381,11 @@ function buildDom(node) {
   root.addEventListener(
     'drop',
     async (event) => {
-      consumeExternalFileDrag(event)
       const files = await getDroppedImageFiles(event)
       externalDragDepth = 0
       setExternalDragActive(false)
       if (!files.length) return
+      finalizeExternalFileDrag(event)
       await handleFiles(files)
     },
     true
@@ -1532,9 +1558,9 @@ function initializeNode(node, widget) {
   }
 
   node.onDragDrop = async (event) => {
-    consumeExternalFileDrag(event)
     const files = await getDroppedImageFiles(event)
     if (!files.length) return false
+    finalizeExternalFileDrag(event)
     return await uploadViaNode(node, files)
   }
 
