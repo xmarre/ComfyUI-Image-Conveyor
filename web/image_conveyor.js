@@ -554,12 +554,6 @@ function consumeExternalFileDrag(event) {
   return true
 }
 
-function consumePotentialExternalFileDrag(event) {
-  if (!hasPotentialExternalFileDrag(event)) return false
-  finalizeExternalFileDrag(event)
-  return true
-}
-
 function activatePotentialExternalFileDrag(event) {
   if (!hasPotentialExternalFileDrag(event)) return false
   event.preventDefault()
@@ -1387,7 +1381,7 @@ function buildDom(node) {
   root.addEventListener(
     'drop',
     async (event) => {
-      if (!consumePotentialExternalFileDrag(event)) return
+      if (!consumeExternalFileDrag(event)) return
       const files = await getDroppedImageFiles(event)
       externalDragDepth = 0
       setExternalDragActive(false)
@@ -1564,7 +1558,7 @@ function initializeNode(node, widget) {
   }
 
   node.onDragDrop = async (event) => {
-    if (!consumePotentialExternalFileDrag(event)) return false
+    if (!consumeExternalFileDrag(event)) return false
     const files = await getDroppedImageFiles(event)
     if (!files.length) return false
     return await uploadViaNode(node, files)
