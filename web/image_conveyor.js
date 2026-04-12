@@ -1381,7 +1381,11 @@ function buildDom(node) {
   root.addEventListener(
     'drop',
     async (event) => {
-      if (!consumeExternalFileDrag(event)) return
+      if (!consumeExternalFileDrag(event)) {
+        externalDragDepth = 0
+        setExternalDragActive(false)
+        return
+      }
       const files = await getDroppedImageFiles(event)
       externalDragDepth = 0
       setExternalDragActive(false)
