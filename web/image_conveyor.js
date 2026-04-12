@@ -691,11 +691,17 @@ function ensureStyles() {
       min-height: 100%;
     }
     .bil-empty {
+      min-height: 100%;
+      box-sizing: border-box;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       padding: 14px 10px;
       text-align: center;
       border: 1px dashed rgba(255,255,255,0.12);
       border-radius: 8px;
       opacity: 0.7;
+      pointer-events: none;
     }
     .bil-row {
       position: absolute;
@@ -1057,9 +1063,9 @@ function renderVisibleRows(node) {
 
   if (!state.items.length) {
     ctx.listInner.style.height = 'auto'
-    ctx.listInner.style.minHeight = '0px'
+    ctx.listInner.style.minHeight = ''
     ctx.listWindow.style.height = 'auto'
-    ctx.listWindow.style.minHeight = '0px'
+    ctx.listWindow.style.minHeight = ''
     hideUnusedRowSlots(ctx, 0)
     ctx.renderedRangeKey = ''
     return
@@ -1112,9 +1118,9 @@ function renderNode(node) {
 
   if (!state.items.length) {
     ctx.listInner.style.height = 'auto'
-    ctx.listInner.style.minHeight = '0px'
+    ctx.listInner.style.minHeight = ''
     ctx.listWindow.style.height = 'auto'
-    ctx.listWindow.style.minHeight = '0px'
+    ctx.listWindow.style.minHeight = ''
     hideUnusedRowSlots(ctx, 0)
     ctx.renderedRangeKey = ''
     if (!ctx.empty) {
