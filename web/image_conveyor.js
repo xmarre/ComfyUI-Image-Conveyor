@@ -906,26 +906,30 @@ function createRowSlot(node, ctx) {
     previewUrl: ''
   }
 
+  const clearTargets = (exceptRow = null) => clearRowDragTargets(ctx, exceptRow)
+
   row.addEventListener('dragstart', () => {
     if (!slot.itemId) return
     ctx.draggedId = slot.itemId
+    clearTargets()
   })
   row.addEventListener('dragend', () => {
     ctx.draggedId = null
-    row.classList.remove('bil-drag-target')
+    clearTargets()
   })
   row.addEventListener('dragover', (event) => {
-    if (!slot.itemId) return
+    if (!slot.itemId || !ctx.draggedId) return
     event.preventDefault()
+    clearTargets(row)
     row.classList.add('bil-drag-target')
   })
   row.addEventListener('dragleave', () => {
     row.classList.remove('bil-drag-target')
   })
   row.addEventListener('drop', (event) => {
-    if (!slot.itemId) return
+    if (!slot.itemId || !ctx.draggedId) return
     event.preventDefault()
-    row.classList.remove('bil-drag-target')
+    clearTargets()
     const { state: liveState, uiState: liveUiState } = getCurrentState(node)
     if (moveItems(liveState, ctx.draggedId, slot.itemId)) {
       updateState(node, liveState, liveUiState)
@@ -1027,6 +1031,14 @@ function createRowSlot(node, ctx) {
   return slot
 }
 
+function clearRowDragTargets(ctx, exceptRow = null) {
+  for (const slot of ctx.rowPool) {
+    if (slot.row !== exceptRow) {
+      slot.row.classList.remove('bil-drag-target')
+    }
+  }
+}
+
 function ensureRowPool(node, needed) {
   const ctx = node.__bil
   if (!ctx) return
@@ -1056,6 +1068,7 @@ function updateRowSlot(slot, item, index, selected) {
   slot.row.style.display = 'grid'
   slot.row.style.top = `${index * ROW_STRIDE}px`
   slot.row.dataset.itemId = item.id
+  slot.row.classList.remove('bil-drag-target')
   slot.row.classList.toggle('bil-selected', selected.has(item.id))
 
   slot.checkbox.checked = selected.has(item.id)
@@ -1311,6 +1324,7 @@ function buildDom(node) {
     renderViewportOnly: false,
     rowPool: []
   }
+  const ctx = node.__bil
 
   list.addEventListener('scroll', () => scheduleRenderNode(node, { viewportOnly: true }), {
     passive: true
@@ -1320,6 +1334,9 @@ function buildDom(node) {
   const setExternalDragActive = (active) => {
     root.classList.toggle('bil-dragover', active)
     dropzone.classList.toggle('bil-dragover', active)
+    if (!active) {
+      clearRowDragTargets(ctx)
+    }
   }
 
   const handleFiles = async (fileList) => {
