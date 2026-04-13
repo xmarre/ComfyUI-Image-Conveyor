@@ -755,7 +755,7 @@ function ensureStyles() {
     .bil-thumb {
       width: 52px;
       height: 52px;
-      object-fit: cover;
+      object-fit: contain;
       border-radius: 6px;
       background: rgba(255,255,255,0.06);
     }
