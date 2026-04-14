@@ -137,6 +137,7 @@ def _select_item(state: Dict[str, Any], queue_item_json: Any) -> Tuple[int, Dict
 class ImageConveyor:
     CATEGORY = "image"
     FUNCTION = "load_next"
+    HAS_INTERMEDIATE_OUTPUT = True
     RETURN_TYPES = ("IMAGE", "MASK", "STRING", "INT", "INT")
     RETURN_NAMES = ("image", "mask", "path", "index", "remaining_pending")
     SEARCH_ALIASES = [
