@@ -25,6 +25,7 @@ def _default_ui_state() -> Dict[str, Any]:
     return {
         "version": _STATE_VERSION,
         "selected_ids": [],
+        "source_paths": {},
     }
 
 
@@ -84,12 +85,23 @@ def _normalize_state(raw: Any) -> Dict[str, Any]:
 def _normalize_ui_state(raw: Any) -> Dict[str, Any]:
     ui_state = _safe_json_load(raw, _default_ui_state())
     selected_ids_raw = ui_state.get("selected_ids", []) if isinstance(ui_state, dict) else []
+    source_paths_raw = ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
     selected_ids: List[str] = []
     if isinstance(selected_ids_raw, list):
         selected_ids = [str(value) for value in selected_ids_raw if str(value).strip()]
+
+    source_paths: Dict[str, str] = {}
+    if isinstance(source_paths_raw, dict):
+        for key, value in source_paths_raw.items():
+            item_id = str(key).strip()
+            path = str(value).strip()
+            if item_id and path:
+                source_paths[item_id] = path
+
     return {
         "version": _STATE_VERSION,
         "selected_ids": selected_ids,
+        "source_paths": source_paths,
     }
 
 
@@ -106,6 +118,15 @@ def _parse_queue_item(raw: Any) -> Optional[Dict[str, Any]]:
         "id": item_id,
         "annotated": annotated,
     }
+
+
+def _get_runtime_source_path(ui_state: Dict[str, Any], item: Dict[str, Any]) -> str:
+    source_paths = ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
+    if isinstance(source_paths, dict):
+        source_path = str(source_paths.get(item["id"], "")).strip()
+        if source_path:
+            return source_path
+    return str(item.get("source_path", "")).strip()
 
 
 def _find_item_by_id(state: Dict[str, Any], item_id: str) -> Tuple[int, Optional[Dict[str, Any]]]:
@@ -223,11 +244,12 @@ class ImageConveyor:
         return True
 
     def load_next(self, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
-        del ui_state_json
         state = _normalize_state(state_json)
+        ui_state = _normalize_ui_state(ui_state_json)
         index, item = _select_item(state, queue_item_json)
 
         annotated = item["annotated"]
+        source_path = _get_runtime_source_path(ui_state, item)
         image, mask = nodes.LoadImage().load_image(annotated)
 
         remaining_pending = 0
@@ -251,7 +273,7 @@ class ImageConveyor:
                 annotated,
                 index + 1,
                 remaining_pending,
-                item.get("source_path", ""),
+                source_path,
             ),
             "ui": {
                 "batch_image_loader_delta": [json.dumps(delta, separators=(",", ":"))],

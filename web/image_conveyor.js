@@ -57,7 +57,8 @@ function defaultState() {
 function defaultUiState() {
   return {
     version: STATE_VERSION,
-    selected_ids: []
+    selected_ids: [],
+    source_paths: {}
   }
 }
 
@@ -103,9 +104,18 @@ function parseUiState(raw) {
   const selectedIds = Array.isArray(uiState.selected_ids)
     ? uiState.selected_ids.map((value) => String(value)).filter(Boolean)
     : []
+  const sourcePaths = {}
+  if (uiState.source_paths && typeof uiState.source_paths === 'object') {
+    for (const [key, value] of Object.entries(uiState.source_paths)) {
+      const itemId = String(key ?? '').trim()
+      const sourcePath = normalizeSourcePath(value)
+      if (itemId && sourcePath) sourcePaths[itemId] = sourcePath
+    }
+  }
   return {
     version: STATE_VERSION,
-    selected_ids: selectedIds
+    selected_ids: selectedIds,
+    source_paths: sourcePaths
   }
 }
 
@@ -123,7 +133,11 @@ function serializeState(state) {
 
 function serializeUiState(uiState) {
   return JSON.stringify(
-    { version: STATE_VERSION, selected_ids: uiState.selected_ids },
+    {
+      version: STATE_VERSION,
+      selected_ids: uiState.selected_ids,
+      source_paths: uiState.source_paths
+    },
     null,
     0
   )
@@ -179,6 +193,9 @@ function getCurrentState(node) {
   const uiState = parseUiState(uiStateWidget?.value ?? '')
   const validIds = new Set(state.items.map((item) => item.id))
   uiState.selected_ids = uiState.selected_ids.filter((id) => validIds.has(id))
+  uiState.source_paths = Object.fromEntries(
+    Object.entries(uiState.source_paths).filter(([itemId]) => validIds.has(itemId))
+  )
   return { state, uiState }
 }
 
@@ -423,8 +440,14 @@ function getSourcePathHint(entry) {
   return normalizeSourcePath(`${relativeSubfolder}/${file.name}`)
 }
 
-function getItemDisplayPath(item) {
-  return isMeaningfulSourcePath(item.source_path) ? item.source_path : item.annotated
+function getRuntimeSourcePath(item, uiState = null) {
+  const sourcePath = normalizeSourcePath(uiState?.source_paths?.[item.id] ?? item.source_path)
+  return sourcePath || ''
+}
+
+function getItemDisplayPath(item, uiState = null) {
+  const sourcePath = getRuntimeSourcePath(item, uiState)
+  return isMeaningfulSourcePath(sourcePath) ? sourcePath : item.annotated
 }
 
 function buildUploadSubfolder(relativeSubfolder = '') {
@@ -1098,6 +1121,7 @@ function createRowSlot(node, ctx) {
     liveUiState.selected_ids = liveUiState.selected_ids.filter(
       (id) => id !== slot.itemId
     )
+    delete liveUiState.source_paths[slot.itemId]
     updateState(node, liveState, liveUiState)
   })
   slot.deleteBtn = deleteBtn
@@ -1136,8 +1160,8 @@ function hideUnusedRowSlots(ctx, startIndex = 0) {
   }
 }
 
-function updateRowSlot(slot, item, index, selected) {
-  const itemLabel = item.filename || getItemDisplayPath(item)
+function updateRowSlot(slot, item, index, selected, uiState) {
+  const itemLabel = item.filename || getItemDisplayPath(item, uiState)
   const previewUrl = filePreviewUrl(item)
 
   slot.itemId = item.id
@@ -1157,7 +1181,7 @@ function updateRowSlot(slot, item, index, selected) {
   }
 
   slot.name.textContent = itemLabel
-  slot.path.textContent = getItemDisplayPath(item)
+  slot.path.textContent = getItemDisplayPath(item, uiState)
 
   slot.badge.className = `bil-badge bil-badge-${item.status}`
   slot.badge.textContent = item.status
@@ -1202,7 +1226,8 @@ function renderVisibleRows(node) {
       ctx.rowPool[offset],
       state.items[start + offset],
       start + offset,
-      selected
+      selected,
+      uiState
     )
   }
   hideUnusedRowSlots(ctx, needed)
@@ -1228,7 +1253,7 @@ function renderNode(node) {
     ctx.autoQueueCheckbox.checked = Boolean(state.auto_queue)
   }
   ctx.nextText.textContent = nextItem
-    ? `Next: ${nextItem.filename || getItemDisplayPath(nextItem)}`
+    ? `Next: ${nextItem.filename || getItemDisplayPath(nextItem, uiState)}`
     : 'Next: none'
 
   if (!state.items.length) {
@@ -1425,7 +1450,10 @@ function buildDom(node) {
       const { state, uiState } = getCurrentState(node)
       for (const entry of uploaded) {
         const item = makeItemFromUploadResponse(entry)
-        if (item) state.items.push(item)
+        if (!item) continue
+        state.items.push(item)
+        const runtimeSourcePath = normalizeSourcePath(entry?.source_path)
+        if (runtimeSourcePath) uiState.source_paths[item.id] = runtimeSourcePath
       }
       updateState(node, state, uiState)
     } finally {
@@ -1520,14 +1548,14 @@ function buildDom(node) {
     switch (sortSelect.value) {
       case 'name_asc':
         state.items.sort((a, b) =>
-          getItemDisplayPath(a).localeCompare(getItemDisplayPath(b), undefined, {
+          getItemDisplayPath(a, uiState).localeCompare(getItemDisplayPath(b, uiState), undefined, {
             sensitivity: 'base'
           })
         )
         break
       case 'name_desc':
         state.items.sort((a, b) =>
-          getItemDisplayPath(b).localeCompare(getItemDisplayPath(a), undefined, {
+          getItemDisplayPath(b, uiState).localeCompare(getItemDisplayPath(a, uiState), undefined, {
             sensitivity: 'base'
           })
         )
@@ -1586,6 +1614,11 @@ function buildDom(node) {
     uiState.selected_ids = uiState.selected_ids.filter((id) =>
       state.items.some((item) => item.id === id)
     )
+    uiState.source_paths = Object.fromEntries(
+      Object.entries(uiState.source_paths).filter(([itemId]) =>
+        state.items.some((item) => item.id === itemId)
+      )
+    )
     updateState(node, state, uiState)
   })
 
@@ -1594,6 +1627,9 @@ function buildDom(node) {
     const selected = getSelectedIds(uiState)
     state.items = state.items.filter((item) => !selected.has(item.id))
     uiState.selected_ids = []
+    uiState.source_paths = Object.fromEntries(
+      Object.entries(uiState.source_paths).filter(([itemId]) => !selected.has(itemId))
+    )
     updateState(node, state, uiState)
   })
 
@@ -1612,7 +1648,10 @@ async function uploadViaNode(node, files) {
     const { state, uiState } = getCurrentState(node)
     for (const entry of uploaded) {
       const item = makeItemFromUploadResponse(entry)
-      if (item) state.items.push(item)
+      if (!item) continue
+      state.items.push(item)
+      const runtimeSourcePath = normalizeSourcePath(entry?.source_path)
+      if (runtimeSourcePath) uiState.source_paths[item.id] = runtimeSourcePath
     }
     updateState(node, state, uiState)
     return true
