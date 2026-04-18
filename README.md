@@ -83,6 +83,7 @@ So it can be used both as a simple sequential loader and as part of queue-driven
 `path` is the ComfyUI-side annotated input path that the node actually loads.
 `source_path` is an optional best-effort hint for the original dropped path when the runtime exposes one
 (for example a folder-relative path during directory drops, or a native path in runtimes that explicitly provide it).
+Absolute native paths are intentionally redacted to filename-only before persistence to avoid leaking local directory details in exported workflows.
 
 ## Installation
 

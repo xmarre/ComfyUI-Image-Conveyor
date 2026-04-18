@@ -77,7 +77,7 @@ function normalizeItem(item) {
     annotated,
     filename: String(item.filename ?? '').trim(),
     subfolder: String(item.subfolder ?? '').trim(),
-    source_path: String(item.source_path ?? '').trim(),
+    source_path: sanitizePersistedSourcePath(item.source_path),
     type: String(item.type ?? 'input').trim() || 'input',
     status,
     added_at: Number(item.added_at ?? 0) || 0,
@@ -389,6 +389,18 @@ function normalizeSourcePath(path) {
   return normalized
 }
 
+function isAbsoluteSourcePath(path) {
+  return /^[a-zA-Z]:\//.test(path) || path.startsWith('//') || path.startsWith('/')
+}
+
+function sanitizePersistedSourcePath(path) {
+  const normalized = normalizeSourcePath(path)
+  if (!normalized) return ''
+  if (!isAbsoluteSourcePath(normalized)) return normalized
+  const segments = normalized.split('/').filter(Boolean)
+  return segments.length ? segments[segments.length - 1] : ''
+}
+
 function isMeaningfulSourcePath(path) {
   return /^[a-zA-Z]:\//.test(path) || path.startsWith('//') || path.includes('/')
 }
@@ -400,7 +412,7 @@ function getSourcePathHint(entry) {
   const nativePath = typeof file.path === 'string' ? normalizeSourcePath(file.path) : ''
   if (nativePath && !/^[a-zA-Z]:\/fakepath\//i.test(nativePath)) return nativePath
 
-  const entryFullPath = normalizeSourcePath(entry?.entry?.fullPath)
+  const entryFullPath = normalizeSourcePath(entry?.entry?.fullPath).replace(/^\/+/, '')
   if (isMeaningfulSourcePath(entryFullPath)) return entryFullPath
 
   const relativePath = normalizeSourcePath(file.webkitRelativePath)
@@ -635,7 +647,7 @@ function filePreviewUrl(item) {
 function makeItemFromUploadResponse(data) {
   const filename = String(data?.name ?? '').trim()
   const subfolder = String(data?.subfolder ?? '').trim()
-  const sourcePath = normalizeSourcePath(data?.source_path)
+  const sourcePath = sanitizePersistedSourcePath(data?.source_path)
   const type = String(data?.type ?? 'input').trim() || 'input'
   if (!filename) return null
 
