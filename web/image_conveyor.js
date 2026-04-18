@@ -495,15 +495,21 @@ function getRuntimeSourcePath(item, uiState = null) {
   return sourcePath || ''
 }
 
+function stripAnnotatedStorageTypeSuffix(value) {
+  return String(value ?? '').replace(/ \[(input|output|temp)\]$/, '')
+}
+
 /**
  * Choose the display path for an item, preferring a runtime source path when available.
  * @param {Object} item - Item object containing at least `annotated` and persisted `source_path`.
  * @param {Object|null} [uiState=null] - Optional UI state that may contain `source_paths[item.id]` to override the item's persisted path.
- * @returns {string} The runtime `source_path` if it appears meaningful, otherwise the item's `annotated` text.
+ * @returns {string} The runtime `source_path` if it appears meaningful, otherwise the item's `annotated` text without the storage-type suffix.
  */
 function getItemDisplayPath(item, uiState = null) {
   const sourcePath = getRuntimeSourcePath(item, uiState)
-  return isMeaningfulSourcePath(sourcePath) ? sourcePath : item.annotated
+  return isMeaningfulSourcePath(sourcePath)
+    ? sourcePath
+    : stripAnnotatedStorageTypeSuffix(item.annotated)
 }
 
 /**
