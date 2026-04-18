@@ -424,7 +424,7 @@ function getSourcePathHint(entry) {
 }
 
 function getItemDisplayPath(item) {
-  return item.source_path || item.annotated
+  return isMeaningfulSourcePath(item.source_path) ? item.source_path : item.annotated
 }
 
 function buildUploadSubfolder(relativeSubfolder = '') {
@@ -684,7 +684,13 @@ async function uploadFiles(files) {
       )
     }
     const payload = await response.json()
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    if (
+      !payload ||
+      typeof payload !== 'object' ||
+      Array.isArray(payload) ||
+      typeof payload.name !== 'string' ||
+      !payload.name.trim()
+    ) {
       throw new Error(`Invalid upload response for '${file.name}'.`)
     }
     payload.source_path = getSourcePathHint(entry)
@@ -1667,6 +1673,11 @@ function initializeNode(node, widget) {
 
   chainNodeCallback(node, 'onConfigure', function () {
     const snapshot = getCurrentState(node)
+    const normalizedStateValue = serializeState(snapshot.state)
+    if (stateWidget.value !== normalizedStateValue) {
+      setWidgetValue(stateWidget, normalizedStateValue)
+      markNodeDirty(node)
+    }
     cacheRenderableState(node, snapshot.state, snapshot.uiState)
     queueMicrotask(() => scheduleRenderNode(node))
   })
@@ -1685,6 +1696,11 @@ function initializeNode(node, widget) {
   })
 
   const snapshot = getCurrentState(node)
+  const normalizedStateValue = serializeState(snapshot.state)
+  if (stateWidget.value !== normalizedStateValue) {
+    setWidgetValue(stateWidget, normalizedStateValue)
+    markNodeDirty(node)
+  }
   cacheRenderableState(node, snapshot.state, snapshot.uiState)
   queueMicrotask(() => scheduleRenderNode(node))
   return widget
