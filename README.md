@@ -76,8 +76,13 @@ The node exposes:
 - `path`
 - `index`
 - `remaining_pending`
+- `source_path`
 
 So it can be used both as a simple sequential loader and as part of queue-driven workflows that need metadata and queue state.
+
+`path` is the ComfyUI-side annotated input path that the node actually loads.
+`source_path` is an optional best-effort hint for the original dropped path when the runtime exposes one
+(for example a folder-relative path during directory drops, or a native path in runtimes that explicitly provide it).
 
 ## Installation
 

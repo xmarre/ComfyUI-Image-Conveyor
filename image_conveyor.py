@@ -56,6 +56,7 @@ def _normalize_item(item: Any) -> Optional[Dict[str, Any]]:
         "annotated": annotated,
         "filename": str(item.get("filename", "")).strip(),
         "subfolder": str(item.get("subfolder", "")).strip(),
+        "source_path": str(item.get("source_path", "")).strip(),
         "type": str(item.get("type", "input")).strip() or "input",
         "status": status,
         "added_at": int(item.get("added_at", 0) or 0),
@@ -138,8 +139,15 @@ class ImageConveyor:
     CATEGORY = "image"
     FUNCTION = "load_next"
     HAS_INTERMEDIATE_OUTPUT = True
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "INT", "INT")
-    RETURN_NAMES = ("image", "mask", "path", "index", "remaining_pending")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "INT", "INT", "STRING")
+    RETURN_NAMES = (
+        "image",
+        "mask",
+        "path",
+        "index",
+        "remaining_pending",
+        "source_path",
+    )
     SEARCH_ALIASES = [
         "image conveyor",
         "comfyui image conveyor",
@@ -243,6 +251,7 @@ class ImageConveyor:
                 annotated,
                 index + 1,
                 remaining_pending,
+                item.get("source_path", ""),
             ),
             "ui": {
                 "batch_image_loader_delta": [json.dumps(delta, separators=(",", ":"))],
