@@ -376,13 +376,17 @@ function normalizeSourcePath(path) {
     return trimmed.replace(/\\/g, '/')
   }
 
-  return trimmed
+  const hasLeadingSlash = /^\/+/.test(trimmed)
+  const normalized = trimmed
     .replace(/\\/g, '/')
-    .replace(/^\/+/, '')
+    .replace(/^\/+/, hasLeadingSlash ? '/' : '')
     .split('/')
     .map((segment) => segment.trim())
     .filter((segment) => segment && segment !== '.' && segment !== '..')
     .join('/')
+  if (!normalized) return ''
+  if (hasLeadingSlash && !normalized.startsWith('/')) return `/${normalized}`
+  return normalized
 }
 
 function isMeaningfulSourcePath(path) {
@@ -668,6 +672,9 @@ async function uploadFiles(files) {
       )
     }
     const payload = await response.json()
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new Error(`Invalid upload response for '${file.name}'.`)
+    }
     payload.source_path = getSourcePathHint(entry)
     uploaded.push(payload)
   }
