@@ -54,6 +54,14 @@ function defaultState() {
   }
 }
 
+/**
+ * Create the default UI state for the image conveyor widget.
+ *
+ * @returns {{version:number, selected_ids:string[], source_paths:Object}} An object with:
+ *  - `version`: the UI state schema version,
+ *  - `selected_ids`: an array of item IDs that are currently selected,
+ *  - `source_paths`: a mapping from item ID to the runtime source path string.
+ */
 function defaultUiState() {
   return {
     version: STATE_VERSION,
@@ -99,6 +107,16 @@ function parseState(raw) {
   }
 }
 
+/**
+ * Parse a stored UI-state JSON value into a normalized runtime UI state.
+ *
+ * Parses `raw` using safe JSON parsing and normalizes `selected_ids` into an array of non-empty strings
+ * and `source_paths` into an object mapping item ids to normalized source path strings. Always returns
+ * the current `STATE_VERSION` along with the normalized fields.
+ *
+ * @param {*} raw - The raw stored widget value (JSON string or object) to parse.
+ * @returns {{version:number, selected_ids:string[], source_paths:Record<string,string>}} The normalized UI state containing `version`, `selected_ids`, and `source_paths`.
+ */
 function parseUiState(raw) {
   const uiState = safeJsonParse(raw, defaultUiState())
   const selectedIds = Array.isArray(uiState.selected_ids)
@@ -131,6 +149,11 @@ function serializeState(state) {
   )
 }
 
+/**
+ * Serialize the UI state into a compact JSON string suitable for widget storage.
+ * @param {{selected_ids: string[], source_paths: Record<string, string>}} uiState - UI state containing selected item IDs and optional per-item runtime source paths.
+ * @returns {string} JSON text containing `version` (STATE_VERSION), `selected_ids`, and `source_paths`.
+ */
 function serializeUiState(uiState) {
   return JSON.stringify(
     {
@@ -187,6 +210,11 @@ function getWidgets(node) {
   }
 }
 
+/**
+ * Read and normalize the node's stored state and UI state, pruning UI selections and source paths to items that exist in the state.
+ * @param {object} node - The ComfyUI node containing the hidden `state` and `ui_state` widgets.
+ * @returns {{state: object, uiState: object}} An object with `state` (normalized state shape) and `uiState` (normalized UI shape). `uiState.selected_ids` will contain only IDs present in `state.items`, and `uiState.source_paths` will only include entries whose keys match `state.items` IDs.
+ */
 function getCurrentState(node) {
   const { stateWidget, uiStateWidget } = getWidgets(node)
   const state = parseState(stateWidget?.value ?? '')
@@ -422,6 +450,22 @@ function isMeaningfulSourcePath(path) {
   return /^[a-zA-Z]:\//.test(path) || path.startsWith('//') || path.includes('/')
 }
 
+/**
+ * Derives a meaningful persisted source path hint from a dropped file entry.
+ *
+ * Examines available metadata on `entry` in priority order and returns the first plausible path:
+ * 1. `file.path` (normalized) unless it appears to be a browser "fakepath",
+ * 2. `entry.entry.fullPath` (normalized and trimmed of leading slashes),
+ * 3. `file.webkitRelativePath` (normalized),
+ * 4. `<relativeSubfolder>/<file.name>` when `relativeSubfolder` is present and normalized;
+ * otherwise returns an empty string.
+ *
+ * @param {object} entry - Drop entry wrapper from drag/drop or file input handling.
+ * @param {File} [entry.file] - The File object for the dropped item.
+ * @param {object} [entry.entry] - Optional FileSystem entry (may contain `fullPath`).
+ * @param {string} [entry.relativeSubfolder] - Optional relative subfolder inferred during directory traversal.
+ * @returns {string} A normalized, meaningful source path hint when available, or an empty string.
+ */
 function getSourcePathHint(entry) {
   const file = entry?.file
   if (!(file instanceof File)) return ''
@@ -440,16 +484,33 @@ function getSourcePathHint(entry) {
   return normalizeSourcePath(`${relativeSubfolder}/${file.name}`)
 }
 
+/**
+ * Selects the runtime source path to display for an item, preferring a UI-provided override.
+ * @param {Object} item - Item object with at least `id` and `source_path`.
+ * @param {Object|null} uiState - UI state that may contain a `source_paths` map of item id → override path.
+ * @returns {string} The normalized source path to use for display, or an empty string if none is available.
+ */
 function getRuntimeSourcePath(item, uiState = null) {
   const sourcePath = normalizeSourcePath(uiState?.source_paths?.[item.id] ?? item.source_path)
   return sourcePath || ''
 }
 
+/**
+ * Choose the display path for an item, preferring a runtime source path when available.
+ * @param {Object} item - Item object containing at least `annotated` and persisted `source_path`.
+ * @param {Object|null} [uiState=null] - Optional UI state that may contain `source_paths[item.id]` to override the item's persisted path.
+ * @returns {string} The runtime `source_path` if it appears meaningful, otherwise the item's `annotated` text.
+ */
 function getItemDisplayPath(item, uiState = null) {
   const sourcePath = getRuntimeSourcePath(item, uiState)
   return isMeaningfulSourcePath(sourcePath) ? sourcePath : item.annotated
 }
 
+/**
+ * Build the upload subfolder path used for image uploads.
+ * @param {string} relativeSubfolder - A relative subfolder path (may be empty or contain redundant segments); treated as relative to the base upload folder.
+ * @returns {string} The resulting upload subfolder path; if `relativeSubfolder` is empty or normalizes to empty, returns the base upload folder.
+ */
 function buildUploadSubfolder(relativeSubfolder = '') {
   const normalized = normalizeRelativeSubfolder(relativeSubfolder)
   return normalized ? `${DEFAULT_SUBFOLDER}/${normalized}` : DEFAULT_SUBFOLDER
@@ -993,6 +1054,11 @@ function getVisibleRowRange(list, totalItems) {
   }
 }
 
+/**
+ * Create a reusable virtualized row slot for an image item, providing its DOM structure and wiring event handlers for drag/drop, selection, preview, and per-item actions.
+ * @param {Object} node - The node instance the slot will operate against (used to read/update widget state).
+ * @param {Object} ctx - Rendering/context object containing shared state and helpers (e.g., `draggedId`, drag-target utilities).
+ * @returns {{row: HTMLElement, itemId: string|null, previewUrl: string, checkbox: HTMLInputElement, thumb: HTMLImageElement, name: HTMLElement, path: HTMLElement, badge: HTMLElement, indexText: HTMLElement, pendingBtn: HTMLButtonElement, processedBtn: HTMLButtonElement, deleteBtn: HTMLButtonElement}} A slot object containing the root row element, the currently bound item id and preview URL, and references to child controls used by the renderer.
 function createRowSlot(node, ctx) {
   const row = document.createElement('div')
   row.className = 'bil-row'
@@ -1149,6 +1215,16 @@ function ensureRowPool(node, needed) {
   }
 }
 
+/**
+ * Hide and clear all row slots in the pool from `startIndex` onward.
+ *
+ * Clears each slot's displayed data (itemId, previewUrl, dataset) and removes
+ * selection/drag CSS classes, then sets the slot DOM row to display: none.
+ *
+ * @param {{rowPool: Array}} ctx - Context object containing `rowPool`, an array of slot objects.
+ * Each slot is expected to have `itemId`, `previewUrl`, `row` (DOM element), and `row.dataset`.
+ * @param {number} [startIndex=0] - Inclusive index in `rowPool` from which slots should be hidden.
+ */
 function hideUnusedRowSlots(ctx, startIndex = 0) {
   for (let index = startIndex; index < ctx.rowPool.length; index += 1) {
     const slot = ctx.rowPool[index]
@@ -1160,6 +1236,18 @@ function hideUnusedRowSlots(ctx, startIndex = 0) {
   }
 }
 
+/**
+ * Populate a pooled row slot's DOM with data for a specific item and selection state.
+ *
+ * Updates the slot's attributes, text, badge, thumbnail, ARIA labels, and positioning so the
+ * row reflects the provided item's current data and the UI state's display path.
+ *
+ * @param {object} slot - Reusable row slot containing DOM elements (row, checkbox, thumb, name, path, badge, buttons, etc.).
+ * @param {object} item - Normalized item object (must include `id`, `filename`, `status`, and other display fields).
+ * @param {number} index - Zero-based index of the item within the rendered list.
+ * @param {Set<string>} selected - Set of selected item IDs.
+ * @param {object} uiState - UI state object used to derive runtime display paths (e.g., `source_paths`).
+ */
 function updateRowSlot(slot, item, index, selected, uiState) {
   const itemLabel = item.filename || getItemDisplayPath(item, uiState)
   const previewUrl = filePreviewUrl(item)
@@ -1193,6 +1281,15 @@ function updateRowSlot(slot, item, index, selected, uiState) {
   slot.deleteBtn.setAttribute('aria-label', `Delete ${itemLabel}`)
 }
 
+/**
+ * Update the widget's virtualized list to render only the rows currently visible in the viewport.
+ *
+ * Reads the cached renderable state for the given node, computes the visible row range, ensures a pool
+ * of row slots exists, populates those slots with item data and UI state, hides unused slots, and
+ * adjusts container sizing. If there are no items the function clears the list layout and hides slots.
+ *
+ * @param {Object} node - The node that owns the batch image loader widget (expected to have a `__bil` render context).
+ */
 function renderVisibleRows(node) {
   const ctx = node.__bil
   if (!ctx) return
@@ -1234,6 +1331,13 @@ function renderVisibleRows(node) {
   ctx.renderedRangeKey = rangeKey
 }
 
+/**
+ * Update the widget DOM to reflect the node's current state and UI state.
+ *
+ * Reads the node's parsed state and uiState, caches the render snapshot, and updates the summary text, next-item text, empty-list UI, row virtualization (visible rows), and action-button enabled/disabled states to match the current items, selection, and auto-queue flag.
+ *
+ * @param {Object} node - The ComfyUI node instance that contains the widget context (node.__bil) to render into.
+ */
 function renderNode(node) {
   const ctx = node.__bil
   if (!ctx) return
@@ -1284,6 +1388,14 @@ function renderNode(node) {
   ctx.deleteSelectedBtn.disabled = selected.size === 0
 }
 
+/**
+ * Build the DOM for the image-conveyor widget, attach interactive controls and event handlers, and store internal references on the node.
+ *
+ * Creates the widget's root element, ensures required stylesheet is present, wires file/drop handling, selection/sorting/status controls,
+ * virtualization scroll handling, and assigns runtime state/refs to `node.__bil`.
+ *
+ * @param {object} node - The ComfyUI node object that will host the widget; `node.__bil` will be populated with DOM references and runtime state.
+ * @returns {HTMLElement} The root DOM element for the widget.
 function buildDom(node) {
   ensureStyles()
 
@@ -1636,6 +1748,15 @@ function buildDom(node) {
   return root
 }
 
+/**
+ * Uploads the provided files through the node's upload pipeline and appends any created items to the node's state.
+ *
+ * The node's UI state (`uiState.source_paths`) is updated with normalized source paths for uploaded items, and the node
+ * state is written back so the widget reflects the new items.
+ *
+ * @param {object} node - The ComfyUI node instance that hosts the batch image loader widget.
+ * @param {FileList|File[]|Array<{file: File, relativeSubfolder?: string}>} files - Files or normalized file entries to upload.
+ * @returns {boolean} `true` if one or more files were uploaded and applied to the node state, `false` if the node widget context is missing or no valid image files were provided.
 async function uploadViaNode(node, files) {
   const ctx = node.__bil
   if (!ctx) return false
