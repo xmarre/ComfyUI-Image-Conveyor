@@ -77,6 +77,7 @@ function normalizeItem(item) {
     annotated,
     filename: String(item.filename ?? '').trim(),
     subfolder: String(item.subfolder ?? '').trim(),
+    source_path: sanitizePersistedSourcePath(item.source_path),
     type: String(item.type ?? 'input').trim() || 'input',
     status,
     added_at: Number(item.added_at ?? 0) || 0,
@@ -365,6 +366,67 @@ function normalizeRelativeSubfolder(path) {
     .join('/')
 }
 
+function normalizeSourcePath(path) {
+  const trimmed = String(path ?? '').trim()
+  if (!trimmed) return ''
+
+  const windowsAbsolute = /^[a-zA-Z]:[\\/]/.test(trimmed)
+  const uncAbsolute = /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+/.test(trimmed)
+  if (windowsAbsolute || uncAbsolute) {
+    return trimmed.replace(/\\/g, '/')
+  }
+
+  const hasLeadingSlash = /^\/+/.test(trimmed)
+  const normalized = trimmed
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, hasLeadingSlash ? '/' : '')
+    .split('/')
+    .map((segment) => segment.trim())
+    .filter((segment) => segment && segment !== '.' && segment !== '..')
+    .join('/')
+  if (!normalized) return ''
+  if (hasLeadingSlash && !normalized.startsWith('/')) return `/${normalized}`
+  return normalized
+}
+
+function isAbsoluteSourcePath(path) {
+  return /^[a-zA-Z]:\//.test(path) || path.startsWith('//') || path.startsWith('/')
+}
+
+function sanitizePersistedSourcePath(path) {
+  const normalized = normalizeSourcePath(path)
+  if (!normalized) return ''
+  if (!isAbsoluteSourcePath(normalized)) return normalized
+  const segments = normalized.split('/').filter(Boolean)
+  return segments.length ? segments[segments.length - 1] : ''
+}
+
+function isMeaningfulSourcePath(path) {
+  return /^[a-zA-Z]:\//.test(path) || path.startsWith('//') || path.includes('/')
+}
+
+function getSourcePathHint(entry) {
+  const file = entry?.file
+  if (!(file instanceof File)) return ''
+
+  const nativePath = typeof file.path === 'string' ? normalizeSourcePath(file.path) : ''
+  if (nativePath && !/^[a-zA-Z]:\/fakepath\//i.test(nativePath)) return nativePath
+
+  const entryFullPath = normalizeSourcePath(entry?.entry?.fullPath).replace(/^\/+/, '')
+  if (isMeaningfulSourcePath(entryFullPath)) return entryFullPath
+
+  const relativePath = normalizeSourcePath(file.webkitRelativePath)
+  if (isMeaningfulSourcePath(relativePath)) return relativePath
+
+  const relativeSubfolder = normalizeRelativeSubfolder(entry?.relativeSubfolder)
+  if (!relativeSubfolder) return ''
+  return normalizeSourcePath(`${relativeSubfolder}/${file.name}`)
+}
+
+function getItemDisplayPath(item) {
+  return isMeaningfulSourcePath(item.source_path) ? item.source_path : item.annotated
+}
+
 function buildUploadSubfolder(relativeSubfolder = '') {
   const normalized = normalizeRelativeSubfolder(relativeSubfolder)
   return normalized ? `${DEFAULT_SUBFOLDER}/${normalized}` : DEFAULT_SUBFOLDER
@@ -585,6 +647,7 @@ function filePreviewUrl(item) {
 function makeItemFromUploadResponse(data) {
   const filename = String(data?.name ?? '').trim()
   const subfolder = String(data?.subfolder ?? '').trim()
+  const sourcePath = sanitizePersistedSourcePath(data?.source_path)
   const type = String(data?.type ?? 'input').trim() || 'input'
   if (!filename) return null
 
@@ -594,6 +657,7 @@ function makeItemFromUploadResponse(data) {
     annotated: `${path} [${type}]`,
     filename,
     subfolder,
+    source_path: sourcePath,
     type,
     status: 'pending',
     added_at: Date.now(),
@@ -604,7 +668,8 @@ function makeItemFromUploadResponse(data) {
 
 async function uploadFiles(files) {
   const uploaded = []
-  for (const { file, relativeSubfolder } of normalizeUploadFiles(files)) {
+  for (const entry of normalizeUploadFiles(files)) {
+    const { file, relativeSubfolder } = entry
     const body = new FormData()
     body.append('image', file)
     body.append('type', 'input')
@@ -618,7 +683,18 @@ async function uploadFiles(files) {
         `Failed to upload '${file.name}': ${response.status} ${response.statusText}`
       )
     }
-    uploaded.push(await response.json())
+    const payload = await response.json()
+    if (
+      !payload ||
+      typeof payload !== 'object' ||
+      Array.isArray(payload) ||
+      typeof payload.name !== 'string' ||
+      !payload.name.trim()
+    ) {
+      throw new Error(`Invalid upload response for '${file.name}'.`)
+    }
+    payload.source_path = getSourcePathHint(entry)
+    uploaded.push(payload)
   }
   return uploaded
 }
@@ -1061,7 +1137,7 @@ function hideUnusedRowSlots(ctx, startIndex = 0) {
 }
 
 function updateRowSlot(slot, item, index, selected) {
-  const itemLabel = item.filename || item.annotated
+  const itemLabel = item.filename || getItemDisplayPath(item)
   const previewUrl = filePreviewUrl(item)
 
   slot.itemId = item.id
@@ -1081,7 +1157,7 @@ function updateRowSlot(slot, item, index, selected) {
   }
 
   slot.name.textContent = itemLabel
-  slot.path.textContent = item.annotated
+  slot.path.textContent = getItemDisplayPath(item)
 
   slot.badge.className = `bil-badge bil-badge-${item.status}`
   slot.badge.textContent = item.status
@@ -1152,7 +1228,7 @@ function renderNode(node) {
     ctx.autoQueueCheckbox.checked = Boolean(state.auto_queue)
   }
   ctx.nextText.textContent = nextItem
-    ? `Next: ${nextItem.filename || nextItem.annotated}`
+    ? `Next: ${nextItem.filename || getItemDisplayPath(nextItem)}`
     : 'Next: none'
 
   if (!state.items.length) {
@@ -1444,14 +1520,14 @@ function buildDom(node) {
     switch (sortSelect.value) {
       case 'name_asc':
         state.items.sort((a, b) =>
-          a.annotated.localeCompare(b.annotated, undefined, {
+          getItemDisplayPath(a).localeCompare(getItemDisplayPath(b), undefined, {
             sensitivity: 'base'
           })
         )
         break
       case 'name_desc':
         state.items.sort((a, b) =>
-          b.annotated.localeCompare(a.annotated, undefined, {
+          getItemDisplayPath(b).localeCompare(getItemDisplayPath(a), undefined, {
             sensitivity: 'base'
           })
         )
@@ -1597,6 +1673,11 @@ function initializeNode(node, widget) {
 
   chainNodeCallback(node, 'onConfigure', function () {
     const snapshot = getCurrentState(node)
+    const normalizedStateValue = serializeState(snapshot.state)
+    if (stateWidget.value !== normalizedStateValue) {
+      setWidgetValue(stateWidget, normalizedStateValue)
+      markNodeDirty(node)
+    }
     cacheRenderableState(node, snapshot.state, snapshot.uiState)
     queueMicrotask(() => scheduleRenderNode(node))
   })
@@ -1615,6 +1696,11 @@ function initializeNode(node, widget) {
   })
 
   const snapshot = getCurrentState(node)
+  const normalizedStateValue = serializeState(snapshot.state)
+  if (stateWidget.value !== normalizedStateValue) {
+    setWidgetValue(stateWidget, normalizedStateValue)
+    markNodeDirty(node)
+  }
   cacheRenderableState(node, snapshot.state, snapshot.uiState)
   queueMicrotask(() => scheduleRenderNode(node))
   return widget
