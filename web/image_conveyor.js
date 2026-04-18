@@ -1059,6 +1059,7 @@ function getVisibleRowRange(list, totalItems) {
  * @param {Object} node - The node instance the slot will operate against (used to read/update widget state).
  * @param {Object} ctx - Rendering/context object containing shared state and helpers (e.g., `draggedId`, drag-target utilities).
  * @returns {{row: HTMLElement, itemId: string|null, previewUrl: string, checkbox: HTMLInputElement, thumb: HTMLImageElement, name: HTMLElement, path: HTMLElement, badge: HTMLElement, indexText: HTMLElement, pendingBtn: HTMLButtonElement, processedBtn: HTMLButtonElement, deleteBtn: HTMLButtonElement}} A slot object containing the root row element, the currently bound item id and preview URL, and references to child controls used by the renderer.
+ */
 function createRowSlot(node, ctx) {
   const row = document.createElement('div')
   row.className = 'bil-row'
@@ -1396,6 +1397,7 @@ function renderNode(node) {
  *
  * @param {object} node - The ComfyUI node object that will host the widget; `node.__bil` will be populated with DOM references and runtime state.
  * @returns {HTMLElement} The root DOM element for the widget.
+ */
 function buildDom(node) {
   ensureStyles()
 
@@ -1757,6 +1759,7 @@ function buildDom(node) {
  * @param {object} node - The ComfyUI node instance that hosts the batch image loader widget.
  * @param {FileList|File[]|Array<{file: File, relativeSubfolder?: string}>} files - Files or normalized file entries to upload.
  * @returns {boolean} `true` if one or more files were uploaded and applied to the node state, `false` if the node widget context is missing or no valid image files were provided.
+ */
 async function uploadViaNode(node, files) {
   const ctx = node.__bil
   if (!ctx) return false
