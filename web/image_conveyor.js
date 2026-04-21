@@ -719,6 +719,42 @@ function activatePotentialExternalFileDrag(event) {
   return true
 }
 
+function getClipboardImageFiles(event) {
+  const transfer = event?.clipboardData
+  if (!transfer) return []
+
+  const items = Array.from(transfer.items ?? [])
+  const filesFromItems = items
+    .filter((item) => item?.kind === 'file' && String(item.type ?? '').startsWith('image/'))
+    .map((item) => {
+      try {
+        return item.getAsFile()
+      } catch {
+        return null
+      }
+    })
+    .filter((file) => file instanceof File && isProbablyImageFile(file))
+
+  if (filesFromItems.length) return filesFromItems
+
+  return Array.from(transfer.files ?? []).filter((file) => isProbablyImageFile(file))
+}
+
+function shouldIgnoreClipboardPasteTarget(target) {
+  if (target instanceof HTMLTextAreaElement) return true
+  if (target instanceof HTMLInputElement) {
+    return !['button', 'checkbox', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'].includes(target.type)
+  }
+  for (let element = target instanceof HTMLElement ? target : null; element; element = element.parentElement) {
+    if (element.isContentEditable) return true
+  }
+  return Boolean(window.getSelection?.()?.toString().trim())
+}
+
+function isModifiedPlainTextPaste(event) {
+  return event.shiftKey && (event.ctrlKey || event.metaKey)
+}
+
 function filePreviewUrl(item) {
   const params = new URLSearchParams()
   params.set(
@@ -1409,6 +1445,7 @@ function buildDom(node) {
 
   const root = document.createElement('div')
   root.className = 'bil-root'
+  root.tabIndex = -1
 
   const dropzone = document.createElement('div')
   dropzone.className = 'bil-dropzone'
@@ -1543,7 +1580,10 @@ function buildDom(node) {
     renderedRangeKey: '',
     renderFrame: 0,
     renderViewportOnly: false,
-    rowPool: []
+    rowPool: [],
+    pointerInside: false,
+    middlePointerId: null,
+    documentPasteHandler: null
   }
   const ctx = node.__bil
 
@@ -1584,6 +1624,104 @@ function buildDom(node) {
 
   dropzone.addEventListener('click', () => fileInput.click())
   fileInput.addEventListener('change', () => handleFiles(fileInput.files))
+
+  root.addEventListener(
+    'pointerdown',
+    (event) => {
+      if (event.button !== 1) {
+        root.focus({ preventScroll: true })
+      }
+    },
+    true
+  )
+
+  root.addEventListener('pointerenter', () => {
+    ctx.pointerInside = true
+  })
+
+  root.addEventListener('pointerleave', () => {
+    ctx.pointerInside = false
+  })
+
+  root.addEventListener('pointerdown', (event) => {
+    if (!app.canvas || event.button !== 1) return
+    ctx.middlePointerId = event.pointerId
+    event.preventDefault()
+    event.stopPropagation()
+    event.stopImmediatePropagation?.()
+    try {
+      root.setPointerCapture?.(event.pointerId)
+    } catch {
+      // ignore pointer-capture failures
+    }
+    app.canvas.processMouseDown(event)
+  })
+
+  root.addEventListener('pointermove', (event) => {
+    if (!app.canvas || ctx.middlePointerId !== event.pointerId) return
+    event.preventDefault()
+    event.stopPropagation()
+    event.stopImmediatePropagation?.()
+    app.canvas.processMouseMove(event)
+  })
+
+  root.addEventListener('pointerup', (event) => {
+    if (!app.canvas || ctx.middlePointerId !== event.pointerId) return
+    ctx.middlePointerId = null
+    event.preventDefault()
+    event.stopPropagation()
+    event.stopImmediatePropagation?.()
+    try {
+      root.releasePointerCapture?.(event.pointerId)
+    } catch {
+      // ignore pointer-capture failures
+    }
+    app.canvas.processMouseUp(event)
+  })
+
+  root.addEventListener('pointercancel', (event) => {
+    if (!app.canvas || ctx.middlePointerId !== event.pointerId) return
+    ctx.middlePointerId = null
+    event.preventDefault()
+    event.stopPropagation()
+    event.stopImmediatePropagation?.()
+    try {
+      root.releasePointerCapture?.(event.pointerId)
+    } catch {
+      // ignore pointer-capture failures
+    }
+    app.canvas.processMouseUp(event)
+  })
+
+  root.addEventListener('auxclick', (event) => {
+    if (event.button === 1) {
+      event.preventDefault()
+      event.stopPropagation()
+      event.stopImmediatePropagation?.()
+    }
+  })
+
+  ctx.documentPasteHandler = (event) => {
+    if (event.defaultPrevented || isModifiedPlainTextPaste(event)) return
+    if (shouldIgnoreClipboardPasteTarget(event.target)) return
+
+    const shouldHandlePaste =
+      ctx.pointerInside ||
+      root === document.activeElement ||
+      root.contains(document.activeElement)
+
+    if (!shouldHandlePaste) return
+
+    const files = getClipboardImageFiles(event)
+    if (!files.length) return
+
+    event.preventDefault()
+    event.stopPropagation()
+    event.stopImmediatePropagation?.()
+    void handleFiles(files)
+  }
+
+  document.addEventListener('paste', ctx.documentPasteHandler, true)
 
   root.addEventListener(
     'dragenter',
@@ -1830,6 +1968,20 @@ function initializeNode(node, widget) {
     return await uploadViaNode(node, files)
   }
 
+  node.pasteFile = (file) => {
+    const files = normalizeUploadFiles([file])
+    if (!files.length) return false
+    void uploadViaNode(node, files)
+    return true
+  }
+
+  node.pasteFiles = (files) => {
+    const validFiles = normalizeUploadFiles(files)
+    if (!validFiles.length) return false
+    void uploadViaNode(node, validFiles)
+    return true
+  }
+
   chainNodeCallback(node, 'onExecuted', function (output) {
     const payload = output?.batch_image_loader_delta?.[0]
     if (!payload) return
@@ -1858,7 +2010,12 @@ function initializeNode(node, widget) {
   chainNodeCallback(node, 'onRemoved', function () {
     autoQueueCoordinator.unregisterNode(node)
     const ctx = node.__bil
-    if (!ctx?.renderFrame) return
+    if (!ctx) return
+    if (ctx.documentPasteHandler) {
+      document.removeEventListener('paste', ctx.documentPasteHandler, true)
+      ctx.documentPasteHandler = null
+    }
+    if (!ctx.renderFrame) return
     cancelAnimationFrame(ctx.renderFrame)
     ctx.renderFrame = 0
     ctx.renderViewportOnly = false
