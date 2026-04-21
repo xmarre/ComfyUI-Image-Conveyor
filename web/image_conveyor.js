@@ -1658,7 +1658,7 @@ function buildDom(node) {
   })
 
   root.addEventListener('pointercancel', (event) => {
-    if (!app.canvas || event.button !== 1) return
+    if (!app.canvas) return
     app.canvas.processMouseUp(event)
   })
 
