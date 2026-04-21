@@ -1582,7 +1582,10 @@ function buildDom(node) {
     renderViewportOnly: false,
     rowPool: [],
     pointerInside: false,
-    documentPasteHandler: null
+    middlePanPointerId: null,
+    documentPasteHandler: null,
+    documentMiddlePanMoveHandler: null,
+    documentMiddlePanEndHandler: null
   }
   const ctx = node.__bil
 
@@ -1627,9 +1630,14 @@ function buildDom(node) {
   root.addEventListener(
     'pointerdown',
     (event) => {
-      if (event.button !== 1) {
-        root.focus({ preventScroll: true })
+      if (event.button === 1) {
+        if (!app.canvas) return
+        ctx.middlePanPointerId = event.pointerId
+        event.preventDefault()
+        app.canvas.processMouseDown(event)
+        return
       }
+      root.focus({ preventScroll: true })
     },
     true
   )
@@ -1642,36 +1650,49 @@ function buildDom(node) {
     ctx.pointerInside = false
   })
 
-  root.addEventListener('pointerdown', (event) => {
-    if (!app.canvas || event.button !== 1) return
-    app.canvas.processMouseDown(event)
-  })
-
-  root.addEventListener('pointermove', (event) => {
-    if (!app.canvas || (event.buttons & 4) !== 4) return
-    app.canvas.processMouseMove(event)
-  })
-
-  root.addEventListener('pointerup', (event) => {
-    if (!app.canvas || event.button !== 1) return
-    app.canvas.processMouseUp(event)
-  })
-
-  root.addEventListener('pointercancel', (event) => {
+  ctx.documentMiddlePanMoveHandler = (event) => {
     if (!app.canvas) return
-    app.canvas.processMouseUp(event)
-  })
+    if (ctx.middlePanPointerId == null || event.pointerId !== ctx.middlePanPointerId) return
 
-  root.addEventListener('mousedown', (event) => {
-    if (event.button !== 1) return
-    event.preventDefault()
-  })
-
-  root.addEventListener('auxclick', (event) => {
-    if (event.button === 1) {
-      event.preventDefault()
+    if ((event.buttons & 4) !== 4) {
+      app.canvas.processMouseUp(event)
+      ctx.middlePanPointerId = null
+      return
     }
-  })
+
+    event.preventDefault()
+    app.canvas.processMouseMove(event)
+  }
+
+  ctx.documentMiddlePanEndHandler = (event) => {
+    if (!app.canvas) return
+    if (ctx.middlePanPointerId == null || event.pointerId !== ctx.middlePanPointerId) return
+    app.canvas.processMouseUp(event)
+    ctx.middlePanPointerId = null
+  }
+
+  document.addEventListener('pointermove', ctx.documentMiddlePanMoveHandler, true)
+  document.addEventListener('pointerup', ctx.documentMiddlePanEndHandler, true)
+  document.addEventListener('pointercancel', ctx.documentMiddlePanEndHandler, true)
+
+  root.addEventListener(
+    'mousedown',
+    (event) => {
+      if (event.button !== 1) return
+      event.preventDefault()
+    },
+    true
+  )
+
+  root.addEventListener(
+    'auxclick',
+    (event) => {
+      if (event.button === 1) {
+        event.preventDefault()
+      }
+    },
+    true
+  )
 
   ctx.documentPasteHandler = (event) => {
     if (event.defaultPrevented || isModifiedPlainTextPaste(event)) return
@@ -1987,6 +2008,16 @@ function initializeNode(node, widget) {
       document.removeEventListener('paste', ctx.documentPasteHandler, true)
       ctx.documentPasteHandler = null
     }
+    if (ctx.documentMiddlePanMoveHandler) {
+      document.removeEventListener('pointermove', ctx.documentMiddlePanMoveHandler, true)
+      ctx.documentMiddlePanMoveHandler = null
+    }
+    if (ctx.documentMiddlePanEndHandler) {
+      document.removeEventListener('pointerup', ctx.documentMiddlePanEndHandler, true)
+      document.removeEventListener('pointercancel', ctx.documentMiddlePanEndHandler, true)
+      ctx.documentMiddlePanEndHandler = null
+    }
+    ctx.middlePanPointerId = null
     if (!ctx.renderFrame) return
     cancelAnimationFrame(ctx.renderFrame)
     ctx.renderFrame = 0
