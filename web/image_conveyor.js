@@ -1582,7 +1582,6 @@ function buildDom(node) {
     renderViewportOnly: false,
     rowPool: [],
     pointerInside: false,
-    middlePointerId: null,
     documentPasteHandler: null
   }
   const ctx = node.__bil
@@ -1645,59 +1644,32 @@ function buildDom(node) {
 
   root.addEventListener('pointerdown', (event) => {
     if (!app.canvas || event.button !== 1) return
-    ctx.middlePointerId = event.pointerId
-    event.preventDefault()
-    event.stopPropagation()
-    event.stopImmediatePropagation?.()
-    try {
-      root.setPointerCapture?.(event.pointerId)
-    } catch {
-      // ignore pointer-capture failures
-    }
     app.canvas.processMouseDown(event)
   })
 
   root.addEventListener('pointermove', (event) => {
-    if (!app.canvas || ctx.middlePointerId !== event.pointerId) return
-    event.preventDefault()
-    event.stopPropagation()
-    event.stopImmediatePropagation?.()
+    if (!app.canvas || (event.buttons & 4) !== 4) return
     app.canvas.processMouseMove(event)
   })
 
   root.addEventListener('pointerup', (event) => {
-    if (!app.canvas || ctx.middlePointerId !== event.pointerId) return
-    ctx.middlePointerId = null
-    event.preventDefault()
-    event.stopPropagation()
-    event.stopImmediatePropagation?.()
-    try {
-      root.releasePointerCapture?.(event.pointerId)
-    } catch {
-      // ignore pointer-capture failures
-    }
+    if (!app.canvas || event.button !== 1) return
     app.canvas.processMouseUp(event)
   })
 
   root.addEventListener('pointercancel', (event) => {
-    if (!app.canvas || ctx.middlePointerId !== event.pointerId) return
-    ctx.middlePointerId = null
-    event.preventDefault()
-    event.stopPropagation()
-    event.stopImmediatePropagation?.()
-    try {
-      root.releasePointerCapture?.(event.pointerId)
-    } catch {
-      // ignore pointer-capture failures
-    }
+    if (!app.canvas || event.button !== 1) return
     app.canvas.processMouseUp(event)
+  })
+
+  root.addEventListener('mousedown', (event) => {
+    if (event.button !== 1) return
+    event.preventDefault()
   })
 
   root.addEventListener('auxclick', (event) => {
     if (event.button === 1) {
       event.preventDefault()
-      event.stopPropagation()
-      event.stopImmediatePropagation?.()
     }
   })
 
