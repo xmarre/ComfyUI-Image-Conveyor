@@ -50,7 +50,8 @@ function defaultState() {
   return {
     version: STATE_VERSION,
     items: [],
-    auto_queue: false
+    auto_queue: false,
+    dont_consume: false
   }
 }
 
@@ -103,7 +104,8 @@ function parseState(raw) {
   return {
     version: STATE_VERSION,
     items,
-    auto_queue: Boolean(state.auto_queue)
+    auto_queue: Boolean(state.auto_queue),
+    dont_consume: Boolean(state.dont_consume)
   }
 }
 
@@ -142,7 +144,8 @@ function serializeState(state) {
     {
       version: STATE_VERSION,
       items: state.items,
-      auto_queue: Boolean(state.auto_queue)
+      auto_queue: Boolean(state.auto_queue),
+      dont_consume: Boolean(state.dont_consume)
     },
     null,
     0
@@ -284,6 +287,13 @@ function findFirstByStatus(state, statuses) {
   return state.items.find((item) => statuses.includes(item.status)) ?? null
 }
 
+function findNextLoadItem(state) {
+  if (state.dont_consume) {
+    return findFirstByStatus(state, ['pending', 'queued']) ?? state.items[0] ?? null
+  }
+  return findFirstByStatus(state, ['pending'])
+}
+
 function countItemsByStatus(state, status) {
   let count = 0
   for (const item of state.items) {
@@ -323,7 +333,7 @@ const autoQueueCoordinator = {
     for (const node of this.nodes) {
       if (!node?.graph || !node.__bilInitialized) continue
       const { state } = getCurrentState(node)
-      if (!state.auto_queue) continue
+      if (!state.auto_queue || state.dont_consume) continue
       const pendingCount = countItemsByStatus(state, 'pending')
       if (pendingCount <= 0) continue
       eligible.push({ node, pendingCount })
@@ -1030,7 +1040,7 @@ function applyBackendDelta(node, delta) {
   if (!delta || typeof delta !== 'object') return
   const { state, uiState } = getCurrentState(node)
   const item = state.items.find((entry) => entry.id === delta.processed_item_id)
-  if (!item) return
+  if (!item || delta.consumed === false) return
   item.status = delta.new_status === 'processed' ? 'processed' : item.status
   item.last_processed_at = Date.now()
   updateState(node, state, uiState, { rerender: true })
@@ -1045,7 +1055,7 @@ function attachQueueLifecycle(node) {
 
   queueWidget.beforeQueued = () => {
     const { state } = getCurrentState(node)
-    const item = findFirstByStatus(state, ['pending'])
+    const item = findNextLoadItem(state)
     updateQueueWidget(
       node,
       item
@@ -1061,6 +1071,7 @@ function attachQueueLifecycle(node) {
     const queuePayload = safeJsonParse(queueWidget.value, {})
     if (!queuePayload?.id) return
     const { state, uiState } = getCurrentState(node)
+    if (state.dont_consume) return
     const item = state.items.find((entry) => entry.id === queuePayload.id)
     if (!item) return
     item.status = 'queued'
@@ -1393,14 +1404,19 @@ function renderNode(node) {
   const pendingCount = countItemsByStatus(state, 'pending')
   const queuedCount = countItemsByStatus(state, 'queued')
   const processedCount = countItemsByStatus(state, 'processed')
-  const nextItem = findFirstByStatus(state, ['pending', 'queued'])
+  const nextItem = state.dont_consume
+    ? findNextLoadItem(state)
+    : findFirstByStatus(state, ['pending', 'queued'])
 
   ctx.summary.textContent = `Total ${state.items.length} · Pending ${pendingCount} · Queued ${queuedCount} · Processed ${processedCount}`
   if (ctx.autoQueueCheckbox) {
     ctx.autoQueueCheckbox.checked = Boolean(state.auto_queue)
   }
+  if (ctx.dontConsumeCheckbox) {
+    ctx.dontConsumeCheckbox.checked = Boolean(state.dont_consume)
+  }
   ctx.nextText.textContent = nextItem
-    ? `Next: ${nextItem.filename || getItemDisplayPath(nextItem, uiState)}`
+    ? `Next: ${nextItem.filename || getItemDisplayPath(nextItem, uiState)}${state.dont_consume ? ' · not consuming' : ''}`
     : 'Next: none'
 
   if (!state.items.length) {
@@ -1500,7 +1516,23 @@ function buildDom(node) {
   autoQueueText.textContent = 'Auto queue all pending'
   autoQueueLabel.append(autoQueueCheckbox, autoQueueText)
 
-  toolbar.append(selectAllBtn, selectNoneBtn, sortSelect, sortBtn, autoQueueLabel)
+  const dontConsumeLabel = document.createElement('label')
+  dontConsumeLabel.className = 'bil-toggle'
+  const dontConsumeCheckbox = document.createElement('input')
+  dontConsumeCheckbox.type = 'checkbox'
+  dontConsumeCheckbox.setAttribute('aria-label', 'Do not consume images')
+  const dontConsumeText = document.createElement('span')
+  dontConsumeText.textContent = "Don't consume"
+  dontConsumeLabel.append(dontConsumeCheckbox, dontConsumeText)
+
+  toolbar.append(
+    selectAllBtn,
+    selectNoneBtn,
+    sortSelect,
+    sortBtn,
+    autoQueueLabel,
+    dontConsumeLabel
+  )
 
   const subtoolbar = document.createElement('div')
   subtoolbar.className = 'bil-subtoolbar'
@@ -1572,6 +1604,7 @@ function buildDom(node) {
     setProcessedBtn,
     deleteSelectedBtn,
     autoQueueCheckbox,
+    dontConsumeCheckbox,
     draggedId: null,
     empty: null,
     state: null,
@@ -1791,6 +1824,12 @@ function buildDom(node) {
   autoQueueCheckbox.addEventListener('change', () => {
     const { state, uiState } = getCurrentState(node)
     state.auto_queue = autoQueueCheckbox.checked
+    updateState(node, state, uiState)
+  })
+
+  dontConsumeCheckbox.addEventListener('change', () => {
+    const { state, uiState } = getCurrentState(node)
+    state.dont_consume = dontConsumeCheckbox.checked
     updateState(node, state, uiState)
   })
 

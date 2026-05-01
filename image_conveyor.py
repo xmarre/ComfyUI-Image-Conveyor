@@ -18,6 +18,7 @@ def _default_state() -> Dict[str, Any]:
         "version": _STATE_VERSION,
         "items": [],
         "auto_queue": False,
+        "dont_consume": False,
     }
 
 
@@ -90,6 +91,7 @@ def _normalize_state(raw: Any) -> Dict[str, Any]:
         "version": _STATE_VERSION,
         "items": items,
         "auto_queue": bool(state.get("auto_queue", False)) if isinstance(state, dict) else False,
+        "dont_consume": bool(state.get("dont_consume", False)) if isinstance(state, dict) else False,
     }
 
 
@@ -188,7 +190,12 @@ def _find_item_by_id(state: Dict[str, Any], item_id: str) -> Tuple[int, Optional
     return -1, None
 
 
-def _select_item(state: Dict[str, Any], queue_item_json: Any) -> Tuple[int, Dict[str, Any]]:
+def _select_item(
+    state: Dict[str, Any],
+    queue_item_json: Any,
+    *,
+    allow_processed: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
     queued_item = _parse_queue_item(queue_item_json)
     if queued_item is not None:
         index, item = _find_item_by_id(state, queued_item["id"])
@@ -201,6 +208,9 @@ def _select_item(state: Dict[str, Any], queue_item_json: Any) -> Tuple[int, Dict
     for idx, item in enumerate(state["items"]):
         if item["status"] in {"pending", "queued"}:
             return idx, item
+
+    if allow_processed and state["items"]:
+        return 0, state["items"][0]
 
     raise RuntimeError(
         "Image Conveyor: no pending or queued images are available. "
@@ -267,10 +277,13 @@ class ImageConveyor:
         if not state["items"]:
             return hashlib.sha256(str(state_json).encode("utf-8")).hexdigest()
 
-        index, item = _select_item(state, queue_item_json)
+        index, item = _select_item(
+            state, queue_item_json, allow_processed=state["dont_consume"]
+        )
         path = folder_paths.get_annotated_filepath(item["annotated"])
 
         hasher = hashlib.sha256()
+        hasher.update(b"dont_consume=1" if state["dont_consume"] else b"dont_consume=0")
         hasher.update(str(index).encode("utf-8"))
         hasher.update(item["id"].encode("utf-8"))
         hasher.update(item["annotated"].encode("utf-8"))
@@ -300,7 +313,9 @@ class ImageConveyor:
             return "Image Conveyor: no images have been added to the node."
 
         try:
-            _index, item = _select_item(state, queue_item_json)
+            _index, item = _select_item(
+                state, queue_item_json, allow_processed=state["dont_consume"]
+            )
         except RuntimeError as exc:
             return str(exc)
 
@@ -335,7 +350,10 @@ class ImageConveyor:
         """
         state = _normalize_state(state_json)
         ui_state = _normalize_ui_state(ui_state_json)
-        index, item = _select_item(state, queue_item_json)
+        dont_consume = state["dont_consume"]
+        index, item = _select_item(
+            state, queue_item_json, allow_processed=dont_consume
+        )
 
         annotated = item["annotated"]
         source_path = _get_runtime_source_path(ui_state, item)
@@ -343,7 +361,7 @@ class ImageConveyor:
 
         remaining_pending = 0
         for idx, candidate in enumerate(state["items"]):
-            if idx == index:
+            if not dont_consume and idx == index:
                 continue
             if candidate["status"] == "pending":
                 remaining_pending += 1
@@ -353,6 +371,7 @@ class ImageConveyor:
             "processed_item_id": item["id"],
             "processed_annotated": annotated,
             "new_status": "processed",
+            "consumed": not dont_consume,
         }
 
         return {
