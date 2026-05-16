@@ -24,6 +24,9 @@ const IMAGE_EXTENSIONS = new Set([
   'tiff',
   'avif'
 ])
+const MIN_WIDGET_HEIGHT = 540
+const MIN_NODE_WIDTH = 520
+const MIN_NODE_HEIGHT = 760
 const ROW_HEIGHT = 66
 const ROW_GAP = 6
 const ROW_STRIDE = ROW_HEIGHT + ROW_GAP
@@ -258,9 +261,10 @@ function updateState(node, state, uiState, { rerender = true } = {}) {
   if (rerender) scheduleRenderNode(node)
 }
 
-function scheduleRenderNode(node, { viewportOnly = false } = {}) {
+function scheduleRenderNode(node, { viewportOnly = false, forceVisibleRows = false } = {}) {
   const ctx = node.__bil
   if (!ctx) return
+  if (forceVisibleRows) ctx.renderedRangeKey = ''
   ctx.renderViewportOnly = ctx.renderFrame
     ? Boolean(ctx.renderViewportOnly && viewportOnly)
     : Boolean(viewportOnly)
@@ -842,15 +846,16 @@ function ensureStyles() {
   style.id = STYLE_ID
   style.textContent = `
     .bil-root {
-      --comfy-widget-min-height: 540px;
-      --comfy-widget-max-height: 540px;
+      --comfy-widget-min-height: ${MIN_WIDGET_HEIGHT}px;
+      --comfy-widget-height: 100%;
       --bil-row-height: ${ROW_HEIGHT}px;
       --bil-row-gap: ${ROW_GAP}px;
       display: flex;
       flex-direction: column;
       gap: 8px;
       height: 100%;
-      min-height: 540px;
+      min-height: ${MIN_WIDGET_HEIGHT}px;
+      overflow: hidden;
       color: var(--input-text, #ddd);
       font: 12px/1.35 system-ui, sans-serif;
       box-sizing: border-box;
@@ -914,11 +919,10 @@ function ensureStyles() {
     }
     .bil-list {
       position: relative;
-      min-height: 180px;
-      max-height: 100%;
+      min-height: 0;
       overflow: auto;
       padding-right: 2px;
-      flex: 1 1 auto;
+      flex: 1 1 0;
     }
     .bil-list-inner {
       position: relative;
@@ -1091,8 +1095,14 @@ function chainNodeCallback(node, key, handler) {
 function getVisibleRowRange(list, totalItems) {
   if (!totalItems) return { start: 0, end: 0, offset: 0, height: 0 }
 
-  const viewportHeight = Math.max(list.clientHeight || 0, ROW_STRIDE)
-  const scrollTop = Math.max(list.scrollTop || 0, 0)
+  const measuredViewportHeight = Math.max(0, list.clientHeight || 0)
+  const viewportHeight = Math.max(measuredViewportHeight, ROW_STRIDE)
+  const maxScrollTop = Math.max(0, totalItems * ROW_STRIDE - ROW_GAP - measuredViewportHeight)
+  const rawScrollTop = Math.max(list.scrollTop || 0, 0)
+  const scrollTop = Math.min(rawScrollTop, maxScrollTop)
+  if (scrollTop !== rawScrollTop) {
+    list.scrollTop = scrollTop
+  }
   const visibleCount = Math.max(1, Math.ceil(viewportHeight / ROW_STRIDE))
   const rawStart = Math.max(0, Math.floor(scrollTop / ROW_STRIDE) - LIST_OVERSCAN)
   const maxStart = Math.max(0, totalItems - (visibleCount + LIST_OVERSCAN * 2))
@@ -1362,7 +1372,8 @@ function renderVisibleRows(node) {
   }
 
   const { start, end, height } = getVisibleRowRange(ctx.list, state.items.length)
-  const rangeKey = `${ctx.renderVersion}:${start}:${end}`
+  const viewportHeight = Math.round(ctx.list.clientHeight || 0)
+  const rangeKey = `${ctx.renderVersion}:${state.items.length}:${viewportHeight}:${start}:${end}`
   if (ctx.renderedRangeKey === rangeKey) return
 
   const needed = end - start
@@ -1614,6 +1625,7 @@ function buildDom(node) {
     renderFrame: 0,
     renderViewportOnly: false,
     rowPool: [],
+    listResizeObserver: null,
     pointerInside: false,
     middlePanPointerId: null,
     documentPasteHandler: null,
@@ -1625,6 +1637,13 @@ function buildDom(node) {
   list.addEventListener('scroll', () => scheduleRenderNode(node, { viewportOnly: true }), {
     passive: true
   })
+
+  if (typeof ResizeObserver === 'function') {
+    ctx.listResizeObserver = new ResizeObserver(() => {
+      scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    })
+    ctx.listResizeObserver.observe(list)
+  }
 
   let externalDragDepth = 0
   const setExternalDragActive = (active) => {
@@ -1980,7 +1999,7 @@ function initializeNode(node, widget) {
   queueWidget.serialize = false
 
   const oldSize = node.size || [420, 700]
-  node.setSize?.([Math.max(oldSize[0], 520), Math.max(oldSize[1], 760)])
+  node.setSize?.([Math.max(oldSize[0], MIN_NODE_WIDTH), Math.max(oldSize[1], MIN_NODE_HEIGHT)])
 
   attachQueueLifecycle(node)
   autoQueueCoordinator.registerNode(node)
@@ -2036,7 +2055,7 @@ function initializeNode(node, widget) {
   })
 
   chainNodeCallback(node, 'onResize', function () {
-    scheduleRenderNode(node, { viewportOnly: true })
+    scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
   })
 
   chainNodeCallback(node, 'onRemoved', function () {
@@ -2057,6 +2076,8 @@ function initializeNode(node, widget) {
       ctx.documentMiddlePanEndHandler = null
     }
     ctx.middlePanPointerId = null
+    ctx.listResizeObserver?.disconnect?.()
+    ctx.listResizeObserver = null
     if (!ctx.renderFrame) return
     cancelAnimationFrame(ctx.renderFrame)
     ctx.renderFrame = 0
@@ -2097,15 +2118,15 @@ app.registerExtension({
         if (node.__bilWidget) {
           return {
             widget: node.__bilWidget,
-            minHeight: 540,
-            minWidth: 520
+            minHeight: MIN_WIDGET_HEIGHT,
+            minWidth: MIN_NODE_WIDTH
           }
         }
 
         const root = buildDom(node)
         const widget = node.addDOMWidget(inputName, CUSTOM_WIDGET_TYPE, root, {
-          getMinHeight: () => 540,
-          getMaxHeight: () => 540,
+          getMinHeight: () => MIN_WIDGET_HEIGHT,
+          getHeight: () => '100%',
           serialize: false
         })
         widget.serialize = false
@@ -2114,8 +2135,8 @@ app.registerExtension({
 
         return {
           widget,
-          minHeight: 540,
-          minWidth: 520
+          minHeight: MIN_WIDGET_HEIGHT,
+          minWidth: MIN_NODE_WIDTH
         }
       }
     }

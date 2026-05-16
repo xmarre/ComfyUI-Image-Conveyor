@@ -9,6 +9,7 @@ A sequential drag-and-drop image queue node for ComfyUI.
 - Drag and drop any number of images into the node
 - Drag and drop folders onto the node to enqueue supported images recursively
 - Shows the queued images directly in the node UI with thumbnails
+- The visible thumbnail list expands with the node height instead of being capped to a fixed row count
 - Processes one image per prompt execution in queue order
 - If you queue multiple prompt runs, the next pending items are reserved and then processed sequentially
 - Optional **Auto queue all pending** mode can expand a single queue action into one queued prompt per pending image
