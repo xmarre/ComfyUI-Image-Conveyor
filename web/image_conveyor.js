@@ -281,6 +281,56 @@ function scheduleRenderNode(node, { viewportOnly = false, forceVisibleRows = fal
   })
 }
 
+function getFiniteNumber(value, fallback = 0) {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : fallback
+}
+
+function getWidgetOuterHeight(node, widget) {
+  const nodeHeight = Math.max(
+    MIN_NODE_HEIGHT,
+    getFiniteNumber(node?.size?.[1], MIN_NODE_HEIGHT)
+  )
+  const widgetY = Math.max(
+    0,
+    getFiniteNumber(widget?.y, getFiniteNumber(widget?.last_y, 0))
+  )
+  return Math.max(MIN_WIDGET_HEIGHT, Math.floor(nodeHeight - widgetY))
+}
+
+function syncDomWidgetSize(node, widget) {
+  const ctx = node.__bil
+  if (!ctx || !widget) return
+
+  const margin = Math.max(0, getFiniteNumber(widget.margin, 10))
+  const outerHeight = getWidgetOuterHeight(node, widget)
+  const innerHeight = Math.max(0, outerHeight - margin * 2)
+  const width = Math.max(
+    MIN_NODE_WIDTH,
+    getFiniteNumber(node?.size?.[0], MIN_NODE_WIDTH)
+  )
+
+  const changed =
+    ctx.widgetOuterHeight !== outerHeight ||
+    ctx.widgetInnerHeight !== innerHeight ||
+    ctx.widgetWidth !== width
+
+  widget.computedHeight = outerHeight
+  widget.width = width
+
+  if (ctx.widgetInnerHeight !== innerHeight) {
+    ctx.root.style.height = `${innerHeight}px`
+    ctx.root.style.minHeight = `${Math.max(0, MIN_WIDGET_HEIGHT - margin * 2)}px`
+  }
+  ctx.widgetOuterHeight = outerHeight
+  ctx.widgetInnerHeight = innerHeight
+  ctx.widgetWidth = width
+
+  if (changed) {
+    scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+  }
+}
+
 function updateQueueWidget(node, payload) {
   const { queueWidget } = getWidgets(node)
   if (!queueWidget) return
@@ -1626,6 +1676,9 @@ function buildDom(node) {
     renderViewportOnly: false,
     rowPool: [],
     listResizeObserver: null,
+    widgetOuterHeight: 0,
+    widgetInnerHeight: 0,
+    widgetWidth: 0,
     pointerInside: false,
     middlePanPointerId: null,
     documentPasteHandler: null,
@@ -2055,6 +2108,7 @@ function initializeNode(node, widget) {
   })
 
   chainNodeCallback(node, 'onResize', function () {
+    syncDomWidgetSize(node, widget)
     scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
   })
 
@@ -2127,8 +2181,11 @@ app.registerExtension({
         const widget = node.addDOMWidget(inputName, CUSTOM_WIDGET_TYPE, root, {
           getMinHeight: () => MIN_WIDGET_HEIGHT,
           getHeight: () => '100%',
+          onDraw: (domWidget) => syncDomWidgetSize(node, domWidget),
+          afterResize: (domWidgetNode) => syncDomWidgetSize(domWidgetNode, widget),
           serialize: false
         })
+        syncDomWidgetSize(node, widget)
         widget.serialize = false
 
         initializeNode(node, widget)
