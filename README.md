@@ -8,6 +8,7 @@ A sequential drag-and-drop image queue node for ComfyUI.
 
 - Drag and drop any number of images into the node
 - Drag and drop folders onto the node to enqueue supported images recursively
+- Optional **Catch canvas drops** mode can route external image/folder drops from anywhere on the graph canvas into the conveyor
 - Shows the queued images directly in the node UI with thumbnails
 - The visible thumbnail list expands with the node height instead of being capped to a fixed row count; taller nodes show more queued images
 - Processes one image per prompt execution in queue order
@@ -23,6 +24,21 @@ This node is for **sequential in-graph image queueing**.
 The main use case is dropping in a set of images, keeping the queue visible directly on the node, and consuming them **one prompt execution at a time** without relying on an external folder iterator workflow.
 
 Existing batch image loaders generally solve a different problem. Many are oriented around folder iteration, one-shot batch loading, or less explicit queue state. Image Conveyor is meant to give you a **visible in-graph queue**, **clear item state**, **manual intervention when needed**, and **predictable sequential consumption across queued prompt runs**.
+
+
+## Canvas-wide drop capture
+
+Enable **Catch canvas drops** on a conveyor node to let it receive external image and folder drops made anywhere inside the graph canvas, not only drops made directly over the node.
+
+Routing is intentionally conservative:
+
+1. Dropping directly on the conveyor widget still uses the normal in-node drop path.
+2. If exactly one conveyor with **Catch canvas drops** enabled is selected, canvas-level drops go to that conveyor.
+3. If the pointer is over a conveyor with **Catch canvas drops** enabled, that conveyor receives the drop.
+4. If exactly one conveyor in the graph has **Catch canvas drops** enabled, it receives the drop.
+5. If multiple conveyors have it enabled and no single target can be inferred, the drop is left to ComfyUI's normal canvas drop handling. Select the target conveyor first.
+
+The interceptor only consumes external image/folder drops after a conveyor target has been resolved. JSON/workflow drops are left to ComfyUI.
 
 ## Queue / state behavior
 
@@ -67,6 +83,7 @@ So this is not a compiled custom `.vue` SFC shipped by the extension, and not a 
   - newest / oldest
   - status
 - optional **Auto queue all pending** toggle in the node UI
+- optional **Catch canvas drops** toggle for sending canvas-level external image/folder drops into the conveyor
 
 ## Outputs
 

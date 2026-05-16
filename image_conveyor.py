@@ -19,6 +19,7 @@ def _default_state() -> Dict[str, Any]:
         "items": [],
         "auto_queue": False,
         "dont_consume": False,
+        "catch_canvas_drops": False,
     }
 
 
@@ -92,6 +93,7 @@ def _normalize_state(raw: Any) -> Dict[str, Any]:
         "items": items,
         "auto_queue": bool(state.get("auto_queue", False)) if isinstance(state, dict) else False,
         "dont_consume": bool(state.get("dont_consume", False)) if isinstance(state, dict) else False,
+        "catch_canvas_drops": bool(state.get("catch_canvas_drops", False)) if isinstance(state, dict) else False,
     }
 
 
