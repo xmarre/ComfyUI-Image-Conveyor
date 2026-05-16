@@ -54,7 +54,8 @@ function defaultState() {
     version: STATE_VERSION,
     items: [],
     auto_queue: false,
-    dont_consume: false
+    dont_consume: false,
+    catch_canvas_drops: false
   }
 }
 
@@ -108,7 +109,8 @@ function parseState(raw) {
     version: STATE_VERSION,
     items,
     auto_queue: Boolean(state.auto_queue),
-    dont_consume: Boolean(state.dont_consume)
+    dont_consume: Boolean(state.dont_consume),
+    catch_canvas_drops: Boolean(state.catch_canvas_drops)
   }
 }
 
@@ -148,7 +150,8 @@ function serializeState(state) {
       version: STATE_VERSION,
       items: state.items,
       auto_queue: Boolean(state.auto_queue),
-      dont_consume: Boolean(state.dont_consume)
+      dont_consume: Boolean(state.dont_consume),
+      catch_canvas_drops: Boolean(state.catch_canvas_drops)
     },
     null,
     0
@@ -434,6 +437,208 @@ const autoQueueCoordinator = {
         )
       })
     })
+  }
+
+}
+
+function isTargetInsideConveyorWidget(target) {
+  return target instanceof Element && Boolean(target.closest('.bil-root'))
+}
+
+function isGraphCanvasDropTarget(target) {
+  if (!(target instanceof Node)) return false
+
+  const container =
+    app.canvasContainer ??
+    document.getElementById('graph-canvas-container') ??
+    app.canvas?.canvas?.parentElement ??
+    null
+  if (container?.contains?.(target)) return true
+
+  const canvasElement = app.canvas?.canvas ?? app.canvasEl ?? null
+  return canvasElement === target
+}
+
+function getCanvasNodeAtEvent(event) {
+  if (!app.canvas?.graph) return null
+  try {
+    app.canvas.adjustMouseEvent?.(event)
+  } catch {
+    // Some frontend versions may not accept DragEvent in adjustMouseEvent.
+  }
+  const canvasX = Number(event?.canvasX)
+  const canvasY = Number(event?.canvasY)
+  if (!Number.isFinite(canvasX) || !Number.isFinite(canvasY)) return null
+  return app.canvas.graph.getNodeOnPos?.(canvasX, canvasY) ?? null
+}
+
+function isCanvasNodeSelected(node) {
+  if (!node || !app.canvas) return false
+  const selected = app.canvas.selected_nodes
+  if (!selected) return Boolean(node.selected || node.flags?.selected)
+  if (selected instanceof Set) return selected.has(node)
+  if (Array.isArray(selected)) return selected.includes(node)
+  if (typeof selected === 'object') {
+    if (selected[node.id] === node || selected[String(node.id)] === node) return true
+    return Object.values(selected).includes(node)
+  }
+  return Boolean(node.selected || node.flags?.selected)
+}
+
+function setCanvasDropTargetActive(node, active) {
+  const ctx = node?.__bil
+  if (!ctx) return
+  ctx.root.classList.toggle('bil-dragover', active)
+  ctx.dropzone.classList.toggle('bil-dragover', active)
+  if (!active) clearRowDragTargets(ctx)
+}
+
+const canvasDropCoordinator = {
+  nodes: new Set(),
+  listenerAttached: false,
+  dragOverHandler: null,
+  dropHandler: null,
+  dragLeaveHandler: null,
+  dragEndHandler: null,
+  activeNode: null,
+  warnedAboutMultipleNodes: false,
+
+  registerNode(node) {
+    this.nodes.add(node)
+    this.attach()
+  },
+
+  unregisterNode(node) {
+    this.nodes.delete(node)
+    if (this.activeNode === node) this.setActiveNode(null)
+    if (!this.nodes.size) {
+      this.warnedAboutMultipleNodes = false
+      this.detach()
+    }
+  },
+
+  attach() {
+    if (this.listenerAttached) return
+    this.listenerAttached = true
+    this.dragOverHandler = (event) => this.handleDragOver(event)
+    this.dropHandler = (event) => {
+      void this.handleDrop(event)
+    }
+    this.dragLeaveHandler = (event) => this.handleDragLeave(event)
+    this.dragEndHandler = () => this.setActiveNode(null)
+    document.addEventListener('dragover', this.dragOverHandler, true)
+    document.addEventListener('drop', this.dropHandler, true)
+    document.addEventListener('dragleave', this.dragLeaveHandler, true)
+    document.addEventListener('dragend', this.dragEndHandler, true)
+  },
+
+  detach() {
+    if (!this.listenerAttached) return
+    document.removeEventListener('dragover', this.dragOverHandler, true)
+    document.removeEventListener('drop', this.dropHandler, true)
+    document.removeEventListener('dragleave', this.dragLeaveHandler, true)
+    document.removeEventListener('dragend', this.dragEndHandler, true)
+    this.listenerAttached = false
+    this.dragOverHandler = null
+    this.dropHandler = null
+    this.dragLeaveHandler = null
+    this.dragEndHandler = null
+    this.setActiveNode(null)
+  },
+
+  getEligibleNodes() {
+    const eligible = []
+    for (const node of this.nodes) {
+      if (!node?.graph || !node.__bilInitialized) continue
+      const { state } = getCurrentState(node)
+      if (!state.catch_canvas_drops) continue
+      eligible.push(node)
+    }
+    return eligible
+  },
+
+  resolveDropNode(event) {
+    if (!isGraphCanvasDropTarget(event?.target)) return null
+    if (isTargetInsideConveyorWidget(event?.target)) return null
+
+    const eligibleNodes = this.getEligibleNodes()
+    if (!eligibleNodes.length) {
+      this.warnedAboutMultipleNodes = false
+      return null
+    }
+
+    const selectedNodes = eligibleNodes.filter((node) => isCanvasNodeSelected(node))
+    if (selectedNodes.length === 1) {
+      this.warnedAboutMultipleNodes = false
+      return selectedNodes[0]
+    }
+
+    const nodeAtDropPosition = getCanvasNodeAtEvent(event)
+    if (eligibleNodes.includes(nodeAtDropPosition)) {
+      this.warnedAboutMultipleNodes = false
+      return nodeAtDropPosition
+    }
+
+    if (eligibleNodes.length === 1) {
+      this.warnedAboutMultipleNodes = false
+      return eligibleNodes[0]
+    }
+
+    if (!this.warnedAboutMultipleNodes) {
+      this.warnedAboutMultipleNodes = true
+      console.warn(
+        'Image Conveyor: multiple conveyors have canvas-drop capture enabled. Select one conveyor before dropping images on empty canvas.'
+      )
+    }
+    return null
+  },
+
+  setActiveNode(node) {
+    if (this.activeNode === node) return
+    if (this.activeNode) setCanvasDropTargetActive(this.activeNode, false)
+    this.activeNode = node
+    if (this.activeNode) setCanvasDropTargetActive(this.activeNode, true)
+  },
+
+  handleDragOver(event) {
+    if (event.defaultPrevented && !isGraphCanvasDropTarget(event.target)) return
+    const node = this.resolveDropNode(event)
+    if (!node) {
+      this.setActiveNode(null)
+      return
+    }
+    if (!hasExternalFileDrag(event) && !hasPotentialExternalFileDrag(event)) {
+      this.setActiveNode(null)
+      return
+    }
+    activatePotentialExternalFileDrag(event)
+    this.setActiveNode(node)
+  },
+
+  async handleDrop(event) {
+    if (event.defaultPrevented && !isGraphCanvasDropTarget(event.target)) return
+    const node = this.resolveDropNode(event)
+    if (!node) {
+      this.setActiveNode(null)
+      return
+    }
+    if (!hasExternalFileDrag(event)) {
+      this.setActiveNode(null)
+      return
+    }
+
+    finalizeExternalFileDrag(event)
+    this.setActiveNode(null)
+
+    const files = await getDroppedImageFiles(event)
+    if (!files.length) return
+    await uploadViaNode(node, files)
+  },
+
+  handleDragLeave(event) {
+    if (event.target === document || event.target === document.documentElement) {
+      this.setActiveNode(null)
+    }
   }
 }
 
@@ -1476,6 +1681,9 @@ function renderNode(node) {
   if (ctx.dontConsumeCheckbox) {
     ctx.dontConsumeCheckbox.checked = Boolean(state.dont_consume)
   }
+  if (ctx.canvasDropCheckbox) {
+    ctx.canvasDropCheckbox.checked = Boolean(state.catch_canvas_drops)
+  }
   ctx.nextText.textContent = nextItem
     ? `Next: ${nextItem.filename || getItemDisplayPath(nextItem, uiState)}${state.dont_consume ? ' · not consuming' : ''}`
     : 'Next: none'
@@ -1586,13 +1794,24 @@ function buildDom(node) {
   dontConsumeText.textContent = "Don't consume"
   dontConsumeLabel.append(dontConsumeCheckbox, dontConsumeText)
 
+  const canvasDropLabel = document.createElement('label')
+  canvasDropLabel.className = 'bil-toggle'
+  canvasDropLabel.title = 'When enabled, external image/folder drops anywhere on the graph canvas are added to this conveyor. If multiple conveyors enable it, select the target conveyor first.'
+  const canvasDropCheckbox = document.createElement('input')
+  canvasDropCheckbox.type = 'checkbox'
+  canvasDropCheckbox.setAttribute('aria-label', 'Catch image drops anywhere on the canvas')
+  const canvasDropText = document.createElement('span')
+  canvasDropText.textContent = 'Catch canvas drops'
+  canvasDropLabel.append(canvasDropCheckbox, canvasDropText)
+
   toolbar.append(
     selectAllBtn,
     selectNoneBtn,
     sortSelect,
     sortBtn,
     autoQueueLabel,
-    dontConsumeLabel
+    dontConsumeLabel,
+    canvasDropLabel
   )
 
   const subtoolbar = document.createElement('div')
@@ -1666,6 +1885,7 @@ function buildDom(node) {
     deleteSelectedBtn,
     autoQueueCheckbox,
     dontConsumeCheckbox,
+    canvasDropCheckbox,
     draggedId: null,
     empty: null,
     state: null,
@@ -1905,6 +2125,12 @@ function buildDom(node) {
     updateState(node, state, uiState)
   })
 
+  canvasDropCheckbox.addEventListener('change', () => {
+    const { state, uiState } = getCurrentState(node)
+    state.catch_canvas_drops = canvasDropCheckbox.checked
+    updateState(node, state, uiState)
+  })
+
   sortBtn.addEventListener('click', () => {
     const { state, uiState } = getCurrentState(node)
     switch (sortSelect.value) {
@@ -2056,6 +2282,7 @@ function initializeNode(node, widget) {
 
   attachQueueLifecycle(node)
   autoQueueCoordinator.registerNode(node)
+  canvasDropCoordinator.registerNode(node)
 
   node.onDragOver = (event) => {
     if (!hasExternalFileDrag(event)) return false
@@ -2114,6 +2341,7 @@ function initializeNode(node, widget) {
 
   chainNodeCallback(node, 'onRemoved', function () {
     autoQueueCoordinator.unregisterNode(node)
+    canvasDropCoordinator.unregisterNode(node)
     const ctx = node.__bil
     if (!ctx) return
     if (ctx.documentPasteHandler) {
