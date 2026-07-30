@@ -1,9 +1,12 @@
 import hashlib
 import json
+import os
 from typing import Any, Dict, List, Optional, Tuple
+from PIL import Image, ImageOps, ImageSequence, ExifTags
 
 import folder_paths
 import nodes
+import node_helpers
 
 
 _STATE_VERSION = 1
@@ -224,14 +227,14 @@ class ImageConveyor:
     CATEGORY = "image"
     FUNCTION = "load_next"
     HAS_INTERMEDIATE_OUTPUT = True
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "INT", "INT", "STRING")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "INT", "INT", "STRING","STRING","STRING","INT","INT","INT","INT","INT","INT","STRING")
     RETURN_NAMES = (
         "image",
         "mask",
         "path",
         "index",
         "remaining_pending",
-        "source_path",
+        "source_path","filename","format","dpi","width","height","long_edge","short_edge","file_size","exif"
     )
     SEARCH_ALIASES = [
         "image conveyor",
@@ -361,6 +364,39 @@ class ImageConveyor:
         source_path = _get_runtime_source_path(ui_state, item)
         image, mask = nodes.LoadImage().load_image(annotated)
 
+        image_path = folder_paths.get_annotated_filepath(annotated)
+        image_name, image_format = os.path.splitext(os.path.basename(image_path))
+        image_format = image_format[1:] or 'png'
+        image_file_size = os.path.getsize(image_path)
+
+        img = node_helpers.pillow(Image.open, image_path)
+
+        # 获取图像基本信息
+        width, height = img.size
+        long_edge = max(width, height)
+        short_edge = min(width, height)
+        
+        # 获取DPI信息
+        try:
+            dpi = img.info.get('dpi', (96, 96))[0]
+        except:
+            dpi = 0
+        
+        # 获取EXIF信息
+        exif_data = {}
+        try:
+            exif = {ExifTags.TAGS[k]: v for k, v in img.getexif().items() if k in ExifTags.TAGS} if img.getexif() else {}
+            for key, value in exif.items():
+                if isinstance(value, bytes):
+                    try:
+                        exif_data[key] = value.decode('utf-8')
+                    except:
+                        exif_data[key] = str(value)
+                else:
+                    exif_data[key] = str(value)
+        except:
+            pass
+
         remaining_pending = 0
         for idx, candidate in enumerate(state["items"]):
             if not dont_consume and idx == index:
@@ -384,6 +420,15 @@ class ImageConveyor:
                 index + 1,
                 remaining_pending,
                 source_path,
+                image_name,
+                image_format,
+                dpi,
+                width,
+                height,
+                long_edge,
+                short_edge,
+                image_file_size,
+                exif_data
             ),
             "ui": {
                 "batch_image_loader_delta": [json.dumps(delta, separators=(",", ":"))],
