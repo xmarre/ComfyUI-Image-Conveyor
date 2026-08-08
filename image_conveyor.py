@@ -1,8 +1,10 @@
 import hashlib
 import json
 import os
+import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image, ImageOps, ImageSequence, ExifTags
+import torch
 
 import folder_paths
 import nodes
@@ -251,6 +253,7 @@ class ImageConveyor:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "keep_alpha_channel": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
                 "state_json": (
                     "STRING",
                     {
@@ -329,7 +332,7 @@ class ImageConveyor:
 
         return True
 
-    def load_next(self, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
+    def load_next(self,keep_alpha_channel, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
         """
         Load the next selected image, compute remaining pending count, and produce a UI state delta.
         
@@ -370,6 +373,48 @@ class ImageConveyor:
         image_file_size = os.path.getsize(image_path)
 
         img = node_helpers.pillow(Image.open, image_path)
+
+        output_images = []
+        output_masks = []
+        w, h = None, None
+
+        excluded_formats = ['MPO']
+
+        for i in ImageSequence.Iterator(img):
+            i = node_helpers.pillow(ImageOps.exif_transpose, i)
+
+            if i.mode == 'I':
+                i = i.point(lambda pixel: pixel * (1 / 255))
+
+            has_alpha = "A" in i.getbands()
+            if has_alpha and keep_alpha_channel:
+                image_a = i.convert("RGBA")
+            else:
+                image_a = i.convert("RGB")
+
+            if len(output_images) == 0:
+                w = image_a.size[0]
+                h = image_a.size[1]
+
+            if image_a.size[0] != w or image_a.size[1] != h:
+                continue
+
+            image_a = np.array(image_a).astype(np.float32) / 255.0
+            image_a = torch.from_numpy(image_a)[None, ]
+            if 'A' in i.getbands():
+                mask_a = np.array(i.getchannel('A')).astype(np.float32) / 255.0
+                mask_a = 1. - torch.from_numpy(mask_a)
+            else:
+                mask_a = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+            output_images.append(image_a)
+            output_masks.append(mask_a.unsqueeze(0))
+
+        if len(output_images) > 1 and img.format not in excluded_formats:
+            output_image = torch.cat(output_images, dim=0)
+            output_mask = torch.cat(output_masks, dim=0)
+        else:
+            output_image = output_images[0]
+            output_mask = output_masks[0]
 
         # 获取图像基本信息
         width, height = img.size
@@ -414,8 +459,8 @@ class ImageConveyor:
 
         return {
             "result": (
-                image,
-                mask,
+                output_image,
+                output_mask,
                 annotated,
                 index + 1,
                 remaining_pending,
