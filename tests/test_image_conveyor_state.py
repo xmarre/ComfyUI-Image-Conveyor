@@ -4,12 +4,12 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 fake_folder_paths = types.ModuleType("folder_paths")
 fake_folder_paths.get_annotated_filepath = lambda annotated: annotated
 fake_folder_paths.exists_annotated_filepath = lambda annotated: True
-sys.modules.setdefault("folder_paths", fake_folder_paths)
 
 
 class FakeLoadImage:
@@ -19,13 +19,13 @@ class FakeLoadImage:
 
 fake_nodes = types.ModuleType("nodes")
 fake_nodes.LoadImage = FakeLoadImage
-sys.modules.setdefault("nodes", fake_nodes)
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "image_conveyor.py"
 SPEC = importlib.util.spec_from_file_location("image_conveyor_under_test", MODULE_PATH)
 conveyor = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
-SPEC.loader.exec_module(conveyor)
+with mock.patch.dict(sys.modules, {"folder_paths": fake_folder_paths, "nodes": fake_nodes}):
+    SPEC.loader.exec_module(conveyor)
 
 
 def item(item_id, annotated, status="pending"):

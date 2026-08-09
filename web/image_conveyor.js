@@ -1,7 +1,7 @@
 import { app } from '../../scripts/app.js'
 import { api } from '../../scripts/api.js'
 import '../../scripts/domWidget.js'
-import { calculateGalleryMetrics, calculateVisibleCardRange } from './image_conveyor_math.mjs'
+import { CARD_FOOTER_HEIGHT, calculateGalleryMetrics, calculateVisibleCardRange } from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -1105,40 +1105,45 @@ function makeItemFromUploadResponse(data) {
 
 async function uploadFiles(files) {
   const uploaded = []
+  const errors = []
   for (const entry of normalizeUploadFiles(files)) {
     const { file, relativeSubfolder } = entry
-    const body = new FormData()
-    body.append('image', file)
-    body.append('type', 'input')
-    body.append('subfolder', buildUploadSubfolder(relativeSubfolder))
-    const response = await api.fetchApi('/image-conveyor/resolve-upload', {
-      method: 'POST',
-      body
-    })
-    if (!response.ok) {
-      let detail = response.statusText
-      try {
-        const errorPayload = await response.json()
-        detail = errorPayload?.error || detail
-      } catch {
-        // Keep the HTTP status text when the server did not return JSON.
+    try {
+      const body = new FormData()
+      body.append('image', file)
+      body.append('type', 'input')
+      body.append('subfolder', buildUploadSubfolder(relativeSubfolder))
+      const response = await api.fetchApi('/image-conveyor/resolve-upload', {
+        method: 'POST',
+        body
+      })
+      if (!response.ok) {
+        let detail = response.statusText
+        try {
+          const errorPayload = await response.json()
+          detail = errorPayload?.error || detail
+        } catch {
+          // Keep the HTTP status text when the server did not return JSON.
+        }
+        throw new Error(`Failed to import '${file.name}': ${response.status} ${detail}`)
       }
-      throw new Error(`Failed to import '${file.name}': ${response.status} ${detail}`)
+      const payload = await response.json()
+      if (
+        !payload ||
+        typeof payload !== 'object' ||
+        Array.isArray(payload) ||
+        typeof payload.name !== 'string' ||
+        !payload.name.trim()
+      ) {
+        throw new Error(`Invalid upload response for '${file.name}'.`)
+      }
+      payload.source_path = getSourcePathHint(entry)
+      uploaded.push(payload)
+    } catch (error) {
+      errors.push({ file, error: error instanceof Error ? error : new Error(String(error)) })
     }
-    const payload = await response.json()
-    if (
-      !payload ||
-      typeof payload !== 'object' ||
-      Array.isArray(payload) ||
-      typeof payload.name !== 'string' ||
-      !payload.name.trim()
-    ) {
-      throw new Error(`Invalid upload response for '${file.name}'.`)
-    }
-    payload.source_path = getSourcePathHint(entry)
-    uploaded.push(payload)
   }
-  return uploaded
+  return { uploaded, errors }
 }
 
 function ensureStyles() {
@@ -1192,12 +1197,13 @@ function ensureStyles() {
     .bil-card.bil-drag-target { outline: 2px dashed rgba(120,185,255,.95); outline-offset: -4px; }
     .bil-media { position: relative; flex: 1 1 auto; min-height: 0; background: rgba(255,255,255,.045); cursor: pointer; }
     .bil-thumb { width: 100%; height: 100%; display: block; object-fit: contain; background: repeating-conic-gradient(rgba(255,255,255,.035) 0 25%, transparent 0 50%) 50% / 14px 14px; }
+    .bil-thumb-error { opacity: .32; filter: grayscale(1); outline: 1px dashed rgba(255,110,110,.78); outline-offset: -2px; }
     .bil-card-overlay { position: absolute; inset: 6px 6px auto 6px; display: flex; align-items: flex-start; justify-content: space-between; gap: 4px; pointer-events: none; }
     .bil-card-check { pointer-events: auto; width: 17px; height: 17px; margin: 0; accent-color: #6aaef7; }
     .bil-badge { padding: 2px 6px; border-radius: 999px; font-size: 10px; text-transform: uppercase; letter-spacing: .025em; background: rgba(20,20,20,.72); backdrop-filter: blur(3px); }
     .bil-badge-pending { color: #e2e2e2; } .bil-badge-queued { color: #ffd276; } .bil-badge-processed { color: #8bea9e; }
     .bil-count-badge { color: #cce4ff; text-transform: none; }
-    .bil-card-footer { flex: 0 0 58px; display: flex; flex-direction: column; justify-content: center; gap: 4px; padding: 5px 7px 6px; min-width: 0; }
+    .bil-card-footer { flex: 0 0 ${CARD_FOOTER_HEIGHT}px; display: flex; flex-direction: column; justify-content: center; gap: 4px; padding: 5px 7px 6px; min-width: 0; }
     .bil-card-title-row, .bil-card-actions { display: flex; align-items: center; gap: 4px; min-width: 0; }
     .bil-name { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 620; }
     .bil-index { flex: 0 0 auto; opacity: .65; font-variant-numeric: tabular-nums; }
@@ -1372,30 +1378,17 @@ function setItemSelected(node, itemId, checked, event = null) {
   const ctx = node.__bil
   const browser = activeBrowser(ctx)
   const items = ctx.visibleItems || []
-  if (ctx.browser.activeView === 'input') {
-    const selected = browser.selected
-    if (event?.shiftKey && browser.lastSelectedId) {
-      const anchor = items.findIndex((item) => item.relative_path === browser.lastSelectedId)
-      const current = items.findIndex((item) => item.relative_path === itemId)
-      if (anchor >= 0 && current >= 0) {
-        for (let index = Math.min(anchor, current); index <= Math.max(anchor, current); index += 1) {
-          selected.add(items[index].relative_path)
-        }
-      }
-    } else if (checked) selected.add(itemId)
-    else selected.delete(itemId)
-    browser.lastSelectedId = itemId
-    renderSelectionContext(node)
-    scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
-    return
-  }
-
+  const itemIdentifier = ctx.browser.activeView === 'input'
+    ? (item) => item.relative_path
+    : (item) => item.id
   const selected = browser.selected
   if (event?.shiftKey && browser.lastSelectedId) {
-    const anchor = items.findIndex((item) => item.id === browser.lastSelectedId)
-    const current = items.findIndex((item) => item.id === itemId)
+    const anchor = items.findIndex((item) => itemIdentifier(item) === browser.lastSelectedId)
+    const current = items.findIndex((item) => itemIdentifier(item) === itemId)
     if (anchor >= 0 && current >= 0) {
-      for (let index = Math.min(anchor, current); index <= Math.max(anchor, current); index += 1) selected.add(items[index].id)
+      for (let index = Math.min(anchor, current); index <= Math.max(anchor, current); index += 1) {
+        selected.add(itemIdentifier(items[index]))
+      }
     }
   } else if (checked) selected.add(itemId)
   else selected.delete(itemId)
@@ -1410,6 +1403,7 @@ function createLightbox(node) {
   lightbox.hidden = true
   lightbox.setAttribute('role', 'dialog')
   lightbox.setAttribute('aria-modal', 'true')
+  lightbox.tabIndex = -1
   const image = document.createElement('img')
   const label = document.createElement('div')
   label.className = 'bil-lightbox-label'
@@ -1427,7 +1421,7 @@ function createLightbox(node) {
   close.addEventListener('click', hide)
   lightbox.addEventListener('click', (event) => { if (event.target === lightbox) hide() })
   document.body.appendChild(lightbox)
-  return { root: lightbox, image, label, hide }
+  return { root: lightbox, image, label, close, hide }
 }
 
 function openPreview(node, item) {
@@ -1438,7 +1432,7 @@ function openPreview(node, item) {
   ctx.lightbox.image.alt = label
   ctx.lightbox.label.textContent = label
   ctx.lightbox.root.hidden = false
-  ctx.lightbox.root.focus?.({ preventScroll: true })
+  ctx.lightbox.close.focus({ preventScroll: true })
 }
 
 function clearCardDragTargets(ctx, except = null) {
@@ -1574,7 +1568,9 @@ function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotate
   const ctx = node.__bil
   const inputView = ctx.browser.activeView === 'input'
   const itemId = inputView ? item.relative_path : item.id
-  const label = item.filename || item.relative_path || getItemDisplayPath(item, getRenderableState(node).uiState)
+  const { uiState } = getRenderableState(node)
+  const displayPath = inputView ? item.relative_path : getItemDisplayPath(item, uiState)
+  const label = item.filename || item.relative_path || displayPath
   const row = Math.floor(itemIndex / metrics.columns)
   const column = itemIndex % metrics.columns
   const left = column * (metrics.cardWidth + CARD_GAP)
@@ -1589,10 +1585,10 @@ function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotate
   slot.card.classList.toggle('bil-focused', activeBrowser(ctx).focusedId === itemId)
   slot.checkbox.checked = selected.has(itemId)
   slot.checkbox.setAttribute('aria-label', `Select ${label}`)
-  slot.card.title = inputView ? item.relative_path : getItemDisplayPath(item, getRenderableState(node).uiState)
+  slot.card.title = displayPath
   slot.name.textContent = label
   slot.indexText.textContent = `#${itemIndex + 1}`
-  slot.path.textContent = inputView ? (item.subfolder || 'input root') : getItemDisplayPath(item, getRenderableState(node).uiState)
+  slot.path.textContent = inputView ? (item.subfolder || 'input root') : displayPath
   slot.path.title = slot.path.textContent
   slot.draggable = !inputView && canReorderConveyor(ctx)
   slot.card.draggable = slot.draggable
@@ -1705,6 +1701,7 @@ function renderGalleryNode(node) {
   ctx.inputTab.textContent = `Input Folder ${ctx.browser.input.files.length}`
   ctx.conveyorTab.setAttribute('aria-selected', String(!inputView))
   ctx.inputTab.setAttribute('aria-selected', String(inputView))
+  ctx.list.setAttribute('aria-labelledby', inputView ? ctx.inputTab.id : ctx.conveyorTab.id)
   if (document.activeElement !== ctx.searchInput) ctx.searchInput.value = browser.query
   ctx.sizeSelect.value = browser.size
   ctx.conveyorFilter.hidden = inputView
@@ -1889,6 +1886,9 @@ function buildGalleryDom(node) {
   conveyorTab.className = 'bil-tab'; conveyorTab.type = 'button'; conveyorTab.setAttribute('role', 'tab')
   const inputTab = document.createElement('button')
   inputTab.className = 'bil-tab'; inputTab.type = 'button'; inputTab.setAttribute('role', 'tab')
+  const tabSetId = makeId()
+  conveyorTab.id = `${tabSetId}-conveyor-tab`
+  inputTab.id = `${tabSetId}-input-tab`
   tabs.append(conveyorTab, inputTab)
   const addImagesBtn = document.createElement('button')
   addImagesBtn.className = 'bil-btn bil-add-btn'; addImagesBtn.type = 'button'; addImagesBtn.textContent = '+ Add images'
@@ -1971,6 +1971,11 @@ function buildGalleryDom(node) {
 
   const list = document.createElement('div')
   list.className = 'bil-list'; list.tabIndex = 0
+  list.id = `${tabSetId}-panel`
+  list.setAttribute('role', 'tabpanel')
+  list.setAttribute('aria-labelledby', conveyorTab.id)
+  conveyorTab.setAttribute('aria-controls', list.id)
+  inputTab.setAttribute('aria-controls', list.id)
   const listInner = document.createElement('div'); listInner.className = 'bil-list-inner'
   const listWindow = document.createElement('div'); listWindow.className = 'bil-list-window'
   listInner.appendChild(listWindow); list.appendChild(listInner)
@@ -1991,6 +1996,7 @@ function buildGalleryDom(node) {
     documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
     documentKeyHandler: null, inputAbortController: null, inputRequestId: 0,
     searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
+    uploadDepth: 0, dropzoneLabel: '',
     queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map()
   }
   const ctx = node.__bil
@@ -2197,12 +2203,16 @@ async function uploadViaNode(node, files) {
   const validFiles = normalizeUploadFiles(files)
   if (!validFiles.length) return false
 
-  const originalLabel = ctx.dropzone.textContent
+  ctx.uploadDepth += 1
+  if (ctx.uploadDepth === 1) ctx.dropzoneLabel = ctx.dropzone.textContent || '+ Add images'
   ctx.dropzone.disabled = true
   ctx.dropzone.textContent = `Importing ${validFiles.length}…`
   try {
-    const uploaded = await uploadFiles(validFiles)
+    const { uploaded, errors } = await uploadFiles(validFiles)
     if (node.__bil !== ctx || ctx.removed) return false
+    if (!uploaded.length && errors.length) {
+      throw new Error(errors.length === 1 ? errors[0].error.message : `${errors.length} images failed to import.`)
+    }
     const { state, uiState } = getRenderableState(node)
     const inputPosition = ctx.browser?.input?.loaded
       ? new Map(ctx.browser.input.files.map((entry, index) => [entry.relative_path, index]))
@@ -2231,15 +2241,27 @@ async function uploadViaNode(node, files) {
         }
       }
     }
-    if (ctx.browser?.input?.loaded) {
+    if (ctx.browser?.input?.loaded && uploaded.length) {
       ctx.inputVersion += 1
       updateFolderOptions(ctx)
     }
-    updateState(node, state, uiState)
-    return true
+    if (uploaded.length) updateState(node, state, uiState)
+    if (errors.length) {
+      const firstFailure = errors[0].error.message
+      ctx.browser.input.error = errors.length === 1
+        ? firstFailure
+        : `${errors.length} images failed to import. First error: ${firstFailure}`
+      console.error('Image Conveyor: some images failed to import.', ...errors.map(({ error }) => error))
+      scheduleRenderNode(node)
+    }
+    return uploaded.length > 0
   } finally {
-    ctx.dropzone.disabled = false
-    ctx.dropzone.textContent = originalLabel || '+ Add images'
+    ctx.uploadDepth = Math.max(0, ctx.uploadDepth - 1)
+    if (ctx.uploadDepth === 0) {
+      ctx.dropzone.disabled = false
+      ctx.dropzone.textContent = ctx.dropzoneLabel || '+ Add images'
+      ctx.dropzoneLabel = ''
+    }
   }
 }
 

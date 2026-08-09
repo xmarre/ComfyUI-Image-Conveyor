@@ -1,3 +1,5 @@
+export const CARD_FOOTER_HEIGHT = 58
+
 export function calculateGalleryMetrics(width, minimumCardWidth, gap = 10) {
   const safeWidth = Math.max(1, Math.floor(Number(width) || 1))
   const safeMinimum = Math.max(1, Math.floor(Number(minimumCardWidth) || 1))
@@ -5,7 +7,7 @@ export function calculateGalleryMetrics(width, minimumCardWidth, gap = 10) {
   const columns = Math.max(1, Math.floor((safeWidth + safeGap) / (safeMinimum + safeGap)))
   const cardWidth = Math.max(96, Math.floor((safeWidth - safeGap * (columns - 1)) / columns))
   const mediaHeight = Math.max(84, Math.round(cardWidth * 0.78))
-  const cardHeight = mediaHeight + 58
+  const cardHeight = mediaHeight + CARD_FOOTER_HEIGHT
   return {
     width: safeWidth,
     columns,

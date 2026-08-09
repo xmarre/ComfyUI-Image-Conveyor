@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -30,6 +31,10 @@ class InvalidInputPath(ValueError):
 
 
 class InvalidUpload(ValueError):
+    pass
+
+
+class InvalidThumbnail(ValueError):
     pass
 
 
@@ -191,14 +196,20 @@ class ContentIndex:
                     pass
 
     def _run(self, operation):
+        def execute():
+            connection = self._connect()
+            try:
+                with connection:
+                    return operation(connection)
+            finally:
+                connection.close()
+
         try:
-            with self._connect() as connection:
-                return operation(connection)
+            return execute()
         except sqlite3.DatabaseError as exc:
             LOGGER.warning("Image Conveyor duplicate index was corrupt and will be rebuilt: %s", exc)
             self.recover_if_corrupt()
-            with self._connect() as connection:
-                return operation(connection)
+            return execute()
 
     def sync_metadata(self, records: Sequence[FileRecord]) -> None:
         paths = {record.relative_path for record in records}
@@ -271,6 +282,12 @@ class ContentIndex:
         self._run(operation)
 
 
+@dataclass
+class _KeyLockEntry:
+    lock: Any
+    users: int = 0
+
+
 class InputLibrary:
     def __init__(self, input_root: str, cache_root: str, snapshot_ttl: float = SNAPSHOT_TTL_SECONDS):
         self.input_root = os.path.realpath(input_root)
@@ -285,18 +302,28 @@ class InputLibrary:
         self._snapshot_version = 0
         self._snapshot_lock = threading.Lock()
         self._key_locks_lock = threading.Lock()
-        self._digest_locks: Dict[str, threading.Lock] = {}
-        self._destination_locks: Dict[str, threading.Lock] = {}
-        self._thumbnail_locks: Dict[str, threading.Lock] = {}
+        self._digest_locks: Dict[str, _KeyLockEntry] = {}
+        self._destination_locks: Dict[str, _KeyLockEntry] = {}
+        self._thumbnail_locks: Dict[str, _KeyLockEntry] = {}
         self._last_thumbnail_prune = 0.0
 
-    def _key_lock(self, registry: Dict[str, threading.Lock], key: str) -> threading.Lock:
+    @contextmanager
+    def _key_lock(self, registry: Dict[str, _KeyLockEntry], key: str) -> Iterable[None]:
         with self._key_locks_lock:
-            lock = registry.get(key)
-            if lock is None:
-                lock = threading.Lock()
-                registry[key] = lock
-            return lock
+            entry = registry.get(key)
+            if entry is None:
+                entry = _KeyLockEntry(threading.Lock())
+                registry[key] = entry
+            entry.users += 1
+        entry.lock.acquire()
+        try:
+            yield
+        finally:
+            entry.lock.release()
+            with self._key_locks_lock:
+                entry.users -= 1
+                if entry.users == 0 and registry.get(key) is entry:
+                    del registry[key]
 
     def _scan(self) -> List[FileRecord]:
         records: List[FileRecord] = []
@@ -491,15 +518,13 @@ class InputLibrary:
         # aware of pre-existing same-size candidates without hashing the whole input tree.
         self.list_files(force=False)
 
-        digest_lock = self._key_lock(self._digest_locks, digest)
-        with digest_lock:
+        with self._key_lock(self._digest_locks, digest):
             duplicate = self._find_duplicate(intended, size, digest)
             if duplicate is not None:
                 self._patch_snapshot(duplicate)
                 return duplicate, True
 
-            destination_lock = self._key_lock(self._destination_locks, intended.casefold())
-            with destination_lock:
+            with self._key_lock(self._destination_locks, intended.casefold()):
                 # A different digest may have written the intended filename while this
                 # request was hashing candidates, so collision choice is inside the lock.
                 relative_path = self._collision_safe_relative_path(intended)
@@ -555,24 +580,27 @@ class InputLibrary:
         etag = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         os.makedirs(self.thumbnail_root, exist_ok=True)
         target = os.path.join(self.thumbnail_root, f"{etag}.webp")
-        lock = self._key_lock(self._thumbnail_locks, etag)
-        with lock:
+        with self._key_lock(self._thumbnail_locks, etag):
             if not os.path.isfile(target):
-                from PIL import Image, ImageOps
+                from PIL import Image, ImageOps, UnidentifiedImageError
 
                 descriptor, temporary = tempfile.mkstemp(prefix=".thumb-", suffix=".webp", dir=self.thumbnail_root)
                 os.close(descriptor)
                 try:
-                    with Image.open(source) as opened:
-                        try:
-                            opened.seek(0)
-                        except EOFError:
-                            pass
-                        image = ImageOps.exif_transpose(opened)
-                        image.thumbnail((bucket, bucket), Image.Resampling.LANCZOS, reducing_gap=2.0)
-                        has_alpha = image.mode in {"RGBA", "LA"} or "transparency" in image.info
-                        image = image.convert("RGBA" if has_alpha else "RGB")
-                        image.save(temporary, "WEBP", quality=84, method=4)
+                    try:
+                        with Image.open(source) as opened:
+                            try:
+                                opened.seek(0)
+                            except EOFError:
+                                pass
+                            image = ImageOps.exif_transpose(opened)
+                            resampling = getattr(Image, "Resampling", Image)
+                            image.thumbnail((bucket, bucket), resampling.LANCZOS, reducing_gap=2.0)
+                            has_alpha = image.mode in {"RGBA", "LA"} or "transparency" in image.info
+                            image = image.convert("RGBA" if has_alpha else "RGB")
+                            image.save(temporary, "WEBP", quality=84, method=4)
+                    except UnidentifiedImageError as exc:
+                        raise InvalidThumbnail("The thumbnail source is not a readable image.") from exc
                     os.replace(temporary, target)
                 finally:
                     try:
@@ -742,9 +770,12 @@ def register_routes() -> None:
             return web.Response(status=404)
         except InvalidInputPath as exc:
             return web.json_response({"error": str(exc)}, status=400)
+        except InvalidThumbnail:
+            LOGGER.warning("Image Conveyor could not decode a thumbnail source.", exc_info=True)
+            return web.Response(status=415)
         except Exception:
             LOGGER.exception("Image Conveyor failed to create a thumbnail.")
-            return web.Response(status=415)
+            return web.Response(status=500)
 
         quoted_etag = f'"{etag}"'
         cache_control = (

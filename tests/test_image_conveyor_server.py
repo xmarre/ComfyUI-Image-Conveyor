@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,6 +14,48 @@ SPEC = importlib.util.spec_from_file_location("image_conveyor_server_under_test"
 server = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(server)
+
+
+class MultipartPartStub:
+    def __init__(self, name, *, filename=None, contents=b"", text_value=""):
+        self.name = name
+        self.filename = filename
+        self._chunks = [contents] if contents else []
+        self._text = text_value
+        self.released = False
+
+    async def read_chunk(self, size):
+        del size
+        return self._chunks.pop(0) if self._chunks else b""
+
+    async def text(self):
+        return self._text
+
+    async def release(self):
+        self.released = True
+
+
+class MultipartReaderStub:
+    def __init__(self, parts):
+        self._parts = iter(parts)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._parts)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+
+class UploadRequestStub:
+    def __init__(self, content_type, parts=()):
+        self.content_type = content_type
+        self._parts = parts
+
+    async def multipart(self):
+        return MultipartReaderStub(self._parts)
 
 
 class InputLibraryTest(unittest.TestCase):
@@ -151,6 +194,8 @@ class InputLibraryTest(unittest.TestCase):
         self.assertEqual(1, len(records))
         self.assertEqual(results[0][0].relative_path, results[1][0].relative_path)
         self.assertEqual([False, True], sorted(result[1] for result in results))
+        self.assertEqual({}, self.library._digest_locks)
+        self.assertEqual({}, self.library._destination_locks)
 
     def test_concurrent_different_uploads_both_succeed(self):
         barrier = threading.Barrier(2)
@@ -193,6 +238,44 @@ class InputLibraryTest(unittest.TestCase):
         self.assertEqual("image_conveyor/recovered.png", record.relative_path)
         self.assertTrue(os.path.exists(self.library.index.db_path))
 
+    def test_index_connections_close_before_corruption_recovery(self):
+        connections = []
+        recoveries = []
+
+        class ConnectionStub:
+            def __init__(self):
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def close(self):
+                self.closed = True
+
+        def connect():
+            connection = ConnectionStub()
+            connections.append(connection)
+            return connection
+
+        attempts = 0
+
+        def operation(_connection):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.DatabaseError("corrupt")
+            return "recovered"
+
+        self.library.index._connect = connect
+        self.library.index.recover_if_corrupt = lambda: recoveries.append(True)
+        self.assertEqual("recovered", self.library.index._run(operation))
+        self.assertEqual([True], recoveries)
+        self.assertEqual(2, len(connections))
+        self.assertTrue(all(connection.closed for connection in connections))
+
     def test_listing_is_recursive_deterministic_and_filters_extensions(self):
         for index in range(1000):
             self.write_input(f"nested/{index:04d}.png", bytes([index % 251]))
@@ -210,6 +293,8 @@ class InputLibraryTest(unittest.TestCase):
         self.assertIn("external.png", paths)
 
     def test_thumbnail_is_bounded_cached_and_invalidated_by_source_identity(self):
+        if importlib.util.find_spec("PIL") is None:
+            self.skipTest("Pillow is not installed")
         from PIL import Image
 
         source = self.write_input("large.png", b"")
@@ -229,6 +314,63 @@ class InputLibraryTest(unittest.TestCase):
         third_path, third_etag = self.library.thumbnail("large.png", 256)
         self.assertNotEqual(first_etag, third_etag)
         self.assertNotEqual(first_path, third_path)
+        self.assertEqual({}, self.library._thumbnail_locks)
+
+    def test_unreadable_thumbnail_source_is_classified_as_invalid_media(self):
+        if importlib.util.find_spec("PIL") is None:
+            self.skipTest("Pillow is not installed")
+        self.write_input("broken.png", b"not an image")
+        with self.assertRaises(server.InvalidThumbnail):
+            self.library.thumbnail("broken.png", 256)
+        self.assertEqual({}, self.library._thumbnail_locks)
+
+
+class UploadValidationTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.upload_root = os.path.join(self.temporary.name, "uploads")
+        self.service = types.SimpleNamespace(
+            upload_temp_root=self.upload_root,
+            verify_image=lambda _path: None,
+        )
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    async def assert_rejected(self, request):
+        with self.assertRaises(server.InvalidUpload):
+            await server._read_upload(request, self.service)
+        if os.path.isdir(self.upload_root):
+            self.assertEqual([], os.listdir(self.upload_root))
+
+    async def test_rejects_non_multipart_content_type(self):
+        await self.assert_rejected(UploadRequestStub("application/json"))
+
+    async def test_rejects_requests_without_exactly_one_image_part(self):
+        requests = (
+            UploadRequestStub("multipart/form-data", []),
+            UploadRequestStub(
+                "multipart/form-data",
+                [
+                    MultipartPartStub("image", filename="first.png", contents=b"first"),
+                    MultipartPartStub("image", filename="second.png", contents=b"second"),
+                ],
+            ),
+        )
+        for request in requests:
+            with self.subTest(parts=request._parts):
+                await self.assert_rejected(request)
+
+    async def test_rejects_non_input_upload_type(self):
+        await self.assert_rejected(
+            UploadRequestStub(
+                "multipart/form-data",
+                [
+                    MultipartPartStub("image", filename="image.png", contents=b"image"),
+                    MultipartPartStub("type", text_value="output"),
+                ],
+            )
+        )
 
 
 class PathValidationTest(unittest.TestCase):
