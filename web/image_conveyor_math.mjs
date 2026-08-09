@@ -48,3 +48,18 @@ export function calculateVisibleCardRange(
     scrollTop: clampedScroll
   }
 }
+
+export function isDragLeavingDocument(event, documentElement) {
+  if (!documentElement) return false
+
+  const target = event?.target ?? null
+  if (target === documentElement || target === documentElement.ownerDocument) return true
+
+  const relatedTarget = event?.relatedTarget ?? null
+  if (relatedTarget == null) return true
+  try {
+    return !documentElement.contains(relatedTarget)
+  } catch {
+    return true
+  }
+}

@@ -1,7 +1,12 @@
 import { app } from '../../scripts/app.js'
 import { api } from '../../scripts/api.js'
 import '../../scripts/domWidget.js'
-import { CARD_FOOTER_HEIGHT, calculateGalleryMetrics, calculateVisibleCardRange } from './image_conveyor_math.mjs'
+import {
+  CARD_FOOTER_HEIGHT,
+  calculateGalleryMetrics,
+  calculateVisibleCardRange,
+  isDragLeavingDocument
+} from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -513,6 +518,8 @@ const canvasDropCoordinator = {
   dropHandler: null,
   dragLeaveHandler: null,
   dragEndHandler: null,
+  windowBlurHandler: null,
+  dragExitTimer: null,
   activeNode: null,
   warnedAboutMultipleNodes: false,
 
@@ -538,11 +545,16 @@ const canvasDropCoordinator = {
       void this.handleDrop(event)
     }
     this.dragLeaveHandler = (event) => this.handleDragLeave(event)
-    this.dragEndHandler = () => this.setActiveNode(null)
+    this.dragEndHandler = () => {
+      this.cancelPendingDragExit()
+      this.clearAllDragTargets()
+    }
+    this.windowBlurHandler = this.dragEndHandler
     document.addEventListener('dragover', this.dragOverHandler, true)
     document.addEventListener('drop', this.dropHandler, true)
     document.addEventListener('dragleave', this.dragLeaveHandler, true)
     document.addEventListener('dragend', this.dragEndHandler, true)
+    window.addEventListener('blur', this.windowBlurHandler)
   },
 
   detach() {
@@ -551,12 +563,36 @@ const canvasDropCoordinator = {
     document.removeEventListener('drop', this.dropHandler, true)
     document.removeEventListener('dragleave', this.dragLeaveHandler, true)
     document.removeEventListener('dragend', this.dragEndHandler, true)
+    window.removeEventListener('blur', this.windowBlurHandler)
     this.listenerAttached = false
     this.dragOverHandler = null
     this.dropHandler = null
     this.dragLeaveHandler = null
     this.dragEndHandler = null
+    this.windowBlurHandler = null
+    this.cancelPendingDragExit()
+    this.clearAllDragTargets()
+  },
+
+  cancelPendingDragExit() {
+    if (this.dragExitTimer == null) return
+    clearTimeout(this.dragExitTimer)
+    this.dragExitTimer = null
+  },
+
+  clearAllDragTargets() {
     this.setActiveNode(null)
+    for (const node of this.nodes) {
+      node?.__bil?.clearExternalDragState?.()
+    }
+  },
+
+  scheduleDragExitClear() {
+    this.cancelPendingDragExit()
+    this.dragExitTimer = setTimeout(() => {
+      this.dragExitTimer = null
+      this.clearAllDragTargets()
+    }, 0)
   },
 
   getEligibleNodes() {
@@ -614,7 +650,11 @@ const canvasDropCoordinator = {
   },
 
   handleDragOver(event) {
-    if (event.defaultPrevented && !isGraphCanvasDropTarget(event.target)) return
+    this.cancelPendingDragExit()
+    if (event.defaultPrevented && !isGraphCanvasDropTarget(event.target)) {
+      this.setActiveNode(null)
+      return
+    }
     const node = this.resolveDropNode(event)
     if (!node) {
       this.setActiveNode(null)
@@ -629,19 +669,23 @@ const canvasDropCoordinator = {
   },
 
   async handleDrop(event) {
-    if (event.defaultPrevented && !isGraphCanvasDropTarget(event.target)) return
+    this.cancelPendingDragExit()
+    if (event.defaultPrevented && !isGraphCanvasDropTarget(event.target)) {
+      this.clearAllDragTargets()
+      return
+    }
     const node = this.resolveDropNode(event)
     if (!node) {
-      this.setActiveNode(null)
+      this.clearAllDragTargets()
       return
     }
     if (!hasExternalFileDrag(event)) {
-      this.setActiveNode(null)
+      this.clearAllDragTargets()
       return
     }
 
     finalizeExternalFileDrag(event)
-    this.setActiveNode(null)
+    this.clearAllDragTargets()
 
     const files = await getDroppedImageFiles(event)
     if (!files.length) return
@@ -649,9 +693,7 @@ const canvasDropCoordinator = {
   },
 
   handleDragLeave(event) {
-    if (event.target === document || event.target === document.documentElement) {
-      this.setActiveNode(null)
-    }
+    if (isDragLeavingDocument(event, document.documentElement)) this.scheduleDragExitClear()
   }
 }
 
@@ -1997,6 +2039,7 @@ function buildGalleryDom(node) {
     documentKeyHandler: null, inputAbortController: null, inputRequestId: 0,
     searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
     uploadDepth: 0, dropzoneLabel: '',
+    clearExternalDragState: null,
     queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map()
   }
   const ctx = node.__bil
@@ -2175,14 +2218,16 @@ function buildGalleryDom(node) {
 
   let externalDragDepth = 0
   const setDragActive = (active) => { root.classList.toggle('bil-dragover', active); if (!active) clearCardDragTargets(ctx) }
+  const clearExternalDragState = () => { externalDragDepth = 0; setDragActive(false) }
+  ctx.clearExternalDragState = clearExternalDragState
   root.addEventListener('dragenter', (event) => { if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return; externalDragDepth += 1; setDragActive(true) }, true)
   root.addEventListener('dragover', (event) => { if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return; setDragActive(true) }, true)
   root.addEventListener('dragleave', (event) => { if (!(externalDragDepth > 0 || hasExternalFileDrag(event))) return; event.preventDefault(); event.stopPropagation(); externalDragDepth = Math.max(0, externalDragDepth - 1); if (!externalDragDepth) setDragActive(false) }, true)
   root.addEventListener('drop', async (event) => {
-    if (!consumeExternalFileDrag(event)) { externalDragDepth = 0; setDragActive(false); return }
-    const files = await getDroppedImageFiles(event); externalDragDepth = 0; setDragActive(false); if (files.length) runUpload(files)
+    if (!consumeExternalFileDrag(event)) { clearExternalDragState(); return }
+    const files = await getDroppedImageFiles(event); clearExternalDragState(); if (files.length) runUpload(files)
   }, true)
-  root.addEventListener('dragend', () => { externalDragDepth = 0; setDragActive(false) }, true)
+  root.addEventListener('dragend', clearExternalDragState, true)
 
   return root
 }
@@ -2383,6 +2428,8 @@ function initializeNode(node, widget) {
     ctx.lightbox?.root?.remove?.()
     ctx.listResizeObserver?.disconnect?.()
     ctx.listResizeObserver = null
+    ctx.clearExternalDragState?.()
+    ctx.clearExternalDragState = null
     if (!ctx.renderFrame) return
     cancelAnimationFrame(ctx.renderFrame)
     ctx.renderFrame = 0

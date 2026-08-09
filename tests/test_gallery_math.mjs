@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { calculateGalleryMetrics, calculateVisibleCardRange } from '../web/image_conveyor_math.mjs'
+import {
+  calculateGalleryMetrics,
+  calculateVisibleCardRange,
+  isDragLeavingDocument
+} from '../web/image_conveyor_math.mjs'
 
 test('responsive metrics add columns as width grows', () => {
   const medium = calculateGalleryMetrics(520, 172, 10)
@@ -31,4 +35,31 @@ test('range clamps scroll after filtering to a smaller collection', () => {
   const range = calculateVisibleCardRange(3, metrics.columns, metrics.rowStride, 10, 999_999, 700, 2)
   assert.equal(range.scrollTop, 0)
   assert.deepEqual([range.start, range.end], [0, 3])
+})
+
+test('external drag exit distinguishes viewport exits from child transitions', () => {
+  const documentNode = {}
+  const insideNode = {}
+  const outsideNode = {}
+  const documentElement = {
+    ownerDocument: documentNode,
+    contains: (target) => target === insideNode
+  }
+
+  assert.equal(
+    isDragLeavingDocument({ target: insideNode, relatedTarget: insideNode }, documentElement),
+    false
+  )
+  assert.equal(
+    isDragLeavingDocument({ target: insideNode, relatedTarget: null }, documentElement),
+    true
+  )
+  assert.equal(
+    isDragLeavingDocument({ target: insideNode, relatedTarget: outsideNode }, documentElement),
+    true
+  )
+  assert.equal(
+    isDragLeavingDocument({ target: documentNode, relatedTarget: insideNode }, documentElement),
+    true
+  )
 })
