@@ -6,6 +6,8 @@ import {
   calculateGalleryMetrics,
   calculateVisibleCardRange,
   isDragLeavingDocument,
+  isHighVelocityScroll,
+  planCardSlotReuse,
   planViewScrollSwitch
 } from './image_conveyor_math.mjs'
 
@@ -36,6 +38,7 @@ const MIN_NODE_WIDTH = 520
 const MIN_NODE_HEIGHT = 760
 const CARD_GAP = 10
 const GALLERY_OVERSCAN_ROWS = 2
+const FAST_SCROLL_SETTLE_MS = 80
 const CARD_SIZES = {
   small: { minWidth: 124, thumbnail: 160 },
   medium: { minWidth: 172, thumbnail: 256 },
@@ -1105,6 +1108,20 @@ function thumbnailUrl(item, density = 'medium') {
   return api.apiURL(`/image-conveyor/thumbnail?${params.toString()}`)
 }
 
+function cachedThumbnailUrl(ctx, item, density) {
+  if (!item?.source_version) return thumbnailUrl(item, density)
+  let urls = ctx.thumbnailUrlCache.get(item)
+  if (!urls) {
+    urls = new Map()
+    ctx.thumbnailUrlCache.set(item, urls)
+  }
+  const cached = urls.get(density)
+  if (cached?.sourceVersion === item.source_version) return cached.url
+  const url = thumbnailUrl(item, density)
+  urls.set(density, { sourceVersion: item.source_version, url })
+  return url
+}
+
 function makeItemFromInputFile(entry) {
   const relativePath = normalizeSourcePath(entry?.relative_path).replace(/^\/+/, '')
   const filename = String(entry?.filename ?? '').trim()
@@ -1239,11 +1256,12 @@ function ensureStyles() {
     .bil-card.bil-focused { outline: 2px solid rgba(150,200,255,.95); outline-offset: -3px; }
     .bil-card.bil-drag-target { outline: 2px dashed rgba(120,185,255,.95); outline-offset: -4px; }
     .bil-media { position: relative; flex: 1 1 auto; min-height: 0; background: transparent; cursor: pointer; }
-    .bil-thumb { width: 100%; height: 100%; display: block; object-fit: contain; background: transparent; }
+    .bil-thumb { width: 100%; height: 100%; display: block; object-fit: contain; background: transparent; opacity: 0; }
+    .bil-thumb.bil-thumb-ready { opacity: 1; }
     .bil-thumb-error { opacity: .32; filter: grayscale(1); outline: 1px dashed rgba(255,110,110,.78); outline-offset: -2px; }
     .bil-card-overlay { position: absolute; inset: 6px 6px auto 6px; display: flex; align-items: flex-start; justify-content: space-between; gap: 4px; pointer-events: none; }
     .bil-card-check { pointer-events: auto; width: 17px; height: 17px; margin: 0; accent-color: #6aaef7; }
-    .bil-badge { padding: 2px 6px; border-radius: 999px; font-size: 10px; text-transform: uppercase; letter-spacing: .025em; background: rgba(20,20,20,.72); backdrop-filter: blur(3px); }
+    .bil-badge { padding: 2px 6px; border-radius: 999px; font-size: 10px; text-transform: uppercase; letter-spacing: .025em; background: rgba(20,20,20,.82); }
     .bil-badge-pending { color: #e2e2e2; } .bil-badge-queued { color: #ffd276; } .bil-badge-processed { color: #8bea9e; }
     .bil-count-badge { color: #cce4ff; text-transform: none; }
     .bil-card-footer { flex: 0 0 ${CARD_FOOTER_HEIGHT}px; display: flex; flex-direction: column; justify-content: center; gap: 4px; padding: 5px 7px 6px; min-width: 0; }
@@ -1486,7 +1504,23 @@ function createCardSlot(node, ctx) {
   const card = document.createElement('div')
   card.className = 'bil-card'
   card.style.display = 'none'
-  const slot = { card, itemId: null, item: null, previewUrl: '', bindToken: 0, draggable: false }
+  const slot = {
+    card,
+    itemId: null,
+    item: null,
+    itemIndex: -1,
+    inputView: null,
+    label: '',
+    displayPath: '',
+    subfolder: '',
+    previewUrl: '',
+    bindToken: 0,
+    layoutKey: '',
+    badgeKey: '',
+    selected: null,
+    focused: null,
+    draggable: false
+  }
 
   card.addEventListener('dragstart', (event) => {
     if (!slot.draggable || !slot.itemId) { event.preventDefault(); return }
@@ -1523,6 +1557,7 @@ function createCardSlot(node, ctx) {
   thumb.className = 'bil-thumb'
   thumb.loading = 'lazy'
   thumb.decoding = 'async'
+  thumb.fetchPriority = 'low'
   thumb.draggable = false
   const overlay = document.createElement('div')
   overlay.className = 'bil-card-overlay'
@@ -1595,71 +1630,120 @@ function ensureCardPool(node, needed) {
   }
 }
 
+function resetCardThumbnail(slot) {
+  slot.bindToken += 1
+  slot.previewUrl = ''
+  slot.thumb.onload = null
+  slot.thumb.onerror = null
+  slot.thumb.classList.remove('bil-thumb-ready', 'bil-thumb-error')
+  slot.thumb.removeAttribute('src')
+}
+
+function bindCardThumbnail(slot, url) {
+  const token = ++slot.bindToken
+  slot.previewUrl = url
+  slot.thumb.onload = () => {
+    if (token !== slot.bindToken || slot.previewUrl !== url) return
+    slot.thumb.classList.remove('bil-thumb-error')
+    slot.thumb.classList.add('bil-thumb-ready')
+  }
+  slot.thumb.onerror = () => {
+    if (token !== slot.bindToken || slot.previewUrl !== url) return
+    slot.thumb.classList.remove('bil-thumb-ready')
+    slot.thumb.classList.add('bil-thumb-error')
+  }
+  slot.thumb.src = url
+}
+
 function hideUnusedCards(ctx, start = 0) {
   for (let index = start; index < ctx.cardPool.length; index += 1) {
     const slot = ctx.cardPool[index]
-    slot.itemId = null; slot.item = null; slot.previewUrl = ''; slot.bindToken += 1
+    slot.itemId = null; slot.item = null; slot.itemIndex = -1; slot.inputView = null
+    slot.layoutKey = ''; slot.badgeKey = ''; slot.selected = null; slot.focused = null
     slot.card.style.display = 'none'
     slot.card.classList.remove('bil-selected', 'bil-focused', 'bil-drag-target')
-    slot.thumb.removeAttribute('src')
+    resetCardThumbnail(slot)
   }
 }
 
-function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotatedCounts) {
+function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotatedCounts, uiState, allowThumbnailLoad) {
   const ctx = node.__bil
   const inputView = ctx.browser.activeView === 'input'
   const itemId = inputView ? item.relative_path : item.id
-  const { uiState } = getRenderableState(node)
   const displayPath = inputView ? item.relative_path : getItemDisplayPath(item, uiState)
   const label = item.filename || item.relative_path || displayPath
-  const row = Math.floor(itemIndex / metrics.columns)
-  const column = itemIndex % metrics.columns
-  const left = column * (metrics.cardWidth + CARD_GAP)
-  const top = row * metrics.rowStride
-  const url = thumbnailUrl(item, activeBrowser(ctx).size)
+  const browser = activeBrowser(ctx)
+  const url = cachedThumbnailUrl(ctx, item, browser.size)
+  const thumbnailChanged = slot.previewUrl !== url
+  if (thumbnailChanged && slot.previewUrl) resetCardThumbnail(slot)
+
+  const subfolder = inputView ? (item.subfolder || 'input root') : ''
+  const staticContentChanged = slot.itemIndex !== itemIndex ||
+    slot.inputView !== inputView ||
+    slot.label !== label ||
+    slot.displayPath !== displayPath ||
+    slot.subfolder !== subfolder
   slot.itemId = itemId; slot.item = item
-  slot.card.style.display = 'flex'
-  slot.card.style.width = `${metrics.cardWidth}px`
-  slot.card.style.height = `${metrics.cardHeight}px`
-  slot.card.style.transform = `translate3d(${left}px, ${top}px, 0)`
-  slot.card.classList.toggle('bil-selected', selected.has(itemId))
-  slot.card.classList.toggle('bil-focused', activeBrowser(ctx).focusedId === itemId)
-  slot.checkbox.checked = selected.has(itemId)
-  slot.checkbox.setAttribute('aria-label', `Select ${label}`)
-  slot.card.title = displayPath
-  slot.name.textContent = label
-  slot.indexText.textContent = `#${itemIndex + 1}`
-  slot.path.textContent = inputView ? (item.subfolder || 'input root') : displayPath
-  slot.path.title = slot.path.textContent
-  slot.draggable = !inputView && canReorderConveyor(ctx)
-  slot.card.draggable = slot.draggable
-  slot.pendingBtn.hidden = inputView
-  slot.processedBtn.hidden = inputView
-  slot.deleteBtn.hidden = inputView
-  slot.addBtn.hidden = !inputView
+  slot.itemIndex = itemIndex; slot.inputView = inputView
+  slot.label = label; slot.displayPath = displayPath; slot.subfolder = subfolder
+  if (slot.card.style.display !== 'flex') slot.card.style.display = 'flex'
+  const layoutKey = `${itemIndex}:${metrics.columns}:${metrics.cardWidth}:${metrics.cardHeight}`
+  if (slot.layoutKey !== layoutKey) {
+    const row = Math.floor(itemIndex / metrics.columns)
+    const column = itemIndex % metrics.columns
+    const left = column * (metrics.cardWidth + CARD_GAP)
+    const top = row * metrics.rowStride
+    slot.card.style.width = `${metrics.cardWidth}px`
+    slot.card.style.height = `${metrics.cardHeight}px`
+    slot.card.style.transform = `translate3d(${left}px, ${top}px, 0)`
+    slot.layoutKey = layoutKey
+  }
+  const isSelected = selected.has(itemId)
+  if (slot.selected !== isSelected) {
+    slot.selected = isSelected
+    slot.card.classList.toggle('bil-selected', isSelected)
+    slot.checkbox.checked = isSelected
+  }
+  const isFocused = browser.focusedId === itemId
+  if (slot.focused !== isFocused) {
+    slot.focused = isFocused
+    slot.card.classList.toggle('bil-focused', isFocused)
+  }
+  if (staticContentChanged) {
+    slot.checkbox.setAttribute('aria-label', `Select ${label}`)
+    slot.card.title = displayPath
+    slot.name.textContent = label
+    slot.indexText.textContent = `#${itemIndex + 1}`
+    slot.path.textContent = inputView ? subfolder : displayPath
+    slot.path.title = slot.path.textContent
+    slot.thumb.alt = label
+  }
+  const draggable = !inputView && canReorderConveyor(ctx)
+  if (slot.draggable !== draggable) {
+    slot.draggable = draggable
+    slot.card.draggable = draggable
+  }
+  if (slot.pendingBtn.hidden !== inputView) slot.pendingBtn.hidden = inputView
+  if (slot.processedBtn.hidden !== inputView) slot.processedBtn.hidden = inputView
+  if (slot.deleteBtn.hidden !== inputView) slot.deleteBtn.hidden = inputView
+  if (slot.addBtn.hidden === inputView) slot.addBtn.hidden = !inputView
   if (inputView) {
     const count = annotatedCounts.get(item.relative_path) || 0
-    slot.badge.className = 'bil-badge bil-count-badge'
-    slot.badge.textContent = count ? `In conveyor ×${count}` : 'Input'
+    const badgeKey = `input:${count}`
+    if (slot.badgeKey !== badgeKey) {
+      slot.badge.className = 'bil-badge bil-count-badge'
+      slot.badge.textContent = count ? `In conveyor ×${count}` : 'Input'
+      slot.badgeKey = badgeKey
+    }
   } else {
-    slot.badge.className = `bil-badge bil-badge-${item.status}`
-    slot.badge.textContent = item.status
-  }
-  slot.thumb.alt = label
-  if (slot.previewUrl !== url) {
-    const token = ++slot.bindToken
-    slot.thumb.classList.remove('bil-thumb-error')
-    slot.thumb.onload = () => {
-      if (token !== slot.bindToken) return
-      slot.thumb.classList.remove('bil-thumb-error')
+    const badgeKey = `conveyor:${item.status}`
+    if (slot.badgeKey !== badgeKey) {
+      slot.badge.className = `bil-badge bil-badge-${item.status}`
+      slot.badge.textContent = item.status
+      slot.badgeKey = badgeKey
     }
-    slot.thumb.onerror = () => {
-      if (token !== slot.bindToken) return
-      slot.thumb.classList.add('bil-thumb-error')
-    }
-    slot.thumb.src = url
-    slot.previewUrl = url
   }
+  if (allowThumbnailLoad && slot.previewUrl !== url) bindCardThumbnail(slot, url)
 }
 
 function renderVisibleCards(node) {
@@ -1687,7 +1771,7 @@ function renderVisibleCards(node) {
     pendingRestore?.scrollTop ?? ctx.list.scrollTop
   )
   const selected = getViewSelectedIds(node)
-  const { state } = getRenderableState(node)
+  const { state, uiState } = getRenderableState(node)
   let annotatedCounts = new Map()
   if (view === 'input') {
     if (ctx.annotatedCountsRevision !== ctx.queueRevision) {
@@ -1706,6 +1790,8 @@ function renderVisibleCards(node) {
   if (pendingRestore) {
     activeBrowser(ctx).scrollTop = range.scrollTop
     ctx.list.scrollTop = range.scrollTop
+    ctx.scrollSampleTop = range.scrollTop
+    ctx.scrollSampleAt = globalThis.performance?.now?.() ?? Date.now()
     ctx.pendingScrollRestore = null
   } else if (range.scrollTop !== ctx.list.scrollTop) {
     ctx.list.scrollTop = range.scrollTop
@@ -1715,8 +1801,27 @@ function renderVisibleCards(node) {
   if (ctx.renderedRangeKey === key) return
   const needed = range.end - range.start
   ensureCardPool(node, needed)
+  const nextItemIds = items.slice(range.start, range.end).map((item) => (
+    view === 'input' ? item.relative_path : item.id
+  ))
+  const assignments = planCardSlotReuse(ctx.cardPool.map((slot) => slot.itemId), nextItemIds)
+  const assigned = new Set(assignments)
+  ctx.cardPool = [
+    ...assignments.map((index) => ctx.cardPool[index]),
+    ...ctx.cardPool.filter((_, index) => !assigned.has(index))
+  ]
   for (let offset = 0; offset < needed; offset += 1) {
-    updateCardSlot(node, ctx.cardPool[offset], items[range.start + offset], range.start + offset, metrics, selected, annotatedCounts)
+    updateCardSlot(
+      node,
+      ctx.cardPool[offset],
+      items[range.start + offset],
+      range.start + offset,
+      metrics,
+      selected,
+      annotatedCounts,
+      uiState,
+      !ctx.deferThumbnailLoads
+    )
   }
   hideUnusedCards(ctx, needed)
   ctx.renderedRangeKey = key
@@ -2066,6 +2171,8 @@ function buildGalleryDom(node) {
     draggedId: null, empty: null, state: null, uiState: null, renderVersion: 0,
     inputVersion: 0, renderedRangeKey: '', renderFrame: 0, renderViewportOnly: false,
     pendingScrollRestore: null,
+    deferThumbnailLoads: false, scrollSettleTimer: 0,
+    scrollSampleTop: 0, scrollSampleAt: 0,
     listResizeObserver: null, widgetOuterHeight: 0, widgetInnerHeight: 0, widgetWidth: 0,
     pointerInside: false, middlePanPointerId: null, documentPasteHandler: null,
     documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
@@ -2073,7 +2180,8 @@ function buildGalleryDom(node) {
     searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
     uploadDepth: 0, dropzoneLabel: '',
     clearExternalDragState: null,
-    queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map()
+    queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map(),
+    thumbnailUrlCache: new WeakMap()
   }
   const ctx = node.__bil
   ctx.lightbox = createLightbox(node)
@@ -2193,6 +2301,25 @@ function buildGalleryDom(node) {
 
   list.addEventListener('scroll', () => {
     if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) return
+    const now = globalThis.performance?.now?.() ?? Date.now()
+    const previousAt = ctx.scrollSampleAt
+    const previousTop = ctx.scrollSampleTop
+    ctx.scrollSampleTop = list.scrollTop
+    ctx.scrollSampleAt = now
+    if (previousAt && (ctx.deferThumbnailLoads || isHighVelocityScroll(
+      list.scrollTop - previousTop,
+      now - previousAt,
+      ctx.lastMetrics?.rowStride
+    ))) {
+      ctx.deferThumbnailLoads = true
+      clearTimeout(ctx.scrollSettleTimer)
+      ctx.scrollSettleTimer = setTimeout(() => {
+        if (ctx.removed) return
+        ctx.deferThumbnailLoads = false
+        ctx.renderedRangeKey = ''
+        scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+      }, FAST_SCROLL_SETTLE_MS)
+    }
     activeBrowser(ctx).scrollTop = list.scrollTop
     scheduleRenderNode(node, { viewportOnly: true })
   }, { passive: true })
@@ -2464,6 +2591,8 @@ function initializeNode(node, widget) {
     ctx.inputAbortController?.abort?.()
     ctx.inputAbortController = null
     clearTimeout(ctx.searchTimer)
+    clearTimeout(ctx.scrollSettleTimer)
+    ctx.scrollSettleTimer = 0
     ctx.lightbox?.root?.remove?.()
     ctx.listResizeObserver?.disconnect?.()
     ctx.listResizeObserver = null

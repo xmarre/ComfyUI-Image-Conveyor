@@ -4,6 +4,8 @@ import {
   calculateGalleryMetrics,
   calculateVisibleCardRange,
   isDragLeavingDocument,
+  isHighVelocityScroll,
+  planCardSlotReuse,
   planViewScrollSwitch
 } from '../web/image_conveyor_math.mjs'
 
@@ -36,6 +38,28 @@ test('range clamps scroll after filtering to a smaller collection', () => {
   const range = calculateVisibleCardRange(3, metrics.columns, metrics.rowStride, 10, 999_999, 700, 2)
   assert.equal(range.scrollTop, 0)
   assert.deepEqual([range.start, range.end], [0, 3])
+})
+
+test('recycled card slots stay attached to overlapping item identities', () => {
+  const assignments = planCardSlotReuse(
+    ['a', 'b', 'c', 'd', null],
+    ['c', 'd', 'e', 'f', 'g']
+  )
+  assert.deepEqual(assignments, [2, 3, 0, 1, 4])
+  assert.equal(new Set(assignments).size, assignments.length)
+
+  const previous = Array.from({ length: 40 }, (_, index) => `item-${index}`)
+  const next = Array.from({ length: 40 }, (_, index) => `item-${index + 4}`)
+  const shiftedAssignments = planCardSlotReuse(previous, next)
+  const retained = shiftedAssignments.filter((slotIndex, index) => previous[slotIndex] === next[index])
+  assert.equal(retained.length, 36)
+})
+
+test('only high-velocity scrolling defers intermediate thumbnail requests', () => {
+  assert.equal(isHighVelocityScroll(80, 16, 220), false)
+  assert.equal(isHighVelocityScroll(20, 0, 220), false)
+  assert.equal(isHighVelocityScroll(240, 16, 220), true)
+  assert.equal(isHighVelocityScroll(350, 100, 220), true)
 })
 
 test('tab switches preserve independent scroll positions', () => {

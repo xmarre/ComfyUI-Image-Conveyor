@@ -49,6 +49,44 @@ export function calculateVisibleCardRange(
   }
 }
 
+export function planCardSlotReuse(previousItemIds, nextItemIds) {
+  const previous = Array.isArray(previousItemIds) ? previousItemIds : []
+  const next = Array.isArray(nextItemIds) ? nextItemIds : []
+  const availableById = new Map()
+  for (let index = 0; index < previous.length; index += 1) {
+    const itemId = previous[index]
+    if (itemId != null && !availableById.has(itemId)) availableById.set(itemId, index)
+  }
+
+  const assignments = new Array(next.length).fill(-1)
+  const used = new Set()
+  for (let index = 0; index < next.length; index += 1) {
+    const previousIndex = availableById.get(next[index])
+    if (previousIndex == null || used.has(previousIndex)) continue
+    assignments[index] = previousIndex
+    used.add(previousIndex)
+  }
+
+  const free = []
+  for (let index = 0; index < previous.length; index += 1) {
+    if (!used.has(index)) free.push(index)
+  }
+  let freeIndex = 0
+  let nextNewIndex = previous.length
+  for (let index = 0; index < assignments.length; index += 1) {
+    if (assignments[index] >= 0) continue
+    assignments[index] = freeIndex < free.length ? free[freeIndex++] : nextNewIndex++
+  }
+  return assignments
+}
+
+export function isHighVelocityScroll(deltaPixels, elapsedMs, rowStride) {
+  const distance = Math.abs(Number(deltaPixels) || 0)
+  const elapsed = Math.max(8, Number(elapsedMs) || 8)
+  const stride = Math.max(1, Number(rowStride) || 1)
+  return distance >= stride * 1.5 || distance / elapsed >= stride / 32
+}
+
 export function planViewScrollSwitch(
   activeView,
   nextView,
