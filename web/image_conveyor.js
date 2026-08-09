@@ -1,6 +1,7 @@
 import { app } from '../../scripts/app.js'
 import { api } from '../../scripts/api.js'
 import '../../scripts/domWidget.js'
+import { calculateGalleryMetrics, calculateVisibleCardRange } from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -27,10 +28,13 @@ const IMAGE_EXTENSIONS = new Set([
 const MIN_WIDGET_HEIGHT = 540
 const MIN_NODE_WIDTH = 520
 const MIN_NODE_HEIGHT = 760
-const ROW_HEIGHT = 66
-const ROW_GAP = 6
-const ROW_STRIDE = ROW_HEIGHT + ROW_GAP
-const LIST_OVERSCAN = 6
+const CARD_GAP = 10
+const GALLERY_OVERSCAN_ROWS = 2
+const CARD_SIZES = {
+  small: { minWidth: 124, thumbnail: 160 },
+  medium: { minWidth: 172, thumbnail: 256 },
+  large: { minWidth: 224, thumbnail: 384 }
+}
 
 function structuredCloneCompat(value) {
   if (typeof structuredClone === 'function') return structuredClone(value)
@@ -193,10 +197,6 @@ function itemStatusRank(status) {
   }
 }
 
-function getSelectedIds(uiState) {
-  return new Set(uiState.selected_ids)
-}
-
 function setWidgetValue(widget, value) {
   widget.value = value
   widget.callback?.(value)
@@ -224,7 +224,11 @@ function getWidgets(node) {
  * @param {object} node - The ComfyUI node containing the hidden `state` and `ui_state` widgets.
  * @returns {{state: object, uiState: object}} An object with `state` (normalized state shape) and `uiState` (normalized UI shape). `uiState.selected_ids` will contain only IDs present in `state.items`, and `uiState.source_paths` will only include entries whose keys match `state.items` IDs.
  */
-function getCurrentState(node) {
+function getCurrentState(node, { fromWidgets = false } = {}) {
+  const cached = node.__bil
+  if (!fromWidgets && cached?.state && cached?.uiState) {
+    return { state: cached.state, uiState: cached.uiState }
+  }
   const { stateWidget, uiStateWidget } = getWidgets(node)
   const state = parseState(stateWidget?.value ?? '')
   const uiState = parseUiState(uiStateWidget?.value ?? '')
@@ -254,19 +258,28 @@ function getRenderableState(node) {
   return snapshot
 }
 
-function updateState(node, state, uiState, { rerender = true } = {}) {
+function updateState(
+  node,
+  state,
+  uiState,
+  { rerender = true, commitState = true, commitUi = true } = {}
+) {
   const { stateWidget, uiStateWidget } = getWidgets(node)
   if (!stateWidget || !uiStateWidget) return
-  setWidgetValue(stateWidget, serializeState(state))
-  setWidgetValue(uiStateWidget, serializeUiState(uiState))
+  if (commitState) setWidgetValue(stateWidget, serializeState(state))
+  if (commitUi) setWidgetValue(uiStateWidget, serializeUiState(uiState))
+  if (commitState && node.__bil) {
+    node.__bil.queueRevision = (node.__bil.queueRevision || 0) + 1
+    node.__bil.annotatedCountsRevision = -1
+  }
   cacheRenderableState(node, state, uiState)
-  markNodeDirty(node)
+  if (commitState) markNodeDirty(node)
   if (rerender) scheduleRenderNode(node)
 }
 
 function scheduleRenderNode(node, { viewportOnly = false, forceVisibleRows = false } = {}) {
   const ctx = node.__bil
-  if (!ctx) return
+  if (!ctx || ctx.removed) return
   if (forceVisibleRows) ctx.renderedRangeKey = ''
   ctx.renderViewportOnly = ctx.renderFrame
     ? Boolean(ctx.renderViewportOnly && viewportOnly)
@@ -277,9 +290,9 @@ function scheduleRenderNode(node, { viewportOnly = false, forceVisibleRows = fal
     ctx.renderFrame = 0
     ctx.renderViewportOnly = false
     if (renderViewportOnly) {
-      renderVisibleRows(node)
+      renderVisibleCards(node)
     } else {
-      renderNode(node)
+      renderGalleryNode(node)
     }
   })
 }
@@ -490,7 +503,7 @@ function setCanvasDropTargetActive(node, active) {
   if (!ctx) return
   ctx.root.classList.toggle('bil-dragover', active)
   ctx.dropzone.classList.toggle('bil-dragover', active)
-  if (!active) clearRowDragTargets(ctx)
+  if (!active && ctx.cardPool) clearCardDragTargets(ctx)
 }
 
 const canvasDropCoordinator = {
@@ -640,13 +653,6 @@ const canvasDropCoordinator = {
       this.setActiveNode(null)
     }
   }
-}
-
-function applySelectionToggle(uiState, itemId, checked) {
-  const selected = getSelectedIds(uiState)
-  if (checked) selected.add(itemId)
-  else selected.delete(itemId)
-  uiState.selected_ids = Array.from(selected)
 }
 
 function moveItems(state, draggedId, targetId) {
@@ -1039,6 +1045,42 @@ function filePreviewUrl(item) {
   return api.apiURL(`/view?${params.toString()}`)
 }
 
+function getInputRelativePath(item) {
+  if (String(item?.type ?? 'input') !== 'input') return ''
+  const annotated = stripAnnotatedStorageTypeSuffix(item?.annotated)
+  const explicit = String(item?.relative_path ?? '').trim()
+  return normalizeSourcePath(explicit || annotated).replace(/^\/+/, '')
+}
+
+function thumbnailUrl(item, density = 'medium') {
+  const relativePath = getInputRelativePath(item)
+  if (!relativePath) return filePreviewUrl(item)
+  const params = new URLSearchParams()
+  params.set('relative_path', relativePath)
+  params.set('size', String(CARD_SIZES[density]?.thumbnail ?? CARD_SIZES.medium.thumbnail))
+  if (item.source_version || item.mtime_ns) params.set('v', String(item.source_version || item.mtime_ns))
+  return api.apiURL(`/image-conveyor/thumbnail?${params.toString()}`)
+}
+
+function makeItemFromInputFile(entry) {
+  const relativePath = normalizeSourcePath(entry?.relative_path).replace(/^\/+/, '')
+  const filename = String(entry?.filename ?? '').trim()
+  if (!relativePath || !filename) return null
+  const subfolder = String(entry?.subfolder ?? '').trim()
+  return {
+    id: makeId(),
+    annotated: `${relativePath} [input]`,
+    filename,
+    subfolder,
+    source_path: relativePath,
+    type: 'input',
+    status: 'pending',
+    added_at: Date.now(),
+    last_queued_at: 0,
+    last_processed_at: 0
+  }
+}
+
 function makeItemFromUploadResponse(data) {
   const filename = String(data?.name ?? '').trim()
   const subfolder = String(data?.subfolder ?? '').trim()
@@ -1069,14 +1111,19 @@ async function uploadFiles(files) {
     body.append('image', file)
     body.append('type', 'input')
     body.append('subfolder', buildUploadSubfolder(relativeSubfolder))
-    const response = await api.fetchApi('/upload/image', {
+    const response = await api.fetchApi('/image-conveyor/resolve-upload', {
       method: 'POST',
       body
     })
     if (!response.ok) {
-      throw new Error(
-        `Failed to upload '${file.name}': ${response.status} ${response.statusText}`
-      )
+      let detail = response.statusText
+      try {
+        const errorPayload = await response.json()
+        detail = errorPayload?.error || detail
+      } catch {
+        // Keep the HTTP status text when the server did not return JSON.
+      }
+      throw new Error(`Failed to import '${file.name}': ${response.status} ${detail}`)
     }
     const payload = await response.json()
     if (
@@ -1103,194 +1150,68 @@ function ensureStyles() {
     .bil-root {
       --comfy-widget-min-height: ${MIN_WIDGET_HEIGHT}px;
       --comfy-widget-height: 100%;
-      --bil-row-height: ${ROW_HEIGHT}px;
-      --bil-row-gap: ${ROW_GAP}px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      height: 100%;
-      min-height: ${MIN_WIDGET_HEIGHT}px;
-      overflow: hidden;
-      color: var(--input-text, #ddd);
-      font: 12px/1.35 system-ui, sans-serif;
-      box-sizing: border-box;
-      padding: 2px 0;
+      display: flex; flex-direction: column; gap: 8px; height: 100%;
+      min-height: ${MIN_WIDGET_HEIGHT}px; overflow: hidden; box-sizing: border-box;
+      padding: 2px 0; color: var(--input-text, #ddd); font: 12px/1.35 system-ui, sans-serif;
     }
-    .bil-root.bil-dragover {
-      outline: 1px dashed rgba(120,180,255,0.9);
-      outline-offset: -2px;
-      border-radius: 10px;
-      background: rgba(120,180,255,0.06);
+    .bil-root.bil-dragover { outline: 2px dashed #73aef5; outline-offset: -3px; border-radius: 10px; background: rgba(90,155,235,.08); }
+    .bil-header, .bil-browserbar, .bil-summary, .bil-contextbar, .bil-settings-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .bil-header { justify-content: space-between; }
+    .bil-tabs { display: flex; gap: 3px; min-width: 0; }
+    .bil-tab, .bil-btn, .bil-select, .bil-input, .bil-icon-btn {
+      border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.055);
+      color: inherit; border-radius: 7px; padding: 5px 8px; font: inherit; box-sizing: border-box;
     }
-    .bil-toolbar, .bil-subtoolbar, .bil-summary {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      align-items: center;
+    .bil-tab, .bil-btn, .bil-icon-btn { cursor: pointer; }
+    .bil-tab[aria-selected="true"] { background: rgba(105,165,240,.20); border-color: rgba(115,175,250,.65); }
+    .bil-btn:disabled, .bil-icon-btn:disabled { opacity: .4; cursor: not-allowed; }
+    .bil-add-btn { font-weight: 650; white-space: nowrap; }
+    .bil-browserbar { display: grid; grid-template-columns: minmax(110px,1fr) auto auto auto; }
+    .bil-input { min-width: 0; width: 100%; }
+    .bil-select { min-width: 0; max-width: 132px; }
+    .bil-summary { justify-content: space-between; color: color-mix(in srgb, currentColor 78%, transparent); white-space: nowrap; overflow: hidden; }
+    .bil-summary > * { overflow: hidden; text-overflow: ellipsis; }
+    .bil-contextbar { min-height: 29px; padding: 4px 6px; border-radius: 7px; background: rgba(105,165,240,.11); }
+    .bil-contextbar[hidden] { display: none; }
+    .bil-context-label { margin-right: auto; font-weight: 650; }
+    .bil-settings { border: 1px solid rgba(255,255,255,.10); border-radius: 7px; }
+    .bil-settings > summary { cursor: pointer; padding: 5px 7px; user-select: none; opacity: .82; }
+    .bil-settings-row { flex-wrap: wrap; padding: 0 7px 7px; }
+    .bil-toggle { display: inline-flex; align-items: center; gap: 5px; user-select: none; white-space: nowrap; }
+    .bil-toggle input { margin: 0; }
+    .bil-list { position: relative; min-height: 0; overflow: auto; flex: 1 1 0; overscroll-behavior: contain; outline: none; }
+    .bil-list-inner, .bil-list-window { position: relative; min-height: 100%; }
+    .bil-empty { min-height: 100%; display: flex; align-items: center; justify-content: center; box-sizing: border-box; padding: 20px; text-align: center; border: 1px dashed rgba(255,255,255,.14); border-radius: 10px; opacity: .7; }
+    .bil-card {
+      position: absolute; display: flex; flex-direction: column; overflow: hidden; box-sizing: border-box;
+      border: 1px solid rgba(255,255,255,.11); border-radius: 10px; background: rgba(0,0,0,.18);
+      contain: layout paint style; transition: border-color 80ms ease, background 80ms ease;
     }
-    .bil-toggle {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 8px;
-      border: 1px solid rgba(255,255,255,0.18);
-      border-radius: 6px;
-      background: rgba(255,255,255,0.06);
-      user-select: none;
-    }
-    .bil-toggle input {
-      margin: 0;
-    }
-    .bil-dropzone {
-      border: 1px dashed rgba(255,255,255,0.25);
-      border-radius: 8px;
-      padding: 10px;
-      text-align: center;
-      background: rgba(255,255,255,0.04);
-      cursor: pointer;
-      user-select: none;
-    }
-    .bil-dropzone.bil-dragover {
-      border-color: rgba(120,180,255,0.9);
-      background: rgba(120,180,255,0.12);
-    }
-    .bil-btn, .bil-select {
-      border: 1px solid rgba(255,255,255,0.18);
-      background: rgba(255,255,255,0.06);
-      color: inherit;
-      border-radius: 6px;
-      padding: 4px 8px;
-      font: inherit;
-    }
-    .bil-btn { cursor: pointer; }
-    .bil-btn:disabled {
-      opacity: 0.45;
-      cursor: not-allowed;
-    }
-    .bil-summary {
-      justify-content: space-between;
-      gap: 8px;
-      opacity: 0.9;
-    }
-    .bil-list {
-      position: relative;
-      min-height: 0;
-      overflow: auto;
-      padding-right: 2px;
-      flex: 1 1 0;
-    }
-    .bil-list-inner {
-      position: relative;
-      min-height: 100%;
-    }
-    .bil-list-window {
-      position: relative;
-      min-height: 100%;
-    }
-    .bil-empty {
-      min-height: 100%;
-      box-sizing: border-box;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 14px 10px;
-      text-align: center;
-      border: 1px dashed rgba(255,255,255,0.12);
-      border-radius: 8px;
-      opacity: 0.7;
-      pointer-events: none;
-    }
-    .bil-row {
-      position: absolute;
-      left: 0;
-      right: 0;
-      display: grid;
-      grid-template-columns: 24px 52px minmax(0,1fr) auto auto;
-      gap: 8px;
-      align-items: center;
-      height: var(--bil-row-height);
-      padding: 6px;
-      box-sizing: border-box;
-      border: 1px solid rgba(255,255,255,0.10);
-      border-radius: 8px;
-      background: rgba(0,0,0,0.16);
-    }
-    .bil-row.bil-selected {
-      border-color: rgba(120,180,255,0.85);
-      background: rgba(120,180,255,0.10);
-    }
-    .bil-row.bil-drag-target {
-      outline: 1px dashed rgba(120,180,255,0.95);
-      outline-offset: -2px;
-    }
-    .bil-thumb {
-      width: 52px;
-      height: 52px;
-      object-fit: contain;
-      border-radius: 6px;
-      background: rgba(255,255,255,0.06);
-    }
-    .bil-meta {
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-    .bil-name,
-    .bil-path {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .bil-name { font-weight: 600; }
-    .bil-path {
-      opacity: 0.72;
-      font-size: 11px;
-    }
-    .bil-right {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      align-items: flex-end;
-      min-width: 82px;
-    }
-    .bil-badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 72px;
-      padding: 2px 6px;
-      border-radius: 999px;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.02em;
-      background: rgba(255,255,255,0.08);
-    }
-    .bil-badge-pending { background: rgba(160,160,160,0.18); }
-    .bil-badge-queued { background: rgba(255,190,70,0.22); }
-    .bil-badge-processed { background: rgba(80,190,110,0.24); }
-    .bil-index {
-      opacity: 0.72;
-      font-variant-numeric: tabular-nums;
-    }
-    .bil-status-text { opacity: 0.8; }
-    .bil-row-actions {
-      display: flex;
-      gap: 4px;
-      align-items: center;
-      justify-content: flex-end;
-      flex-wrap: wrap;
-      min-width: 108px;
-    }
-    .bil-mini-btn {
-      border: 1px solid rgba(255,255,255,0.16);
-      background: rgba(255,255,255,0.04);
-      color: inherit;
-      border-radius: 6px;
-      padding: 2px 6px;
-      font: inherit;
-      cursor: pointer;
-    }
+    .bil-card.bil-selected { border-color: rgba(110,175,255,.95); box-shadow: inset 0 0 0 1px rgba(110,175,255,.34); background: rgba(80,145,225,.11); }
+    .bil-card.bil-focused { outline: 2px solid rgba(150,200,255,.95); outline-offset: -3px; }
+    .bil-card.bil-drag-target { outline: 2px dashed rgba(120,185,255,.95); outline-offset: -4px; }
+    .bil-media { position: relative; flex: 1 1 auto; min-height: 0; background: rgba(255,255,255,.045); cursor: pointer; }
+    .bil-thumb { width: 100%; height: 100%; display: block; object-fit: contain; background: repeating-conic-gradient(rgba(255,255,255,.035) 0 25%, transparent 0 50%) 50% / 14px 14px; }
+    .bil-card-overlay { position: absolute; inset: 6px 6px auto 6px; display: flex; align-items: flex-start; justify-content: space-between; gap: 4px; pointer-events: none; }
+    .bil-card-check { pointer-events: auto; width: 17px; height: 17px; margin: 0; accent-color: #6aaef7; }
+    .bil-badge { padding: 2px 6px; border-radius: 999px; font-size: 10px; text-transform: uppercase; letter-spacing: .025em; background: rgba(20,20,20,.72); backdrop-filter: blur(3px); }
+    .bil-badge-pending { color: #e2e2e2; } .bil-badge-queued { color: #ffd276; } .bil-badge-processed { color: #8bea9e; }
+    .bil-count-badge { color: #cce4ff; text-transform: none; }
+    .bil-card-footer { flex: 0 0 58px; display: flex; flex-direction: column; justify-content: center; gap: 4px; padding: 5px 7px 6px; min-width: 0; }
+    .bil-card-title-row, .bil-card-actions { display: flex; align-items: center; gap: 4px; min-width: 0; }
+    .bil-name { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 620; }
+    .bil-index { flex: 0 0 auto; opacity: .65; font-variant-numeric: tabular-nums; }
+    .bil-path { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .62; font-size: 10px; }
+    .bil-card-actions { justify-content: flex-end; }
+    .bil-mini-btn { border: 0; background: transparent; color: inherit; border-radius: 5px; padding: 2px 5px; font: inherit; cursor: pointer; opacity: .78; }
+    .bil-mini-btn:hover { background: rgba(255,255,255,.10); opacity: 1; }
+    .bil-position { margin-left: auto; opacity: .65; font-variant-numeric: tabular-nums; }
+    .bil-lightbox { position: fixed; inset: 0; z-index: 100000; display: flex; align-items: center; justify-content: center; padding: 36px; background: rgba(0,0,0,.86); }
+    .bil-lightbox[hidden] { display: none; }
+    .bil-lightbox img { max-width: 94vw; max-height: 90vh; object-fit: contain; box-shadow: 0 18px 60px rgba(0,0,0,.45); }
+    .bil-lightbox-label { position: absolute; left: 24px; bottom: 18px; right: 70px; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bil-lightbox-close { position: absolute; top: 18px; right: 20px; font-size: 24px; color: white; background: rgba(255,255,255,.12); border: 0; border-radius: 8px; width: 38px; height: 38px; cursor: pointer; }
+    @media (max-width: 600px) { .bil-browserbar { grid-template-columns: minmax(100px,1fr) auto auto; } .bil-browserbar .bil-size-select { display: none; } }
   `
   document.head.appendChild(style)
 }
@@ -1347,879 +1268,915 @@ function chainNodeCallback(node, key, handler) {
   }
 }
 
-function getVisibleRowRange(list, totalItems) {
-  if (!totalItems) return { start: 0, end: 0, offset: 0, height: 0 }
-
-  const measuredViewportHeight = Math.max(0, list.clientHeight || 0)
-  const viewportHeight = Math.max(measuredViewportHeight, ROW_STRIDE)
-  const maxScrollTop = Math.max(0, totalItems * ROW_STRIDE - ROW_GAP - measuredViewportHeight)
-  const rawScrollTop = Math.max(list.scrollTop || 0, 0)
-  const scrollTop = Math.min(rawScrollTop, maxScrollTop)
-  if (scrollTop !== rawScrollTop) {
-    list.scrollTop = scrollTop
-  }
-  const visibleCount = Math.max(1, Math.ceil(viewportHeight / ROW_STRIDE))
-  const rawStart = Math.max(0, Math.floor(scrollTop / ROW_STRIDE) - LIST_OVERSCAN)
-  const maxStart = Math.max(0, totalItems - (visibleCount + LIST_OVERSCAN * 2))
-  const start = Math.min(rawStart, maxStart)
-  const end = Math.min(totalItems, start + visibleCount + LIST_OVERSCAN * 2)
-  const height = Math.max(0, totalItems * ROW_STRIDE - ROW_GAP)
+function createBrowserState() {
   return {
-    start,
-    end,
-    offset: start * ROW_STRIDE,
-    height
-  }
-}
-
-/**
- * Create a reusable virtualized row slot for an image item, providing its DOM structure and wiring event handlers for drag/drop, selection, preview, and per-item actions.
- * @param {Object} node - The node instance the slot will operate against (used to read/update widget state).
- * @param {Object} ctx - Rendering/context object containing shared state and helpers (e.g., `draggedId`, drag-target utilities).
- * @returns {{row: HTMLElement, itemId: string|null, previewUrl: string, checkbox: HTMLInputElement, thumb: HTMLImageElement, name: HTMLElement, path: HTMLElement, badge: HTMLElement, indexText: HTMLElement, pendingBtn: HTMLButtonElement, processedBtn: HTMLButtonElement, deleteBtn: HTMLButtonElement}} A slot object containing the root row element, the currently bound item id and preview URL, and references to child controls used by the renderer.
- */
-function createRowSlot(node, ctx) {
-  const row = document.createElement('div')
-  row.className = 'bil-row'
-  row.draggable = true
-  row.style.display = 'none'
-
-  const slot = {
-    row,
-    itemId: null,
-    previewUrl: ''
-  }
-
-  const clearTargets = (exceptRow = null) => clearRowDragTargets(ctx, exceptRow)
-
-  row.addEventListener('dragstart', () => {
-    if (!slot.itemId) return
-    ctx.draggedId = slot.itemId
-    clearTargets()
-  })
-  row.addEventListener('dragend', () => {
-    ctx.draggedId = null
-    clearTargets()
-  })
-  row.addEventListener('dragover', (event) => {
-    if (!slot.itemId || !ctx.draggedId) return
-    event.preventDefault()
-    clearTargets(row)
-    row.classList.add('bil-drag-target')
-  })
-  row.addEventListener('dragleave', () => {
-    row.classList.remove('bil-drag-target')
-  })
-  row.addEventListener('drop', (event) => {
-    if (!slot.itemId || !ctx.draggedId) return
-    event.preventDefault()
-    clearTargets()
-    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-    if (moveItems(liveState, ctx.draggedId, slot.itemId)) {
-      updateState(node, liveState, liveUiState)
-    }
-    ctx.draggedId = null
-  })
-
-  const checkbox = document.createElement('input')
-  checkbox.type = 'checkbox'
-  checkbox.addEventListener('change', () => {
-    if (!slot.itemId) return
-    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-    applySelectionToggle(liveUiState, slot.itemId, checkbox.checked)
-    updateState(node, liveState, liveUiState)
-  })
-  slot.checkbox = checkbox
-
-  const thumb = document.createElement('img')
-  thumb.className = 'bil-thumb'
-  thumb.decoding = 'async'
-  thumb.draggable = false
-  slot.thumb = thumb
-
-  const meta = document.createElement('div')
-  meta.className = 'bil-meta'
-
-  const name = document.createElement('div')
-  name.className = 'bil-name'
-  slot.name = name
-
-  const path = document.createElement('div')
-  path.className = 'bil-path'
-  slot.path = path
-
-  meta.append(name, path)
-
-  const right = document.createElement('div')
-  right.className = 'bil-right'
-
-  const badge = document.createElement('div')
-  badge.className = 'bil-badge'
-  slot.badge = badge
-
-  const indexText = document.createElement('div')
-  indexText.className = 'bil-index'
-  slot.indexText = indexText
-
-  right.append(badge, indexText)
-
-  const actions = document.createElement('div')
-  actions.className = 'bil-row-actions'
-
-  const pendingBtn = document.createElement('button')
-  pendingBtn.className = 'bil-mini-btn'
-  pendingBtn.type = 'button'
-  pendingBtn.textContent = 'Pending'
-  pendingBtn.addEventListener('click', () => {
-    if (!slot.itemId) return
-    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-    const liveItem = liveState.items.find((entry) => entry.id === slot.itemId)
-    if (!liveItem) return
-    liveItem.status = 'pending'
-    updateState(node, liveState, liveUiState)
-  })
-  slot.pendingBtn = pendingBtn
-
-  const processedBtn = document.createElement('button')
-  processedBtn.className = 'bil-mini-btn'
-  processedBtn.type = 'button'
-  processedBtn.textContent = 'Done'
-  processedBtn.addEventListener('click', () => {
-    if (!slot.itemId) return
-    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-    const liveItem = liveState.items.find((entry) => entry.id === slot.itemId)
-    if (!liveItem) return
-    liveItem.status = 'processed'
-    liveItem.last_processed_at = Date.now()
-    updateState(node, liveState, liveUiState)
-  })
-  slot.processedBtn = processedBtn
-
-  const deleteBtn = document.createElement('button')
-  deleteBtn.className = 'bil-mini-btn'
-  deleteBtn.type = 'button'
-  deleteBtn.textContent = 'Delete'
-  deleteBtn.addEventListener('click', () => {
-    if (!slot.itemId) return
-    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-    liveState.items = liveState.items.filter((entry) => entry.id !== slot.itemId)
-    liveUiState.selected_ids = liveUiState.selected_ids.filter(
-      (id) => id !== slot.itemId
-    )
-    delete liveUiState.source_paths[slot.itemId]
-    updateState(node, liveState, liveUiState)
-  })
-  slot.deleteBtn = deleteBtn
-
-  actions.append(pendingBtn, processedBtn, deleteBtn)
-  row.append(checkbox, thumb, meta, right, actions)
-  return slot
-}
-
-function clearRowDragTargets(ctx, exceptRow = null) {
-  for (const slot of ctx.rowPool) {
-    if (slot.row !== exceptRow) {
-      slot.row.classList.remove('bil-drag-target')
+    activeView: 'conveyor',
+    conveyor: {
+      query: '', filter: 'all', sort: 'manual', size: 'medium', scrollTop: 0,
+      focusedId: null, lastSelectedId: null, selected: new Set()
+    },
+    input: {
+      query: '', folder: 'all', sort: 'name_asc', size: 'medium', scrollTop: 0,
+      focusedId: null, lastSelectedId: null, files: [], selected: new Set(),
+      loaded: false, loading: false, error: '', snapshotVersion: 0
     }
   }
 }
 
-function ensureRowPool(node, needed) {
+function activeBrowser(ctx) {
+  return ctx.browser[ctx.browser.activeView]
+}
+
+function compareNatural(left, right) {
+  return String(left ?? '').localeCompare(String(right ?? ''), undefined, {
+    numeric: true,
+    sensitivity: 'base'
+  })
+}
+
+function getViewItems(node) {
   const ctx = node.__bil
-  if (!ctx) return
-  while (ctx.rowPool.length < needed) {
-    const slot = createRowSlot(node, ctx)
-    ctx.rowPool.push(slot)
-    ctx.listWindow.appendChild(slot.row)
+  const browser = activeBrowser(ctx)
+  if (ctx.browser.activeView === 'input') {
+    const query = browser.query.trim().toLocaleLowerCase()
+    const items = browser.files.filter((entry) => {
+      if (browser.folder !== 'all') {
+        const folder = String(entry.subfolder || '')
+        if (folder !== browser.folder && !folder.startsWith(`${browser.folder}/`)) return false
+      }
+      return !query || `${entry.filename} ${entry.relative_path}`.toLocaleLowerCase().includes(query)
+    })
+    switch (browser.sort) {
+      case 'name_desc': items.sort((a, b) => compareNatural(b.relative_path, a.relative_path)); break
+      case 'newest': items.sort((a, b) => (b.mtime_ns || 0) - (a.mtime_ns || 0) || compareNatural(a.relative_path, b.relative_path)); break
+      case 'oldest': items.sort((a, b) => (a.mtime_ns || 0) - (b.mtime_ns || 0) || compareNatural(a.relative_path, b.relative_path)); break
+      default: items.sort((a, b) => compareNatural(a.relative_path, b.relative_path)); break
+    }
+    return items
   }
-}
-
-/**
- * Hide and clear all row slots in the pool from `startIndex` onward.
- *
- * Clears each slot's displayed data (itemId, previewUrl, dataset) and removes
- * selection/drag CSS classes, then sets the slot DOM row to display: none.
- *
- * @param {{rowPool: Array}} ctx - Context object containing `rowPool`, an array of slot objects.
- * Each slot is expected to have `itemId`, `previewUrl`, `row` (DOM element), and `row.dataset`.
- * @param {number} [startIndex=0] - Inclusive index in `rowPool` from which slots should be hidden.
- */
-function hideUnusedRowSlots(ctx, startIndex = 0) {
-  for (let index = startIndex; index < ctx.rowPool.length; index += 1) {
-    const slot = ctx.rowPool[index]
-    slot.itemId = null
-    slot.previewUrl = ''
-    slot.row.style.display = 'none'
-    slot.row.classList.remove('bil-selected', 'bil-drag-target')
-    delete slot.row.dataset.itemId
-  }
-}
-
-/**
- * Populate a pooled row slot's DOM with data for a specific item and selection state.
- *
- * Updates the slot's attributes, text, badge, thumbnail, ARIA labels, and positioning so the
- * row reflects the provided item's current data and the UI state's display path.
- *
- * @param {object} slot - Reusable row slot containing DOM elements (row, checkbox, thumb, name, path, badge, buttons, etc.).
- * @param {object} item - Normalized item object (must include `id`, `filename`, `status`, and other display fields).
- * @param {number} index - Zero-based index of the item within the rendered list.
- * @param {Set<string>} selected - Set of selected item IDs.
- * @param {object} uiState - UI state object used to derive runtime display paths (e.g., `source_paths`).
- */
-function updateRowSlot(slot, item, index, selected, uiState) {
-  const itemLabel = item.filename || getItemDisplayPath(item, uiState)
-  const previewUrl = filePreviewUrl(item)
-
-  slot.itemId = item.id
-  slot.row.style.display = 'grid'
-  slot.row.style.top = `${index * ROW_STRIDE}px`
-  slot.row.dataset.itemId = item.id
-  slot.row.classList.remove('bil-drag-target')
-  slot.row.classList.toggle('bil-selected', selected.has(item.id))
-
-  slot.checkbox.checked = selected.has(item.id)
-  slot.checkbox.setAttribute('aria-label', `Select ${itemLabel}`)
-
-  slot.thumb.alt = itemLabel
-  if (slot.previewUrl !== previewUrl) {
-    slot.thumb.src = previewUrl
-    slot.previewUrl = previewUrl
-  }
-
-  slot.name.textContent = itemLabel
-  slot.path.textContent = getItemDisplayPath(item, uiState)
-
-  slot.badge.className = `bil-badge bil-badge-${item.status}`
-  slot.badge.textContent = item.status
-
-  slot.indexText.textContent = `#${index + 1}`
-
-  slot.pendingBtn.setAttribute('aria-label', `Mark ${itemLabel} as pending`)
-  slot.processedBtn.setAttribute('aria-label', `Mark ${itemLabel} as done`)
-  slot.deleteBtn.setAttribute('aria-label', `Delete ${itemLabel}`)
-}
-
-/**
- * Update the widget's virtualized list to render only the rows currently visible in the viewport.
- *
- * Reads the cached renderable state for the given node, computes the visible row range, ensures a pool
- * of row slots exists, populates those slots with item data and UI state, hides unused slots, and
- * adjusts container sizing. If there are no items the function clears the list layout and hides slots.
- *
- * @param {Object} node - The node that owns the batch image loader widget (expected to have a `__bil` render context).
- */
-function renderVisibleRows(node) {
-  const ctx = node.__bil
-  if (!ctx) return
 
   const { state, uiState } = getRenderableState(node)
-  const selected = getSelectedIds(uiState)
+  const query = browser.query.trim().toLocaleLowerCase()
+  return state.items.filter((item) => {
+    if (browser.filter !== 'all' && item.status !== browser.filter) return false
+    if (!query) return true
+    return `${item.filename} ${getItemDisplayPath(item, uiState)}`.toLocaleLowerCase().includes(query)
+  })
+}
 
-  if (!state.items.length) {
-    ctx.listInner.style.height = 'auto'
-    ctx.listInner.style.minHeight = ''
-    ctx.listWindow.style.height = 'auto'
-    ctx.listWindow.style.minHeight = ''
-    hideUnusedRowSlots(ctx, 0)
-    ctx.renderedRangeKey = ''
+function getGalleryMetrics(ctx) {
+  const browser = activeBrowser(ctx)
+  const definition = CARD_SIZES[browser.size] ?? CARD_SIZES.medium
+  const width = Math.max(1, Math.floor(ctx.list.clientWidth || ctx.widgetWidth || MIN_NODE_WIDTH))
+  return calculateGalleryMetrics(width, definition.minWidth, CARD_GAP)
+}
+
+function getVisibleCardRange(ctx, totalItems, metrics) {
+  const range = calculateVisibleCardRange(
+    totalItems,
+    metrics.columns,
+    metrics.rowStride,
+    CARD_GAP,
+    ctx.list.scrollTop,
+    ctx.list.clientHeight,
+    GALLERY_OVERSCAN_ROWS
+  )
+  if (range.scrollTop !== ctx.list.scrollTop) ctx.list.scrollTop = range.scrollTop
+  return range
+}
+
+function canReorderConveyor(ctx) {
+  const browser = ctx.browser.conveyor
+  return ctx.browser.activeView === 'conveyor' && browser.filter === 'all' && !browser.query.trim()
+}
+
+function getViewSelectedIds(node) {
+  const ctx = node.__bil
+  return activeBrowser(ctx).selected
+}
+
+function renderSelectionContext(node) {
+  const ctx = node.__bil
+  if (!ctx) return
+  const inputView = ctx.browser.activeView === 'input'
+  const selected = getViewSelectedIds(node)
+  ctx.contextBar.hidden = selected.size === 0
+  ctx.contextLabel.textContent = `${selected.size} selected`
+  ctx.setPendingBtn.hidden = inputView
+  ctx.setProcessedBtn.hidden = inputView
+  ctx.deleteSelectedBtn.hidden = inputView
+  ctx.contextAddBtn.hidden = !inputView
+}
+
+function setItemSelected(node, itemId, checked, event = null) {
+  const ctx = node.__bil
+  const browser = activeBrowser(ctx)
+  const items = ctx.visibleItems || []
+  if (ctx.browser.activeView === 'input') {
+    const selected = browser.selected
+    if (event?.shiftKey && browser.lastSelectedId) {
+      const anchor = items.findIndex((item) => item.relative_path === browser.lastSelectedId)
+      const current = items.findIndex((item) => item.relative_path === itemId)
+      if (anchor >= 0 && current >= 0) {
+        for (let index = Math.min(anchor, current); index <= Math.max(anchor, current); index += 1) {
+          selected.add(items[index].relative_path)
+        }
+      }
+    } else if (checked) selected.add(itemId)
+    else selected.delete(itemId)
+    browser.lastSelectedId = itemId
+    renderSelectionContext(node)
+    scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
     return
   }
 
-  const { start, end, height } = getVisibleRowRange(ctx.list, state.items.length)
-  const viewportHeight = Math.round(ctx.list.clientHeight || 0)
-  const rangeKey = `${ctx.renderVersion}:${state.items.length}:${viewportHeight}:${start}:${end}`
-  if (ctx.renderedRangeKey === rangeKey) return
-
-  const needed = end - start
-  ctx.listInner.style.minHeight = ''
-  ctx.listWindow.style.minHeight = ''
-  ctx.listInner.style.height = `${height}px`
-  ctx.listWindow.style.height = `${height}px`
-  ensureRowPool(node, needed)
-
-  for (let offset = 0; offset < needed; offset += 1) {
-    updateRowSlot(
-      ctx.rowPool[offset],
-      state.items[start + offset],
-      start + offset,
-      selected,
-      uiState
-    )
-  }
-  hideUnusedRowSlots(ctx, needed)
-  ctx.renderedRangeKey = rangeKey
+  const selected = browser.selected
+  if (event?.shiftKey && browser.lastSelectedId) {
+    const anchor = items.findIndex((item) => item.id === browser.lastSelectedId)
+    const current = items.findIndex((item) => item.id === itemId)
+    if (anchor >= 0 && current >= 0) {
+      for (let index = Math.min(anchor, current); index <= Math.max(anchor, current); index += 1) selected.add(items[index].id)
+    }
+  } else if (checked) selected.add(itemId)
+  else selected.delete(itemId)
+  browser.lastSelectedId = itemId
+  renderSelectionContext(node)
+  scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
 }
 
-/**
- * Update the widget DOM to reflect the node's current state and UI state.
- *
- * Reads the node's parsed state and uiState, caches the render snapshot, and updates the summary text, next-item text, empty-list UI, row virtualization (visible rows), and action-button enabled/disabled states to match the current items, selection, and auto-queue flag.
- *
- * @param {Object} node - The ComfyUI node instance that contains the widget context (node.__bil) to render into.
- */
-function renderNode(node) {
+function createLightbox(node) {
+  const lightbox = document.createElement('div')
+  lightbox.className = 'bil-lightbox'
+  lightbox.hidden = true
+  lightbox.setAttribute('role', 'dialog')
+  lightbox.setAttribute('aria-modal', 'true')
+  const image = document.createElement('img')
+  const label = document.createElement('div')
+  label.className = 'bil-lightbox-label'
+  const close = document.createElement('button')
+  close.className = 'bil-lightbox-close'
+  close.type = 'button'
+  close.textContent = '×'
+  close.setAttribute('aria-label', 'Close preview')
+  lightbox.append(image, label, close)
+  const hide = () => {
+    lightbox.hidden = true
+    image.removeAttribute('src')
+    node.__bil?.root.focus({ preventScroll: true })
+  }
+  close.addEventListener('click', hide)
+  lightbox.addEventListener('click', (event) => { if (event.target === lightbox) hide() })
+  document.body.appendChild(lightbox)
+  return { root: lightbox, image, label, hide }
+}
+
+function openPreview(node, item) {
+  const ctx = node.__bil
+  if (!ctx?.lightbox || !item) return
+  const label = item.filename || item.relative_path || getItemDisplayPath(item)
+  ctx.lightbox.image.src = filePreviewUrl(item)
+  ctx.lightbox.image.alt = label
+  ctx.lightbox.label.textContent = label
+  ctx.lightbox.root.hidden = false
+  ctx.lightbox.root.focus?.({ preventScroll: true })
+}
+
+function clearCardDragTargets(ctx, except = null) {
+  for (const slot of ctx.cardPool) {
+    if (slot.card !== except) slot.card.classList.remove('bil-drag-target')
+  }
+}
+
+function createCardSlot(node, ctx) {
+  const card = document.createElement('div')
+  card.className = 'bil-card'
+  card.style.display = 'none'
+  const slot = { card, itemId: null, item: null, previewUrl: '', bindToken: 0, draggable: false }
+
+  card.addEventListener('dragstart', (event) => {
+    if (!slot.draggable || !slot.itemId) { event.preventDefault(); return }
+    ctx.draggedId = slot.itemId
+    event.dataTransfer?.setData('text/plain', slot.itemId)
+    clearCardDragTargets(ctx)
+  })
+  card.addEventListener('dragend', () => { ctx.draggedId = null; clearCardDragTargets(ctx) })
+  card.addEventListener('dragover', (event) => {
+    if (!slot.draggable || !ctx.draggedId) return
+    event.preventDefault(); clearCardDragTargets(ctx, card); card.classList.add('bil-drag-target')
+  })
+  card.addEventListener('dragleave', () => card.classList.remove('bil-drag-target'))
+  card.addEventListener('drop', (event) => {
+    if (!slot.draggable || !slot.itemId || !ctx.draggedId) return
+    event.preventDefault(); clearCardDragTargets(ctx)
+    const { state, uiState } = getRenderableState(node)
+    if (moveItems(state, ctx.draggedId, slot.itemId)) updateState(node, state, uiState)
+    ctx.draggedId = null
+  })
+
+  const media = document.createElement('div')
+  media.className = 'bil-media'
+  media.addEventListener('click', (event) => {
+    if (!slot.itemId) return
+    activeBrowser(ctx).focusedId = slot.itemId
+    if (event.ctrlKey || event.metaKey || event.shiftKey) {
+      const selected = getViewSelectedIds(node)
+      setItemSelected(node, slot.itemId, !selected.has(slot.itemId), event)
+    } else scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+  })
+  media.addEventListener('dblclick', () => openPreview(node, slot.item))
+  const thumb = document.createElement('img')
+  thumb.className = 'bil-thumb'
+  thumb.loading = 'lazy'
+  thumb.decoding = 'async'
+  thumb.draggable = false
+  const overlay = document.createElement('div')
+  overlay.className = 'bil-card-overlay'
+  const checkbox = document.createElement('input')
+  checkbox.type = 'checkbox'
+  checkbox.className = 'bil-card-check'
+  checkbox.addEventListener('click', (event) => event.stopPropagation())
+  checkbox.addEventListener('change', (event) => {
+    if (slot.itemId) setItemSelected(node, slot.itemId, checkbox.checked, event)
+  })
+  const badge = document.createElement('span')
+  badge.className = 'bil-badge'
+  overlay.append(checkbox, badge)
+  media.append(thumb, overlay)
+
+  const footer = document.createElement('div')
+  footer.className = 'bil-card-footer'
+  const titleRow = document.createElement('div')
+  titleRow.className = 'bil-card-title-row'
+  const name = document.createElement('div')
+  name.className = 'bil-name'
+  const indexText = document.createElement('div')
+  indexText.className = 'bil-index'
+  titleRow.append(name, indexText)
+  const actions = document.createElement('div')
+  actions.className = 'bil-card-actions'
+  const path = document.createElement('div')
+  path.className = 'bil-path'
+  const pendingBtn = document.createElement('button')
+  pendingBtn.className = 'bil-mini-btn'; pendingBtn.type = 'button'; pendingBtn.textContent = '↶'
+  const processedBtn = document.createElement('button')
+  processedBtn.className = 'bil-mini-btn'; processedBtn.type = 'button'; processedBtn.textContent = '✓'
+  const deleteBtn = document.createElement('button')
+  deleteBtn.className = 'bil-mini-btn'; deleteBtn.type = 'button'; deleteBtn.textContent = '×'
+  const addBtn = document.createElement('button')
+  addBtn.className = 'bil-mini-btn'; addBtn.type = 'button'; addBtn.textContent = '+ Add'
+
+  pendingBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node)
+    const item = state.items.find((entry) => entry.id === slot.itemId)
+    if (item) { item.status = 'pending'; updateState(node, state, uiState) }
+  })
+  processedBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node)
+    const item = state.items.find((entry) => entry.id === slot.itemId)
+    if (item) { item.status = 'processed'; item.last_processed_at = Date.now(); updateState(node, state, uiState) }
+  })
+  deleteBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node)
+    state.items = state.items.filter((entry) => entry.id !== slot.itemId)
+    ctx.browser.conveyor.selected.delete(slot.itemId)
+    uiState.selected_ids = uiState.selected_ids.filter((id) => id !== slot.itemId)
+    delete uiState.source_paths[slot.itemId]
+    updateState(node, state, uiState)
+  })
+  addBtn.addEventListener('click', () => { if (slot.item) addInputEntries(node, [slot.item]) })
+  actions.append(path, pendingBtn, processedBtn, deleteBtn, addBtn)
+  footer.append(titleRow, actions)
+  card.append(media, footer)
+  Object.assign(slot, { media, thumb, checkbox, badge, name, indexText, path, pendingBtn, processedBtn, deleteBtn, addBtn })
+  return slot
+}
+
+function ensureCardPool(node, needed) {
+  const ctx = node.__bil
+  while (ctx.cardPool.length < needed) {
+    const slot = createCardSlot(node, ctx)
+    ctx.cardPool.push(slot)
+    ctx.listWindow.appendChild(slot.card)
+  }
+}
+
+function hideUnusedCards(ctx, start = 0) {
+  for (let index = start; index < ctx.cardPool.length; index += 1) {
+    const slot = ctx.cardPool[index]
+    slot.itemId = null; slot.item = null; slot.previewUrl = ''; slot.bindToken += 1
+    slot.card.style.display = 'none'
+    slot.card.classList.remove('bil-selected', 'bil-focused', 'bil-drag-target')
+    slot.thumb.removeAttribute('src')
+  }
+}
+
+function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotatedCounts) {
+  const ctx = node.__bil
+  const inputView = ctx.browser.activeView === 'input'
+  const itemId = inputView ? item.relative_path : item.id
+  const label = item.filename || item.relative_path || getItemDisplayPath(item, getRenderableState(node).uiState)
+  const row = Math.floor(itemIndex / metrics.columns)
+  const column = itemIndex % metrics.columns
+  const left = column * (metrics.cardWidth + CARD_GAP)
+  const top = row * metrics.rowStride
+  const url = thumbnailUrl(item, activeBrowser(ctx).size)
+  slot.itemId = itemId; slot.item = item
+  slot.card.style.display = 'flex'
+  slot.card.style.width = `${metrics.cardWidth}px`
+  slot.card.style.height = `${metrics.cardHeight}px`
+  slot.card.style.transform = `translate3d(${left}px, ${top}px, 0)`
+  slot.card.classList.toggle('bil-selected', selected.has(itemId))
+  slot.card.classList.toggle('bil-focused', activeBrowser(ctx).focusedId === itemId)
+  slot.checkbox.checked = selected.has(itemId)
+  slot.checkbox.setAttribute('aria-label', `Select ${label}`)
+  slot.card.title = inputView ? item.relative_path : getItemDisplayPath(item, getRenderableState(node).uiState)
+  slot.name.textContent = label
+  slot.indexText.textContent = `#${itemIndex + 1}`
+  slot.path.textContent = inputView ? (item.subfolder || 'input root') : getItemDisplayPath(item, getRenderableState(node).uiState)
+  slot.path.title = slot.path.textContent
+  slot.draggable = !inputView && canReorderConveyor(ctx)
+  slot.card.draggable = slot.draggable
+  slot.pendingBtn.hidden = inputView
+  slot.processedBtn.hidden = inputView
+  slot.deleteBtn.hidden = inputView
+  slot.addBtn.hidden = !inputView
+  if (inputView) {
+    const count = annotatedCounts.get(item.relative_path) || 0
+    slot.badge.className = 'bil-badge bil-count-badge'
+    slot.badge.textContent = count ? `In conveyor ×${count}` : 'Input'
+  } else {
+    slot.badge.className = `bil-badge bil-badge-${item.status}`
+    slot.badge.textContent = item.status
+  }
+  slot.thumb.alt = label
+  if (slot.previewUrl !== url) {
+    const token = ++slot.bindToken
+    slot.thumb.classList.remove('bil-thumb-error')
+    slot.thumb.onload = () => {
+      if (token !== slot.bindToken) return
+      slot.thumb.classList.remove('bil-thumb-error')
+    }
+    slot.thumb.onerror = () => {
+      if (token !== slot.bindToken) return
+      slot.thumb.classList.add('bil-thumb-error')
+    }
+    slot.thumb.src = url
+    slot.previewUrl = url
+  }
+}
+
+function renderVisibleCards(node) {
   const ctx = node.__bil
   if (!ctx) return
+  const items = ctx.visibleItems || []
+  if (!items.length) {
+    ctx.listInner.style.height = 'auto'; ctx.listWindow.style.height = 'auto'
+    hideUnusedCards(ctx); ctx.renderedRangeKey = ''; return
+  }
+  const metrics = getGalleryMetrics(ctx)
+  ctx.lastMetrics = metrics
+  const range = getVisibleCardRange(ctx, items.length, metrics)
+  const view = ctx.browser.activeView
+  const selected = getViewSelectedIds(node)
+  const { state } = getRenderableState(node)
+  let annotatedCounts = new Map()
+  if (view === 'input') {
+    if (ctx.annotatedCountsRevision !== ctx.queueRevision) {
+      ctx.annotatedCounts = new Map()
+      for (const item of state.items) {
+        const path = getInputRelativePath(item)
+        if (path) ctx.annotatedCounts.set(path, (ctx.annotatedCounts.get(path) || 0) + 1)
+      }
+      ctx.annotatedCountsRevision = ctx.queueRevision
+    }
+    annotatedCounts = ctx.annotatedCounts
+  }
+  const key = `${ctx.renderVersion}:${ctx.inputVersion}:${view}:${items.length}:${metrics.width}:${metrics.columns}:${metrics.cardHeight}:${range.start}:${range.end}`
+  if (ctx.renderedRangeKey === key) return
+  ctx.listInner.style.height = `${range.totalHeight}px`
+  ctx.listWindow.style.height = `${range.totalHeight}px`
+  const needed = range.end - range.start
+  ensureCardPool(node, needed)
+  for (let offset = 0; offset < needed; offset += 1) {
+    updateCardSlot(node, ctx.cardPool[offset], items[range.start + offset], range.start + offset, metrics, selected, annotatedCounts)
+  }
+  hideUnusedCards(ctx, needed)
+  ctx.renderedRangeKey = key
+}
 
+function updateFolderOptions(ctx) {
+  const select = ctx.folderSelect
+  const previous = ctx.browser.input.folder
+  const folders = new Set()
+  for (const entry of ctx.browser.input.files) {
+    const folder = String(entry.subfolder || '')
+    if (!folder) continue
+    const segments = folder.split('/')
+    for (let index = 1; index <= segments.length; index += 1) folders.add(segments.slice(0, index).join('/'))
+  }
+  select.replaceChildren()
+  const all = document.createElement('option'); all.value = 'all'; all.textContent = 'All folders'; select.appendChild(all)
+  for (const folder of Array.from(folders).sort(compareNatural)) {
+    const option = document.createElement('option'); option.value = folder; option.textContent = folder; select.appendChild(option)
+  }
+  ctx.browser.input.folder = folders.has(previous) ? previous : 'all'
+  select.value = ctx.browser.input.folder
+}
+
+function renderGalleryNode(node) {
+  const ctx = node.__bil
+  if (!ctx) return
   const snapshot = getCurrentState(node)
   cacheRenderableState(node, snapshot.state, snapshot.uiState)
   const { state, uiState } = snapshot
-  const selected = getSelectedIds(uiState)
+  const validQueueIds = new Set(state.items.map((item) => item.id))
+  ctx.browser.conveyor.selected = new Set(
+    Array.from(ctx.browser.conveyor.selected).filter((id) => validQueueIds.has(id))
+  )
+  ctx.visibleItems = getViewItems(node)
+  const inputView = ctx.browser.activeView === 'input'
+  const browser = activeBrowser(ctx)
+  const pending = countItemsByStatus(state, 'pending')
+  const queued = countItemsByStatus(state, 'queued')
+  const processed = countItemsByStatus(state, 'processed')
+  const next = state.dont_consume ? findNextLoadItem(state) : findFirstByStatus(state, ['pending', 'queued'])
 
-  const pendingCount = countItemsByStatus(state, 'pending')
-  const queuedCount = countItemsByStatus(state, 'queued')
-  const processedCount = countItemsByStatus(state, 'processed')
-  const nextItem = state.dont_consume
-    ? findNextLoadItem(state)
-    : findFirstByStatus(state, ['pending', 'queued'])
+  ctx.conveyorTab.textContent = `Conveyor ${state.items.length}`
+  ctx.inputTab.textContent = `Input Folder ${ctx.browser.input.files.length}`
+  ctx.conveyorTab.setAttribute('aria-selected', String(!inputView))
+  ctx.inputTab.setAttribute('aria-selected', String(inputView))
+  if (document.activeElement !== ctx.searchInput) ctx.searchInput.value = browser.query
+  ctx.sizeSelect.value = browser.size
+  ctx.conveyorFilter.hidden = inputView
+  ctx.folderSelect.hidden = !inputView
+  ctx.conveyorSort.hidden = inputView
+  ctx.inputSort.hidden = !inputView
+  ctx.applySortBtn.hidden = inputView
+  ctx.refreshBtn.hidden = !inputView
+  ctx.addSelectedInputBtn.hidden = !inputView
+  ctx.conveyorFilter.value = ctx.browser.conveyor.filter
+  ctx.folderSelect.value = ctx.browser.input.folder
+  ctx.conveyorSort.value = ctx.browser.conveyor.sort
+  ctx.inputSort.value = ctx.browser.input.sort
+  ctx.summary.textContent = inputView
+    ? `${ctx.visibleItems.length} shown · ${ctx.browser.input.files.length} images${ctx.browser.input.loading ? ' · refreshing…' : ''}${ctx.browser.input.error ? ` · ${ctx.browser.input.error}` : ''}`
+    : `${state.items.length} total · ${pending} pending · ${queued} queued · ${processed} processed`
+  const focusedIndex = browser.focusedId
+    ? ctx.visibleItems.findIndex((item) => (inputView ? item.relative_path : item.id) === browser.focusedId)
+    : -1
+  const position = focusedIndex >= 0 ? `${focusedIndex + 1} of ${ctx.visibleItems.length}` : ''
+  ctx.nextText.textContent = inputView
+    ? position
+    : `${next ? `Next: ${next.filename || getItemDisplayPath(next, uiState)}${state.dont_consume ? ' · not consuming' : ''}` : 'Next: none'}${position ? ` · ${position}` : ''}`
+  renderSelectionContext(node)
+  ctx.autoQueueCheckbox.checked = Boolean(state.auto_queue)
+  ctx.dontConsumeCheckbox.checked = Boolean(state.dont_consume)
+  ctx.canvasDropCheckbox.checked = Boolean(state.catch_canvas_drops)
 
-  ctx.summary.textContent = `Total ${state.items.length} · Pending ${pendingCount} · Queued ${queuedCount} · Processed ${processedCount}`
-  if (ctx.autoQueueCheckbox) {
-    ctx.autoQueueCheckbox.checked = Boolean(state.auto_queue)
-  }
-  if (ctx.dontConsumeCheckbox) {
-    ctx.dontConsumeCheckbox.checked = Boolean(state.dont_consume)
-  }
-  if (ctx.canvasDropCheckbox) {
-    ctx.canvasDropCheckbox.checked = Boolean(state.catch_canvas_drops)
-  }
-  ctx.nextText.textContent = nextItem
-    ? `Next: ${nextItem.filename || getItemDisplayPath(nextItem, uiState)}${state.dont_consume ? ' · not consuming' : ''}`
-    : 'Next: none'
-
-  if (!state.items.length) {
-    ctx.listInner.style.height = 'auto'
-    ctx.listInner.style.minHeight = ''
-    ctx.listWindow.style.height = 'auto'
-    ctx.listWindow.style.minHeight = ''
-    hideUnusedRowSlots(ctx, 0)
-    ctx.renderedRangeKey = ''
-    if (!ctx.empty) {
-      ctx.empty = document.createElement('div')
-      ctx.empty.className = 'bil-empty'
-      ctx.empty.textContent = 'Drop images or folders here, or click the drop area to add images.'
-    }
-    ctx.empty.hidden = false
-    if (ctx.empty.parentElement !== ctx.listWindow) {
-      ctx.listWindow.appendChild(ctx.empty)
-    }
+  if (!ctx.visibleItems.length) {
+    hideUnusedCards(ctx); ctx.renderedRangeKey = ''
+    ctx.listInner.style.height = 'auto'; ctx.listWindow.style.height = 'auto'
+    if (ctx.list.scrollTop) ctx.list.scrollTop = 0
+    if (!ctx.empty) { ctx.empty = document.createElement('div'); ctx.empty.className = 'bil-empty' }
+    ctx.empty.textContent = inputView
+      ? (ctx.browser.input.loading ? 'Loading the ComfyUI input folder…' : 'No images match this input-folder view.')
+      : 'Drop images or folders here, click Add images, or browse the Input Folder tab.'
+    if (ctx.empty.parentElement !== ctx.listWindow) ctx.listWindow.appendChild(ctx.empty)
   } else {
-    ctx.listInner.style.minHeight = ''
-    ctx.listWindow.style.minHeight = ''
     ctx.empty?.remove()
-    renderVisibleRows(node)
+    renderVisibleCards(node)
   }
-
-  ctx.setPendingBtn.disabled = selected.size === 0
-  ctx.setProcessedBtn.disabled = selected.size === 0
-  ctx.deleteSelectedBtn.disabled = selected.size === 0
 }
 
-/**
- * Build the DOM for the image-conveyor widget, attach interactive controls and event handlers, and store internal references on the node.
- *
- * Creates the widget's root element, ensures required stylesheet is present, wires file/drop handling, selection/sorting/status controls,
- * virtualization scroll handling, and assigns runtime state/refs to `node.__bil`.
- *
- * @param {object} node - The ComfyUI node object that will host the widget; `node.__bil` will be populated with DOM references and runtime state.
- * @returns {HTMLElement} The root DOM element for the widget.
- */
-function buildDom(node) {
-  ensureStyles()
+async function refreshInputFiles(node, { force = false } = {}) {
+  const ctx = node.__bil
+  if (!ctx) return
+  ctx.inputRequestId += 1
+  const requestId = ctx.inputRequestId
+  ctx.inputAbortController?.abort()
+  const controller = new AbortController()
+  ctx.inputAbortController = controller
+  ctx.browser.input.loading = true
+  ctx.browser.input.error = ''
+  scheduleRenderNode(node)
+  try {
+    const suffix = force ? '?refresh=1' : ''
+    const response = await api.fetchApi(`/image-conveyor/input-files${suffix}`, { signal: controller.signal })
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
+    const payload = await response.json()
+    if (requestId !== ctx.inputRequestId || node.__bil !== ctx || ctx.removed) return
+    const files = Array.isArray(payload?.files) ? payload.files.filter((entry) => entry?.relative_path && entry?.filename) : []
+    ctx.browser.input.files = files
+    ctx.browser.input.loaded = true
+    ctx.browser.input.snapshotVersion = Number(payload?.snapshot_version || 0)
+    const availablePaths = new Set(files.map((entry) => entry.relative_path))
+    ctx.browser.input.selected = new Set(Array.from(ctx.browser.input.selected).filter((path) => availablePaths.has(path)))
+    ctx.inputVersion += 1
+    updateFolderOptions(ctx)
+  } catch (error) {
+    if (error?.name !== 'AbortError' && requestId === ctx.inputRequestId) {
+      ctx.browser.input.error = 'Refresh failed'
+      console.error('Image Conveyor: failed to load the input folder.', error)
+    }
+  } finally {
+    if (requestId === ctx.inputRequestId && node.__bil === ctx && !ctx.removed) {
+      ctx.browser.input.loading = false
+      scheduleRenderNode(node)
+    }
+  }
+}
 
+function addInputEntries(node, entries) {
+  if (!entries.length) return
+  const { state, uiState } = getRenderableState(node)
+  for (const entry of entries) {
+    const item = makeItemFromInputFile(entry)
+    if (!item) continue
+    state.items.push(item)
+    uiState.source_paths[item.id] = entry.relative_path
+  }
+  updateState(node, state, uiState)
+}
+
+function addSelectedInputEntries(node) {
+  const ctx = node.__bil
+  const selected = ctx.browser.input.selected
+  addInputEntries(node, ctx.browser.input.files.filter((entry) => selected.has(entry.relative_path)))
+}
+
+function switchBrowserView(node, view) {
+  const ctx = node.__bil
+  if (!ctx || ctx.browser.activeView === view) return
+  activeBrowser(ctx).scrollTop = ctx.list.scrollTop
+  ctx.browser.activeView = view
+  ctx.renderedRangeKey = ''
+  ctx.list.scrollTop = activeBrowser(ctx).scrollTop
+  scheduleRenderNode(node, { forceVisibleRows: true })
+  requestAnimationFrame(() => { if (node.__bil) ctx.list.scrollTop = activeBrowser(ctx).scrollTop })
+  if (view === 'input' && !ctx.browser.input.loaded && !ctx.browser.input.loading) void refreshInputFiles(node)
+}
+
+function scrollItemIntoView(node, index) {
+  const ctx = node.__bil
+  const metrics = getGalleryMetrics(ctx)
+  const row = Math.floor(index / metrics.columns)
+  const top = row * metrics.rowStride
+  const bottom = top + metrics.cardHeight
+  if (top < ctx.list.scrollTop) ctx.list.scrollTop = top
+  else if (bottom > ctx.list.scrollTop + ctx.list.clientHeight) ctx.list.scrollTop = bottom - ctx.list.clientHeight
+}
+
+function isTextControl(target) {
+  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target?.isContentEditable
+}
+
+function handleGalleryKeyDown(node, event) {
+  const ctx = node.__bil
+  if (!ctx || isTextControl(event.target)) return
+  if (event.key === 'Escape' && !ctx.lightbox.root.hidden) { event.preventDefault(); ctx.lightbox.hide(); return }
+  const items = ctx.visibleItems || []
+  if (!items.length) return
+  const browser = activeBrowser(ctx)
+  const itemId = (item) => ctx.browser.activeView === 'input' ? item.relative_path : item.id
+  let index = items.findIndex((item) => itemId(item) === browser.focusedId)
+  if (index < 0) index = 0
+  const metrics = getGalleryMetrics(ctx)
+  const page = Math.max(metrics.columns, Math.floor(ctx.list.clientHeight / metrics.rowStride) * metrics.columns)
+  let next = index
+  switch (event.key) {
+    case 'ArrowLeft': next -= 1; break
+    case 'ArrowRight': next += 1; break
+    case 'ArrowUp': next -= metrics.columns; break
+    case 'ArrowDown': next += metrics.columns; break
+    case 'Home': next = 0; break
+    case 'End': next = items.length - 1; break
+    case 'PageUp': next -= page; break
+    case 'PageDown': next += page; break
+    case 'Enter': event.preventDefault(); openPreview(node, items[index]); return
+    case ' ': {
+      event.preventDefault()
+      const id = itemId(items[index]); const selected = getViewSelectedIds(node)
+      setItemSelected(node, id, !selected.has(id), event); return
+    }
+    default: return
+  }
+  event.preventDefault()
+  next = Math.max(0, Math.min(items.length - 1, next))
+  browser.focusedId = itemId(items[next])
+  scrollItemIntoView(node, next)
+  scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+}
+
+function buildGalleryDom(node) {
+  ensureStyles()
   const root = document.createElement('div')
   root.className = 'bil-root'
-  root.tabIndex = -1
-
-  const dropzone = document.createElement('div')
-  dropzone.className = 'bil-dropzone'
-  dropzone.textContent = 'Click to add images, or drop images/folders'
+  root.tabIndex = 0
+  root.setAttribute('aria-label', 'Image Conveyor browser')
 
   const fileInput = document.createElement('input')
   fileInput.type = 'file'
   fileInput.accept = 'image/*,.png,.jpg,.jpeg,.webp,.bmp,.gif,.tif,.tiff,.avif'
   fileInput.multiple = true
-  fileInput.style.display = 'none'
+  fileInput.hidden = true
 
-  const toolbar = document.createElement('div')
-  toolbar.className = 'bil-toolbar'
+  const header = document.createElement('div')
+  header.className = 'bil-header'
+  const tabs = document.createElement('div')
+  tabs.className = 'bil-tabs'
+  tabs.setAttribute('role', 'tablist')
+  const conveyorTab = document.createElement('button')
+  conveyorTab.className = 'bil-tab'; conveyorTab.type = 'button'; conveyorTab.setAttribute('role', 'tab')
+  const inputTab = document.createElement('button')
+  inputTab.className = 'bil-tab'; inputTab.type = 'button'; inputTab.setAttribute('role', 'tab')
+  tabs.append(conveyorTab, inputTab)
+  const addImagesBtn = document.createElement('button')
+  addImagesBtn.className = 'bil-btn bil-add-btn'; addImagesBtn.type = 'button'; addImagesBtn.textContent = '+ Add images'
+  header.append(tabs, addImagesBtn)
 
-  const selectAllBtn = document.createElement('button')
-  selectAllBtn.className = 'bil-btn'
-  selectAllBtn.type = 'button'
-  selectAllBtn.textContent = 'Select all'
-
-  const selectNoneBtn = document.createElement('button')
-  selectNoneBtn.className = 'bil-btn'
-  selectNoneBtn.type = 'button'
-  selectNoneBtn.textContent = 'Clear selection'
-
-  const sortSelect = document.createElement('select')
-  sortSelect.className = 'bil-select'
-  ;[
-    ['manual', 'Manual order'],
-    ['name_asc', 'Sort name ↑'],
-    ['name_desc', 'Sort name ↓'],
-    ['added_newest', 'Sort newest'],
-    ['added_oldest', 'Sort oldest'],
-    ['status', 'Sort status']
-  ].forEach(([value, label]) => {
-    const option = document.createElement('option')
-    option.value = value
-    option.textContent = label
-    sortSelect.appendChild(option)
+  const browserbar = document.createElement('div')
+  browserbar.className = 'bil-browserbar'
+  const searchInput = document.createElement('input')
+  searchInput.className = 'bil-input'; searchInput.type = 'search'; searchInput.placeholder = 'Search images…'
+  const conveyorFilter = document.createElement('select')
+  conveyorFilter.className = 'bil-select'
+  ;[['all', 'All'], ['pending', 'Pending'], ['queued', 'Queued'], ['processed', 'Processed']].forEach(([value, label]) => {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; conveyorFilter.appendChild(option)
   })
+  const folderSelect = document.createElement('select')
+  folderSelect.className = 'bil-select'; folderSelect.hidden = true
+  const conveyorSort = document.createElement('select')
+  conveyorSort.className = 'bil-select'
+  ;[
+    ['manual', 'Manual order'], ['name_asc', 'Name ↑'], ['name_desc', 'Name ↓'],
+    ['added_newest', 'Newest'], ['added_oldest', 'Oldest'], ['status', 'Status']
+  ].forEach(([value, label]) => { const option = document.createElement('option'); option.value = value; option.textContent = label; conveyorSort.appendChild(option) })
+  const inputSort = document.createElement('select')
+  inputSort.className = 'bil-select'; inputSort.hidden = true
+  ;[['name_asc', 'Name ↑'], ['name_desc', 'Name ↓'], ['newest', 'Newest'], ['oldest', 'Oldest']].forEach(([value, label]) => {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; inputSort.appendChild(option)
+  })
+  const sizeSelect = document.createElement('select')
+  sizeSelect.className = 'bil-select bil-size-select'
+  ;[['small', 'Small'], ['medium', 'Medium'], ['large', 'Large']].forEach(([value, label]) => {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; sizeSelect.appendChild(option)
+  })
+  browserbar.append(searchInput, conveyorFilter, folderSelect, conveyorSort, inputSort, sizeSelect)
 
-  const sortBtn = document.createElement('button')
-  sortBtn.className = 'bil-btn'
-  sortBtn.type = 'button'
-  sortBtn.textContent = 'Apply sort'
+  const secondary = document.createElement('div')
+  secondary.className = 'bil-header'
+  const applySortBtn = document.createElement('button')
+  applySortBtn.className = 'bil-btn'; applySortBtn.type = 'button'; applySortBtn.textContent = 'Apply queue sort'
+  const refreshBtn = document.createElement('button')
+  refreshBtn.className = 'bil-btn'; refreshBtn.type = 'button'; refreshBtn.textContent = 'Refresh'; refreshBtn.hidden = true
+  const addSelectedInputBtn = document.createElement('button')
+  addSelectedInputBtn.className = 'bil-btn'; addSelectedInputBtn.type = 'button'; addSelectedInputBtn.textContent = 'Add selected'; addSelectedInputBtn.hidden = true
+  secondary.append(applySortBtn, refreshBtn, addSelectedInputBtn)
 
-  const autoQueueLabel = document.createElement('label')
-  autoQueueLabel.className = 'bil-toggle'
-  const autoQueueCheckbox = document.createElement('input')
-  autoQueueCheckbox.type = 'checkbox'
-  autoQueueCheckbox.setAttribute('aria-label', 'Auto queue all pending images')
-  const autoQueueText = document.createElement('span')
-  autoQueueText.textContent = 'Auto queue all pending'
-  autoQueueLabel.append(autoQueueCheckbox, autoQueueText)
-
-  const dontConsumeLabel = document.createElement('label')
-  dontConsumeLabel.className = 'bil-toggle'
-  const dontConsumeCheckbox = document.createElement('input')
-  dontConsumeCheckbox.type = 'checkbox'
-  dontConsumeCheckbox.setAttribute('aria-label', 'Do not consume images')
-  const dontConsumeText = document.createElement('span')
-  dontConsumeText.textContent = "Don't consume"
-  dontConsumeLabel.append(dontConsumeCheckbox, dontConsumeText)
-
-  const canvasDropLabel = document.createElement('label')
-  canvasDropLabel.className = 'bil-toggle'
-  canvasDropLabel.title = 'When enabled, external image/folder drops anywhere on the graph canvas are added to this conveyor. If multiple conveyors enable it, select the target conveyor first.'
-  const canvasDropCheckbox = document.createElement('input')
-  canvasDropCheckbox.type = 'checkbox'
-  canvasDropCheckbox.setAttribute('aria-label', 'Catch image drops anywhere on the canvas')
-  const canvasDropText = document.createElement('span')
-  canvasDropText.textContent = 'Catch canvas drops'
-  canvasDropLabel.append(canvasDropCheckbox, canvasDropText)
-
-  toolbar.append(
-    selectAllBtn,
-    selectNoneBtn,
-    sortSelect,
-    sortBtn,
-    autoQueueLabel,
-    dontConsumeLabel,
-    canvasDropLabel
-  )
-
-  const subtoolbar = document.createElement('div')
-  subtoolbar.className = 'bil-subtoolbar'
-
-  const setPendingBtn = document.createElement('button')
-  setPendingBtn.className = 'bil-btn'
-  setPendingBtn.type = 'button'
-  setPendingBtn.textContent = 'Set pending'
-
-  const setProcessedBtn = document.createElement('button')
-  setProcessedBtn.className = 'bil-btn'
-  setProcessedBtn.type = 'button'
-  setProcessedBtn.textContent = 'Set processed'
-
-  const clearQueuedBtn = document.createElement('button')
-  clearQueuedBtn.className = 'bil-btn'
-  clearQueuedBtn.type = 'button'
-  clearQueuedBtn.textContent = 'Clear queued'
-
-  const clearProcessedBtn = document.createElement('button')
-  clearProcessedBtn.className = 'bil-btn'
-  clearProcessedBtn.type = 'button'
-  clearProcessedBtn.textContent = 'Remove processed'
-
-  const deleteSelectedBtn = document.createElement('button')
-  deleteSelectedBtn.className = 'bil-btn'
-  deleteSelectedBtn.type = 'button'
-  deleteSelectedBtn.textContent = 'Delete selected'
-
-  subtoolbar.append(
-    setPendingBtn,
-    setProcessedBtn,
-    clearQueuedBtn,
-    clearProcessedBtn,
-    deleteSelectedBtn
-  )
-
+  const summaryRow = document.createElement('div')
+  summaryRow.className = 'bil-summary'
   const summary = document.createElement('div')
-  summary.className = 'bil-summary'
-  const summaryText = document.createElement('div')
   const nextText = document.createElement('div')
-  nextText.className = 'bil-status-text'
-  summary.append(summaryText, nextText)
+  summaryRow.append(summary, nextText)
+
+  const contextBar = document.createElement('div')
+  contextBar.className = 'bil-contextbar'; contextBar.hidden = true
+  const contextLabel = document.createElement('span'); contextLabel.className = 'bil-context-label'
+  const setPendingBtn = document.createElement('button'); setPendingBtn.className = 'bil-btn'; setPendingBtn.type = 'button'; setPendingBtn.textContent = 'Pending'
+  const setProcessedBtn = document.createElement('button'); setProcessedBtn.className = 'bil-btn'; setProcessedBtn.type = 'button'; setProcessedBtn.textContent = 'Done'
+  const deleteSelectedBtn = document.createElement('button'); deleteSelectedBtn.className = 'bil-btn'; deleteSelectedBtn.type = 'button'; deleteSelectedBtn.textContent = 'Delete'
+  const contextAddBtn = document.createElement('button'); contextAddBtn.className = 'bil-btn'; contextAddBtn.type = 'button'; contextAddBtn.textContent = 'Add to Conveyor'
+  const clearSelectionBtn = document.createElement('button'); clearSelectionBtn.className = 'bil-btn'; clearSelectionBtn.type = 'button'; clearSelectionBtn.textContent = 'Clear'
+  contextBar.append(contextLabel, setPendingBtn, setProcessedBtn, deleteSelectedBtn, contextAddBtn, clearSelectionBtn)
+
+  const settings = document.createElement('details')
+  settings.className = 'bil-settings'
+  const settingsSummary = document.createElement('summary'); settingsSummary.textContent = 'Queue options and bulk tools'
+  const settingsRow = document.createElement('div'); settingsRow.className = 'bil-settings-row'
+  const makeToggle = (labelText, ariaLabel) => {
+    const label = document.createElement('label'); label.className = 'bil-toggle'
+    const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.setAttribute('aria-label', ariaLabel)
+    const text = document.createElement('span'); text.textContent = labelText
+    label.append(checkbox, text); return { label, checkbox }
+  }
+  const autoQueue = makeToggle('Auto queue all pending', 'Auto queue all pending images')
+  const dontConsume = makeToggle("Don't consume", 'Do not consume images')
+  const canvasDrop = makeToggle('Catch canvas drops', 'Catch image drops anywhere on the canvas')
+  const selectVisibleBtn = document.createElement('button'); selectVisibleBtn.className = 'bil-btn'; selectVisibleBtn.type = 'button'; selectVisibleBtn.textContent = 'Select all'
+  const clearQueuedBtn = document.createElement('button'); clearQueuedBtn.className = 'bil-btn'; clearQueuedBtn.type = 'button'; clearQueuedBtn.textContent = 'Clear queued'
+  const clearProcessedBtn = document.createElement('button'); clearProcessedBtn.className = 'bil-btn'; clearProcessedBtn.type = 'button'; clearProcessedBtn.textContent = 'Remove processed'
+  const jumpPendingBtn = document.createElement('button'); jumpPendingBtn.className = 'bil-btn'; jumpPendingBtn.type = 'button'; jumpPendingBtn.textContent = 'Jump to next pending'
+  settingsRow.append(autoQueue.label, dontConsume.label, canvasDrop.label, selectVisibleBtn, clearQueuedBtn, clearProcessedBtn, jumpPendingBtn)
+  settings.append(settingsSummary, settingsRow)
 
   const list = document.createElement('div')
-  list.className = 'bil-list'
-
-  const listInner = document.createElement('div')
-  listInner.className = 'bil-list-inner'
-
-  const listWindow = document.createElement('div')
-  listWindow.className = 'bil-list-window'
-
-  listInner.appendChild(listWindow)
-  list.appendChild(listInner)
-
-  root.append(fileInput, dropzone, toolbar, subtoolbar, summary, list)
+  list.className = 'bil-list'; list.tabIndex = 0
+  const listInner = document.createElement('div'); listInner.className = 'bil-list-inner'
+  const listWindow = document.createElement('div'); listWindow.className = 'bil-list-window'
+  listInner.appendChild(listWindow); list.appendChild(listInner)
+  root.append(fileInput, header, browserbar, secondary, summaryRow, contextBar, settings, list)
 
   node.__bil = {
-    root,
-    dropzone,
-    fileInput,
-    summary: summaryText,
-    nextText,
-    list,
-    listInner,
-    listWindow,
-    setPendingBtn,
-    setProcessedBtn,
-    deleteSelectedBtn,
-    autoQueueCheckbox,
-    dontConsumeCheckbox,
-    canvasDropCheckbox,
-    draggedId: null,
-    empty: null,
-    state: null,
-    uiState: null,
-    renderVersion: 0,
-    renderedRangeKey: '',
-    renderFrame: 0,
-    renderViewportOnly: false,
-    rowPool: [],
-    listResizeObserver: null,
-    widgetOuterHeight: 0,
-    widgetInnerHeight: 0,
-    widgetWidth: 0,
-    pointerInside: false,
-    middlePanPointerId: null,
-    documentPasteHandler: null,
-    documentMiddlePanMoveHandler: null,
-    documentMiddlePanEndHandler: null
+    root, dropzone: addImagesBtn, addImagesBtn, fileInput, conveyorTab, inputTab,
+    searchInput, conveyorFilter, folderSelect, conveyorSort, inputSort, sizeSelect,
+    applySortBtn, refreshBtn, addSelectedInputBtn, summary, nextText, contextBar,
+    contextLabel, setPendingBtn, setProcessedBtn, deleteSelectedBtn, contextAddBtn,
+    autoQueueCheckbox: autoQueue.checkbox, dontConsumeCheckbox: dontConsume.checkbox,
+    canvasDropCheckbox: canvasDrop.checkbox, list, listInner, listWindow,
+    browser: createBrowserState(), visibleItems: [], cardPool: [],
+    draggedId: null, empty: null, state: null, uiState: null, renderVersion: 0,
+    inputVersion: 0, renderedRangeKey: '', renderFrame: 0, renderViewportOnly: false,
+    listResizeObserver: null, widgetOuterHeight: 0, widgetInnerHeight: 0, widgetWidth: 0,
+    pointerInside: false, middlePanPointerId: null, documentPasteHandler: null,
+    documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
+    documentKeyHandler: null, inputAbortController: null, inputRequestId: 0,
+    searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
+    queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map()
   }
   const ctx = node.__bil
+  ctx.lightbox = createLightbox(node)
+  updateFolderOptions(ctx)
 
-  list.addEventListener('scroll', () => scheduleRenderNode(node, { viewportOnly: true }), {
-    passive: true
+  const runUpload = (files) => {
+    void uploadViaNode(node, files).catch((error) => {
+      console.error('Image Conveyor: import failed.', error)
+      ctx.browser.input.error = error?.message || 'Import failed'
+      scheduleRenderNode(node)
+    })
+  }
+  addImagesBtn.addEventListener('click', () => fileInput.click())
+  fileInput.addEventListener('change', () => { runUpload(fileInput.files); fileInput.value = '' })
+  conveyorTab.addEventListener('click', () => switchBrowserView(node, 'conveyor'))
+  inputTab.addEventListener('click', () => switchBrowserView(node, 'input'))
+  refreshBtn.addEventListener('click', () => void refreshInputFiles(node, { force: true }))
+  addSelectedInputBtn.addEventListener('click', () => addSelectedInputEntries(node))
+  contextAddBtn.addEventListener('click', () => addSelectedInputEntries(node))
+
+  searchInput.addEventListener('input', () => {
+    clearTimeout(ctx.searchTimer)
+    const targetView = ctx.browser.activeView
+    const query = searchInput.value
+    ctx.searchTimer = setTimeout(() => {
+      ctx.browser[targetView].query = query
+      ctx.browser[targetView].scrollTop = 0
+      if (ctx.browser.activeView === targetView) list.scrollTop = 0
+      scheduleRenderNode(node)
+    }, 70)
   })
+  conveyorFilter.addEventListener('change', () => { ctx.browser.conveyor.filter = conveyorFilter.value; list.scrollTop = 0; scheduleRenderNode(node) })
+  folderSelect.addEventListener('change', () => { ctx.browser.input.folder = folderSelect.value; list.scrollTop = 0; scheduleRenderNode(node) })
+  inputSort.addEventListener('change', () => { ctx.browser.input.sort = inputSort.value; scheduleRenderNode(node) })
+  conveyorSort.addEventListener('change', () => { ctx.browser.conveyor.sort = conveyorSort.value })
+  sizeSelect.addEventListener('change', () => {
+    const items = ctx.visibleItems || []
+    const previous = getGalleryMetrics(ctx)
+    const anchorIndex = Math.min(items.length - 1, Math.max(0, Math.floor(list.scrollTop / previous.rowStride) * previous.columns))
+    const anchorId = items[anchorIndex] ? (ctx.browser.activeView === 'input' ? items[anchorIndex].relative_path : items[anchorIndex].id) : null
+    activeBrowser(ctx).size = sizeSelect.value
+    ctx.renderedRangeKey = ''
+    scheduleRenderNode(node, { forceVisibleRows: true })
+    requestAnimationFrame(() => {
+      if (!anchorId || !node.__bil) return
+      const newIndex = (ctx.visibleItems || []).findIndex((item) => (ctx.browser.activeView === 'input' ? item.relative_path : item.id) === anchorId)
+      if (newIndex >= 0) { const metrics = getGalleryMetrics(ctx); list.scrollTop = Math.floor(newIndex / metrics.columns) * metrics.rowStride }
+    })
+  })
+
+  applySortBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node)
+    switch (conveyorSort.value) {
+      case 'name_asc': state.items.sort((a, b) => compareNatural(getItemDisplayPath(a, uiState), getItemDisplayPath(b, uiState))); break
+      case 'name_desc': state.items.sort((a, b) => compareNatural(getItemDisplayPath(b, uiState), getItemDisplayPath(a, uiState))); break
+      case 'added_newest': state.items.sort((a, b) => (b.added_at || 0) - (a.added_at || 0)); break
+      case 'added_oldest': state.items.sort((a, b) => (a.added_at || 0) - (b.added_at || 0)); break
+      case 'status': state.items.sort((a, b) => itemStatusRank(a.status) - itemStatusRank(b.status) || (a.added_at || 0) - (b.added_at || 0)); break
+      default: break
+    }
+    ctx.browser.conveyor.sort = 'manual'; conveyorSort.value = 'manual'; updateState(node, state, uiState)
+  })
+
+  const mutateSelected = (status) => {
+    const { state, uiState } = getRenderableState(node); const selected = ctx.browser.conveyor.selected; const now = Date.now()
+    for (const item of state.items) if (selected.has(item.id)) { item.status = status; if (status === 'processed') item.last_processed_at = now }
+    updateState(node, state, uiState)
+  }
+  setPendingBtn.addEventListener('click', () => mutateSelected('pending'))
+  setProcessedBtn.addEventListener('click', () => mutateSelected('processed'))
+  deleteSelectedBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node); const selected = ctx.browser.conveyor.selected
+    state.items = state.items.filter((item) => !selected.has(item.id)); uiState.selected_ids = []
+    ctx.browser.conveyor.selected.clear()
+    uiState.source_paths = Object.fromEntries(Object.entries(uiState.source_paths).filter(([id]) => !selected.has(id)))
+    updateState(node, state, uiState)
+  })
+  clearSelectionBtn.addEventListener('click', () => {
+    if (ctx.browser.activeView === 'input') {
+      ctx.browser.input.selected.clear(); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    } else {
+      ctx.browser.conveyor.selected.clear(); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    }
+  })
+  selectVisibleBtn.addEventListener('click', () => {
+    if (ctx.browser.activeView === 'input') {
+      ctx.browser.input.selected = new Set(ctx.browser.input.files.map((item) => item.relative_path)); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    } else {
+      const { state } = getRenderableState(node); ctx.browser.conveyor.selected = new Set(state.items.map((item) => item.id)); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    }
+  })
+  autoQueue.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.auto_queue = autoQueue.checkbox.checked; updateState(node, state, uiState) })
+  dontConsume.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.dont_consume = dontConsume.checkbox.checked; updateState(node, state, uiState) })
+  canvasDrop.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.catch_canvas_drops = canvasDrop.checkbox.checked; updateState(node, state, uiState) })
+  clearQueuedBtn.addEventListener('click', () => { const { state, uiState } = getRenderableState(node); for (const item of state.items) if (item.status === 'queued') item.status = 'pending'; updateState(node, state, uiState) })
+  clearProcessedBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node); const kept = state.items.filter((item) => item.status !== 'processed'); const ids = new Set(kept.map((item) => item.id)); state.items = kept
+    uiState.selected_ids = uiState.selected_ids.filter((id) => ids.has(id)); uiState.source_paths = Object.fromEntries(Object.entries(uiState.source_paths).filter(([id]) => ids.has(id))); updateState(node, state, uiState)
+  })
+  jumpPendingBtn.addEventListener('click', () => {
+    if (ctx.browser.activeView !== 'conveyor') {
+      activeBrowser(ctx).scrollTop = list.scrollTop
+      ctx.browser.activeView = 'conveyor'
+    }
+    ctx.browser.conveyor.query = ''
+    ctx.browser.conveyor.filter = 'all'
+    ctx.visibleItems = getViewItems(node)
+    const index = ctx.visibleItems.findIndex((item) => item.status === 'pending')
+    if (index >= 0) {
+      ctx.browser.conveyor.focusedId = ctx.visibleItems[index].id
+      scrollItemIntoView(node, index)
+    }
+    scheduleRenderNode(node, { forceVisibleRows: true })
+  })
+
+  list.addEventListener('scroll', () => { activeBrowser(ctx).scrollTop = list.scrollTop; scheduleRenderNode(node, { viewportOnly: true }) }, { passive: true })
+  root.addEventListener('keydown', (event) => handleGalleryKeyDown(node, event))
+  ctx.documentKeyHandler = (event) => { if (event.key === 'Escape' && !ctx.lightbox.root.hidden) { event.preventDefault(); ctx.lightbox.hide() } }
+  document.addEventListener('keydown', ctx.documentKeyHandler, true)
 
   if (typeof ResizeObserver === 'function') {
     ctx.listResizeObserver = new ResizeObserver(() => {
+      const previous = ctx.lastMetrics
+      const items = ctx.visibleItems || []
+      const anchorIndex = previous
+        ? Math.min(items.length - 1, Math.max(0, Math.floor(list.scrollTop / previous.rowStride) * previous.columns))
+        : -1
+      const anchorId = anchorIndex >= 0
+        ? (ctx.browser.activeView === 'input' ? items[anchorIndex].relative_path : items[anchorIndex].id)
+        : null
+      ctx.renderedRangeKey = ''
       scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+      if (anchorId && previous && previous.width !== Math.floor(list.clientWidth || 0)) {
+        requestAnimationFrame(() => {
+          if (ctx.removed) return
+          const index = (ctx.visibleItems || []).findIndex((item) => (ctx.browser.activeView === 'input' ? item.relative_path : item.id) === anchorId)
+          if (index >= 0) {
+            const metrics = getGalleryMetrics(ctx)
+            list.scrollTop = Math.floor(index / metrics.columns) * metrics.rowStride
+          }
+        })
+      }
     })
     ctx.listResizeObserver.observe(list)
   }
 
-  let externalDragDepth = 0
-  const setExternalDragActive = (active) => {
-    root.classList.toggle('bil-dragover', active)
-    dropzone.classList.toggle('bil-dragover', active)
-    if (!active) {
-      clearRowDragTargets(ctx)
-    }
-  }
-
-  const handleFiles = async (fileList) => {
-    const files = normalizeUploadFiles(fileList)
-    if (!files.length) return
-
-    dropzone.textContent = `Uploading ${files.length} image${files.length === 1 ? '' : 's'}…`
-    try {
-      const uploaded = await uploadFiles(files)
-      const { state, uiState } = getCurrentState(node)
-      for (const entry of uploaded) {
-        const item = makeItemFromUploadResponse(entry)
-        if (!item) continue
-        state.items.push(item)
-        const runtimeSourcePath = normalizeSourcePath(entry?.source_path)
-        if (runtimeSourcePath) uiState.source_paths[item.id] = runtimeSourcePath
-      }
-      updateState(node, state, uiState)
-    } finally {
-      dropzone.textContent = 'Click to add images, or drop images/folders'
-      fileInput.value = ''
-    }
-  }
-
-  dropzone.addEventListener('click', () => fileInput.click())
-  fileInput.addEventListener('change', () => handleFiles(fileInput.files))
-
-  root.addEventListener(
-    'pointerdown',
-    (event) => {
-      if (event.button === 1) {
-        if (!app.canvas) return
-        ctx.middlePanPointerId = event.pointerId
-        event.preventDefault()
-        app.canvas.processMouseDown(event)
-        return
-      }
-      root.focus({ preventScroll: true })
-    },
-    true
-  )
-
-  root.addEventListener('pointerenter', () => {
-    ctx.pointerInside = true
-  })
-
-  root.addEventListener('pointerleave', () => {
-    ctx.pointerInside = false
-  })
-
+  root.addEventListener('pointerenter', () => { ctx.pointerInside = true })
+  root.addEventListener('pointerleave', () => { ctx.pointerInside = false })
+  root.addEventListener('pointerdown', (event) => {
+    if (event.button === 1) { if (!app.canvas) return; ctx.middlePanPointerId = event.pointerId; event.preventDefault(); app.canvas.processMouseDown(event); return }
+    if (!isTextControl(event.target)) root.focus({ preventScroll: true })
+  }, true)
+  root.addEventListener('mousedown', (event) => { if (event.button === 1) event.preventDefault() }, true)
+  root.addEventListener('auxclick', (event) => { if (event.button === 1) event.preventDefault() }, true)
   ctx.documentMiddlePanMoveHandler = (event) => {
-    if (!app.canvas) return
-    if (ctx.middlePanPointerId == null || event.pointerId !== ctx.middlePanPointerId) return
-
-    if ((event.buttons & 4) !== 4) {
-      app.canvas.processMouseUp(event)
-      ctx.middlePanPointerId = null
-      return
-    }
-
-    event.preventDefault()
-    app.canvas.processMouseMove(event)
+    if (!app.canvas || ctx.middlePanPointerId == null || event.pointerId !== ctx.middlePanPointerId) return
+    if ((event.buttons & 4) !== 4) { app.canvas.processMouseUp(event); ctx.middlePanPointerId = null; return }
+    event.preventDefault(); app.canvas.processMouseMove(event)
   }
-
   ctx.documentMiddlePanEndHandler = (event) => {
-    if (!app.canvas) return
-    if (ctx.middlePanPointerId == null || event.pointerId !== ctx.middlePanPointerId) return
-    app.canvas.processMouseUp(event)
-    ctx.middlePanPointerId = null
+    if (!app.canvas || ctx.middlePanPointerId == null || event.pointerId !== ctx.middlePanPointerId) return
+    app.canvas.processMouseUp(event); ctx.middlePanPointerId = null
   }
-
   document.addEventListener('pointermove', ctx.documentMiddlePanMoveHandler, true)
   document.addEventListener('pointerup', ctx.documentMiddlePanEndHandler, true)
   document.addEventListener('pointercancel', ctx.documentMiddlePanEndHandler, true)
 
-  root.addEventListener(
-    'mousedown',
-    (event) => {
-      if (event.button !== 1) return
-      event.preventDefault()
-    },
-    true
-  )
-
-  root.addEventListener(
-    'auxclick',
-    (event) => {
-      if (event.button === 1) {
-        event.preventDefault()
-      }
-    },
-    true
-  )
-
   ctx.documentPasteHandler = (event) => {
-    if (event.defaultPrevented || isModifiedPlainTextPaste(event)) return
-    if (shouldIgnoreClipboardPasteTarget(event.target)) return
-
-    const shouldHandlePaste =
-      ctx.pointerInside ||
-      root === document.activeElement ||
-      root.contains(document.activeElement)
-
-    if (!shouldHandlePaste) return
-
-    const files = getClipboardImageFiles(event)
-    if (!files.length) return
-
-    event.preventDefault()
-    event.stopPropagation()
-    event.stopImmediatePropagation?.()
-    void handleFiles(files)
+    if (event.defaultPrevented || isModifiedPlainTextPaste(event) || shouldIgnoreClipboardPasteTarget(event.target)) return
+    if (!(ctx.pointerInside || root === document.activeElement || root.contains(document.activeElement))) return
+    const files = getClipboardImageFiles(event); if (!files.length) return
+    event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation?.(); runUpload(files)
   }
-
   document.addEventListener('paste', ctx.documentPasteHandler, true)
 
-  root.addEventListener(
-    'dragenter',
-    (event) => {
-      if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return
-      externalDragDepth += 1
-      setExternalDragActive(true)
-    },
-    true
-  )
-
-  root.addEventListener(
-    'dragover',
-    (event) => {
-      if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return
-      setExternalDragActive(true)
-    },
-    true
-  )
-
-  root.addEventListener(
-    'dragleave',
-    (event) => {
-      if (!(externalDragDepth > 0 || hasExternalFileDrag(event))) return
-      event.preventDefault()
-      event.stopPropagation()
-      event.stopImmediatePropagation?.()
-      externalDragDepth = Math.max(0, externalDragDepth - 1)
-      if (externalDragDepth === 0) {
-        setExternalDragActive(false)
-      }
-    },
-    true
-  )
-
-  root.addEventListener(
-    'drop',
-    async (event) => {
-      if (!consumeExternalFileDrag(event)) {
-        externalDragDepth = 0
-        setExternalDragActive(false)
-        return
-      }
-      const files = await getDroppedImageFiles(event)
-      externalDragDepth = 0
-      setExternalDragActive(false)
-      if (!files.length) return
-      await handleFiles(files)
-    },
-    true
-  )
-
-  root.addEventListener(
-    'dragend',
-    () => {
-      externalDragDepth = 0
-      setExternalDragActive(false)
-    },
-    true
-  )
-
-  selectAllBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    uiState.selected_ids = state.items.map((item) => item.id)
-    updateState(node, state, uiState)
-  })
-
-  selectNoneBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    uiState.selected_ids = []
-    updateState(node, state, uiState)
-  })
-
-  autoQueueCheckbox.addEventListener('change', () => {
-    const { state, uiState } = getCurrentState(node)
-    state.auto_queue = autoQueueCheckbox.checked
-    updateState(node, state, uiState)
-  })
-
-  dontConsumeCheckbox.addEventListener('change', () => {
-    const { state, uiState } = getCurrentState(node)
-    state.dont_consume = dontConsumeCheckbox.checked
-    updateState(node, state, uiState)
-  })
-
-  canvasDropCheckbox.addEventListener('change', () => {
-    const { state, uiState } = getCurrentState(node)
-    state.catch_canvas_drops = canvasDropCheckbox.checked
-    updateState(node, state, uiState)
-  })
-
-  sortBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    switch (sortSelect.value) {
-      case 'name_asc':
-        state.items.sort((a, b) =>
-          getItemDisplayPath(a, uiState).localeCompare(getItemDisplayPath(b, uiState), undefined, {
-            sensitivity: 'base'
-          })
-        )
-        break
-      case 'name_desc':
-        state.items.sort((a, b) =>
-          getItemDisplayPath(b, uiState).localeCompare(getItemDisplayPath(a, uiState), undefined, {
-            sensitivity: 'base'
-          })
-        )
-        break
-      case 'added_newest':
-        state.items.sort((a, b) => (b.added_at || 0) - (a.added_at || 0))
-        break
-      case 'added_oldest':
-        state.items.sort((a, b) => (a.added_at || 0) - (b.added_at || 0))
-        break
-      case 'status':
-        state.items.sort((a, b) => {
-          const rankDiff = itemStatusRank(a.status) - itemStatusRank(b.status)
-          if (rankDiff !== 0) return rankDiff
-          return (a.added_at || 0) - (b.added_at || 0)
-        })
-        break
-      default:
-        break
-    }
-    updateState(node, state, uiState)
-  })
-
-  setPendingBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    const selected = getSelectedIds(uiState)
-    state.items.forEach((item) => {
-      if (selected.has(item.id)) item.status = 'pending'
-    })
-    updateState(node, state, uiState)
-  })
-
-  setProcessedBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    const selected = getSelectedIds(uiState)
-    state.items.forEach((item) => {
-      if (selected.has(item.id)) {
-        item.status = 'processed'
-        item.last_processed_at = Date.now()
-      }
-    })
-    updateState(node, state, uiState)
-  })
-
-  clearQueuedBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    state.items.forEach((item) => {
-      if (item.status === 'queued') item.status = 'pending'
-    })
-    updateState(node, state, uiState)
-  })
-
-  clearProcessedBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    state.items = state.items.filter((item) => item.status !== 'processed')
-    uiState.selected_ids = uiState.selected_ids.filter((id) =>
-      state.items.some((item) => item.id === id)
-    )
-    uiState.source_paths = Object.fromEntries(
-      Object.entries(uiState.source_paths).filter(([itemId]) =>
-        state.items.some((item) => item.id === itemId)
-      )
-    )
-    updateState(node, state, uiState)
-  })
-
-  deleteSelectedBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    const selected = getSelectedIds(uiState)
-    state.items = state.items.filter((item) => !selected.has(item.id))
-    uiState.selected_ids = []
-    uiState.source_paths = Object.fromEntries(
-      Object.entries(uiState.source_paths).filter(([itemId]) => !selected.has(itemId))
-    )
-    updateState(node, state, uiState)
-  })
+  let externalDragDepth = 0
+  const setDragActive = (active) => { root.classList.toggle('bil-dragover', active); if (!active) clearCardDragTargets(ctx) }
+  root.addEventListener('dragenter', (event) => { if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return; externalDragDepth += 1; setDragActive(true) }, true)
+  root.addEventListener('dragover', (event) => { if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return; setDragActive(true) }, true)
+  root.addEventListener('dragleave', (event) => { if (!(externalDragDepth > 0 || hasExternalFileDrag(event))) return; event.preventDefault(); event.stopPropagation(); externalDragDepth = Math.max(0, externalDragDepth - 1); if (!externalDragDepth) setDragActive(false) }, true)
+  root.addEventListener('drop', async (event) => {
+    if (!consumeExternalFileDrag(event)) { externalDragDepth = 0; setDragActive(false); return }
+    const files = await getDroppedImageFiles(event); externalDragDepth = 0; setDragActive(false); if (files.length) runUpload(files)
+  }, true)
+  root.addEventListener('dragend', () => { externalDragDepth = 0; setDragActive(false) }, true)
 
   return root
 }
@@ -2240,21 +2197,49 @@ async function uploadViaNode(node, files) {
   const validFiles = normalizeUploadFiles(files)
   if (!validFiles.length) return false
 
-  ctx.dropzone.textContent = `Uploading ${validFiles.length} image${validFiles.length === 1 ? '' : 's'}…`
+  const originalLabel = ctx.dropzone.textContent
+  ctx.dropzone.disabled = true
+  ctx.dropzone.textContent = `Importing ${validFiles.length}…`
   try {
     const uploaded = await uploadFiles(validFiles)
-    const { state, uiState } = getCurrentState(node)
+    if (node.__bil !== ctx || ctx.removed) return false
+    const { state, uiState } = getRenderableState(node)
+    const inputPosition = ctx.browser?.input?.loaded
+      ? new Map(ctx.browser.input.files.map((entry, index) => [entry.relative_path, index]))
+      : null
     for (const entry of uploaded) {
       const item = makeItemFromUploadResponse(entry)
       if (!item) continue
       state.items.push(item)
       const runtimeSourcePath = normalizeSourcePath(entry?.source_path)
       if (runtimeSourcePath) uiState.source_paths[item.id] = runtimeSourcePath
+      if (ctx.browser?.input?.loaded && entry.relative_path) {
+        const inputEntry = {
+          filename: entry.name,
+          subfolder: entry.subfolder || '',
+          relative_path: entry.relative_path,
+          type: 'input',
+          size: Number(entry.size || 0),
+          mtime_ns: Number(entry.mtime_ns || 0),
+          source_version: String(entry.source_version || '')
+        }
+        const existingIndex = inputPosition.get(inputEntry.relative_path) ?? -1
+        if (existingIndex >= 0) ctx.browser.input.files[existingIndex] = inputEntry
+        else {
+          inputPosition.set(inputEntry.relative_path, ctx.browser.input.files.length)
+          ctx.browser.input.files.push(inputEntry)
+        }
+      }
+    }
+    if (ctx.browser?.input?.loaded) {
+      ctx.inputVersion += 1
+      updateFolderOptions(ctx)
     }
     updateState(node, state, uiState)
     return true
   } finally {
-    ctx.dropzone.textContent = 'Click to add images, or drop images/folders'
+    ctx.dropzone.disabled = false
+    ctx.dropzone.textContent = originalLabel || '+ Add images'
   }
 }
 
@@ -2302,14 +2287,14 @@ function initializeNode(node, widget) {
   node.pasteFile = (file) => {
     const files = normalizeUploadFiles([file])
     if (!files.length) return false
-    void uploadViaNode(node, files)
+    void uploadViaNode(node, files).catch((error) => console.error('Image Conveyor: paste import failed.', error))
     return true
   }
 
   node.pasteFiles = (files) => {
     const validFiles = normalizeUploadFiles(files)
     if (!validFiles.length) return false
-    void uploadViaNode(node, validFiles)
+    void uploadViaNode(node, validFiles).catch((error) => console.error('Image Conveyor: paste import failed.', error))
     return true
   }
 
@@ -2324,7 +2309,13 @@ function initializeNode(node, widget) {
   })
 
   chainNodeCallback(node, 'onConfigure', function () {
-    const snapshot = getCurrentState(node)
+    const snapshot = getCurrentState(node, { fromWidgets: true })
+    const ctx = node.__bil
+    if (ctx) {
+      ctx.queueRevision += 1
+      ctx.annotatedCountsRevision = -1
+      ctx.browser.conveyor.selected = new Set(snapshot.uiState.selected_ids)
+    }
     const normalizedStateValue = serializeState(snapshot.state)
     if (stateWidget.value !== normalizedStateValue) {
       setWidgetValue(stateWidget, normalizedStateValue)
@@ -2344,6 +2335,8 @@ function initializeNode(node, widget) {
     canvasDropCoordinator.unregisterNode(node)
     const ctx = node.__bil
     if (!ctx) return
+    ctx.removed = true
+    ctx.inputRequestId += 1
     if (ctx.documentPasteHandler) {
       document.removeEventListener('paste', ctx.documentPasteHandler, true)
       ctx.documentPasteHandler = null
@@ -2358,6 +2351,14 @@ function initializeNode(node, widget) {
       ctx.documentMiddlePanEndHandler = null
     }
     ctx.middlePanPointerId = null
+    if (ctx.documentKeyHandler) {
+      document.removeEventListener('keydown', ctx.documentKeyHandler, true)
+      ctx.documentKeyHandler = null
+    }
+    ctx.inputAbortController?.abort?.()
+    ctx.inputAbortController = null
+    clearTimeout(ctx.searchTimer)
+    ctx.lightbox?.root?.remove?.()
     ctx.listResizeObserver?.disconnect?.()
     ctx.listResizeObserver = null
     if (!ctx.renderFrame) return
@@ -2366,7 +2367,8 @@ function initializeNode(node, widget) {
     ctx.renderViewportOnly = false
   })
 
-  const snapshot = getCurrentState(node)
+  const snapshot = getCurrentState(node, { fromWidgets: true })
+  node.__bil.browser.conveyor.selected = new Set(snapshot.uiState.selected_ids)
   const normalizedStateValue = serializeState(snapshot.state)
   if (stateWidget.value !== normalizedStateValue) {
     setWidgetValue(stateWidget, normalizedStateValue)
@@ -2405,7 +2407,7 @@ app.registerExtension({
           }
         }
 
-        const root = buildDom(node)
+        const root = buildGalleryDom(node)
         const widget = node.addDOMWidget(inputName, CUSTOM_WIDGET_TYPE, root, {
           getMinHeight: () => MIN_WIDGET_HEIGHT,
           getHeight: () => '100%',
