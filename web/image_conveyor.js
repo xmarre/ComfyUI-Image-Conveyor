@@ -5,7 +5,8 @@ import {
   CARD_FOOTER_HEIGHT,
   calculateGalleryMetrics,
   calculateVisibleCardRange,
-  isDragLeavingDocument
+  isDragLeavingDocument,
+  planViewScrollSwitch
 } from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
@@ -1379,18 +1380,16 @@ function getGalleryMetrics(ctx) {
   return calculateGalleryMetrics(width, definition.minWidth, CARD_GAP)
 }
 
-function getVisibleCardRange(ctx, totalItems, metrics) {
-  const range = calculateVisibleCardRange(
+function getVisibleCardRange(ctx, totalItems, metrics, scrollTop = ctx.list.scrollTop) {
+  return calculateVisibleCardRange(
     totalItems,
     metrics.columns,
     metrics.rowStride,
     CARD_GAP,
-    ctx.list.scrollTop,
+    scrollTop,
     ctx.list.clientHeight,
     GALLERY_OVERSCAN_ROWS
   )
-  if (range.scrollTop !== ctx.list.scrollTop) ctx.list.scrollTop = range.scrollTop
-  return range
 }
 
 function canReorderConveyor(ctx) {
@@ -1668,13 +1667,25 @@ function renderVisibleCards(node) {
   if (!ctx) return
   const items = ctx.visibleItems || []
   if (!items.length) {
-    ctx.listInner.style.height = 'auto'; ctx.listWindow.style.height = 'auto'
+    if (ctx.listInner.style.height !== 'auto') ctx.listInner.style.height = 'auto'
+    if (ctx.listWindow.style.height !== 'auto') ctx.listWindow.style.height = 'auto'
+    activeBrowser(ctx).scrollTop = 0
+    if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) ctx.pendingScrollRestore = null
+    if (ctx.list.scrollTop) ctx.list.scrollTop = 0
     hideUnusedCards(ctx); ctx.renderedRangeKey = ''; return
   }
   const metrics = getGalleryMetrics(ctx)
   ctx.lastMetrics = metrics
-  const range = getVisibleCardRange(ctx, items.length, metrics)
   const view = ctx.browser.activeView
+  const pendingRestore = ctx.pendingScrollRestore?.view === view
+    ? ctx.pendingScrollRestore
+    : null
+  const range = getVisibleCardRange(
+    ctx,
+    items.length,
+    metrics,
+    pendingRestore?.scrollTop ?? ctx.list.scrollTop
+  )
   const selected = getViewSelectedIds(node)
   const { state } = getRenderableState(node)
   let annotatedCounts = new Map()
@@ -1689,10 +1700,19 @@ function renderVisibleCards(node) {
     }
     annotatedCounts = ctx.annotatedCounts
   }
+  const totalHeight = `${range.totalHeight}px`
+  if (ctx.listInner.style.height !== totalHeight) ctx.listInner.style.height = totalHeight
+  if (ctx.listWindow.style.height !== totalHeight) ctx.listWindow.style.height = totalHeight
+  if (pendingRestore) {
+    activeBrowser(ctx).scrollTop = range.scrollTop
+    ctx.list.scrollTop = range.scrollTop
+    ctx.pendingScrollRestore = null
+  } else if (range.scrollTop !== ctx.list.scrollTop) {
+    ctx.list.scrollTop = range.scrollTop
+    activeBrowser(ctx).scrollTop = range.scrollTop
+  }
   const key = `${ctx.renderVersion}:${ctx.inputVersion}:${view}:${items.length}:${metrics.width}:${metrics.columns}:${metrics.cardHeight}:${range.start}:${range.end}`
   if (ctx.renderedRangeKey === key) return
-  ctx.listInner.style.height = `${range.totalHeight}px`
-  ctx.listWindow.style.height = `${range.totalHeight}px`
   const needed = range.end - range.start
   ensureCardPool(node, needed)
   for (let offset = 0; offset < needed; offset += 1) {
@@ -1775,6 +1795,8 @@ function renderGalleryNode(node) {
   if (!ctx.visibleItems.length) {
     hideUnusedCards(ctx); ctx.renderedRangeKey = ''
     ctx.listInner.style.height = 'auto'; ctx.listWindow.style.height = 'auto'
+    browser.scrollTop = 0
+    if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) ctx.pendingScrollRestore = null
     if (ctx.list.scrollTop) ctx.list.scrollTop = 0
     if (!ctx.empty) { ctx.empty = document.createElement('div'); ctx.empty.className = 'bil-empty' }
     ctx.empty.textContent = inputView
@@ -1846,12 +1868,22 @@ function addSelectedInputEntries(node) {
 function switchBrowserView(node, view) {
   const ctx = node.__bil
   if (!ctx || ctx.browser.activeView === view) return
-  activeBrowser(ctx).scrollTop = ctx.list.scrollTop
+  const plan = planViewScrollSwitch(
+    ctx.browser.activeView,
+    view,
+    ctx.list.scrollTop,
+    {
+      conveyor: ctx.browser.conveyor.scrollTop,
+      input: ctx.browser.input.scrollTop
+    },
+    ctx.pendingScrollRestore?.view ?? null
+  )
+  ctx.browser.conveyor.scrollTop = plan.positions.conveyor
+  ctx.browser.input.scrollTop = plan.positions.input
   ctx.browser.activeView = view
+  ctx.pendingScrollRestore = plan.restore
   ctx.renderedRangeKey = ''
-  ctx.list.scrollTop = activeBrowser(ctx).scrollTop
   scheduleRenderNode(node, { forceVisibleRows: true })
-  requestAnimationFrame(() => { if (node.__bil) ctx.list.scrollTop = activeBrowser(ctx).scrollTop })
   if (view === 'input' && !ctx.browser.input.loaded && !ctx.browser.input.loading) void refreshInputFiles(node)
 }
 
@@ -2033,6 +2065,7 @@ function buildGalleryDom(node) {
     browser: createBrowserState(), visibleItems: [], cardPool: [],
     draggedId: null, empty: null, state: null, uiState: null, renderVersion: 0,
     inputVersion: 0, renderedRangeKey: '', renderFrame: 0, renderViewportOnly: false,
+    pendingScrollRestore: null,
     listResizeObserver: null, widgetOuterHeight: 0, widgetInnerHeight: 0, widgetWidth: 0,
     pointerInside: false, middlePanPointerId: null, documentPasteHandler: null,
     documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
@@ -2142,8 +2175,7 @@ function buildGalleryDom(node) {
   })
   jumpPendingBtn.addEventListener('click', () => {
     if (ctx.browser.activeView !== 'conveyor') {
-      activeBrowser(ctx).scrollTop = list.scrollTop
-      ctx.browser.activeView = 'conveyor'
+      switchBrowserView(node, 'conveyor')
     }
     ctx.browser.conveyor.query = ''
     ctx.browser.conveyor.filter = 'all'
@@ -2151,12 +2183,19 @@ function buildGalleryDom(node) {
     const index = ctx.visibleItems.findIndex((item) => item.status === 'pending')
     if (index >= 0) {
       ctx.browser.conveyor.focusedId = ctx.visibleItems[index].id
-      scrollItemIntoView(node, index)
+      const metrics = getGalleryMetrics(ctx)
+      const scrollTop = Math.floor(index / metrics.columns) * metrics.rowStride
+      ctx.browser.conveyor.scrollTop = scrollTop
+      ctx.pendingScrollRestore = { view: 'conveyor', scrollTop }
     }
     scheduleRenderNode(node, { forceVisibleRows: true })
   })
 
-  list.addEventListener('scroll', () => { activeBrowser(ctx).scrollTop = list.scrollTop; scheduleRenderNode(node, { viewportOnly: true }) }, { passive: true })
+  list.addEventListener('scroll', () => {
+    if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) return
+    activeBrowser(ctx).scrollTop = list.scrollTop
+    scheduleRenderNode(node, { viewportOnly: true })
+  }, { passive: true })
   root.addEventListener('keydown', (event) => handleGalleryKeyDown(node, event))
   ctx.documentKeyHandler = (event) => { if (event.key === 'Escape' && !ctx.lightbox.root.hidden) { event.preventDefault(); ctx.lightbox.hide() } }
   document.addEventListener('keydown', ctx.documentKeyHandler, true)

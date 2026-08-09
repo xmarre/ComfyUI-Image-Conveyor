@@ -49,6 +49,24 @@ export function calculateVisibleCardRange(
   }
 }
 
+export function planViewScrollSwitch(
+  activeView,
+  nextView,
+  liveScrollTop,
+  savedScrollTops,
+  pendingView = null
+) {
+  const positions = { ...savedScrollTops }
+  if (pendingView !== activeView) {
+    positions[activeView] = Math.max(0, Number(liveScrollTop) || 0)
+  }
+  positions[nextView] = Math.max(0, Number(positions[nextView]) || 0)
+  return {
+    positions,
+    restore: { view: nextView, scrollTop: positions[nextView] }
+  }
+}
+
 export function isDragLeavingDocument(event, documentElement) {
   if (!documentElement) return false
 

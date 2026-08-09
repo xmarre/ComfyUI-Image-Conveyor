@@ -3,7 +3,8 @@ import test from 'node:test'
 import {
   calculateGalleryMetrics,
   calculateVisibleCardRange,
-  isDragLeavingDocument
+  isDragLeavingDocument,
+  planViewScrollSwitch
 } from '../web/image_conveyor_math.mjs'
 
 test('responsive metrics add columns as width grows', () => {
@@ -35,6 +36,38 @@ test('range clamps scroll after filtering to a smaller collection', () => {
   const range = calculateVisibleCardRange(3, metrics.columns, metrics.rowStride, 10, 999_999, 700, 2)
   assert.equal(range.scrollTop, 0)
   assert.deepEqual([range.start, range.end], [0, 3])
+})
+
+test('tab switches preserve independent scroll positions', () => {
+  const toInput = planViewScrollSwitch(
+    'conveyor',
+    'input',
+    42_500,
+    { conveyor: 0, input: 317_250 }
+  )
+  assert.deepEqual(toInput.positions, { conveyor: 42_500, input: 317_250 })
+  assert.deepEqual(toInput.restore, { view: 'input', scrollTop: 317_250 })
+
+  const backToConveyor = planViewScrollSwitch(
+    'input',
+    'conveyor',
+    317_250,
+    toInput.positions
+  )
+  assert.deepEqual(backToConveyor.positions, { conveyor: 42_500, input: 317_250 })
+  assert.deepEqual(backToConveyor.restore, { view: 'conveyor', scrollTop: 42_500 })
+})
+
+test('rapid tab switches do not replace an unrendered destination position', () => {
+  const switchedBack = planViewScrollSwitch(
+    'input',
+    'conveyor',
+    42_500,
+    { conveyor: 42_500, input: 317_250 },
+    'input'
+  )
+  assert.equal(switchedBack.positions.input, 317_250)
+  assert.deepEqual(switchedBack.restore, { view: 'conveyor', scrollTop: 42_500 })
 })
 
 test('external drag exit distinguishes viewport exits from child transitions', () => {
