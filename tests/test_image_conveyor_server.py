@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import os
 import sqlite3
@@ -7,6 +8,7 @@ import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "image_conveyor_server.py"
@@ -264,6 +266,45 @@ class InputLibraryTest(unittest.TestCase):
         self.assertEqual("image_conveyor/copy.png", result["skipped"][0]["relative_path"])
         self.assertTrue(os.path.exists(duplicate))
 
+    def test_managed_duplicate_cleanup_preserves_deletion_time_reservations(self):
+        self.write_input("original.png", b"same")
+        duplicate = self.write_input("image_conveyor/copy.png", b"same")
+        report = self.library.find_managed_duplicates()
+
+        result = self.library.delete_managed_duplicates(
+            report["groups"],
+            ["image_conveyor/copy.png"],
+        )
+
+        self.assertEqual([], result["deleted"])
+        self.assertEqual(
+            "The duplicate is reserved by a queued Conveyor item.",
+            result["skipped"][0]["reason"],
+        )
+        self.assertTrue(os.path.exists(duplicate))
+
+    def test_managed_duplicate_cleanup_validates_full_plan_before_deleting(self):
+        self.write_input("original.png", b"same")
+        duplicate = self.write_input("image_conveyor/copy.png", b"same")
+        digest = server.hashlib.sha256(b"same").hexdigest()
+        groups = [
+            {
+                "digest": digest,
+                "keep_path": "original.png",
+                "duplicates": [{"relative_path": "image_conveyor/copy.png"}],
+            },
+            {
+                "digest": digest,
+                "keep_path": "original.png",
+                "duplicates": [{"relative_path": "outside.png"}],
+            },
+        ]
+
+        with self.assertRaises(server.InvalidUpload):
+            self.library.delete_managed_duplicates(groups)
+
+        self.assertTrue(os.path.exists(duplicate))
+
     def test_managed_duplicate_cleanup_never_unlinks_symlink_destination(self):
         original = self.write_input("original.png", b"same")
         duplicate = self.write_input("image_conveyor/copy.png", b"same")
@@ -441,6 +482,34 @@ class InputLibraryTest(unittest.TestCase):
             self.library.thumbnail("broken.png", 256)
         self.assertEqual({}, self.library._thumbnail_locks)
 
+    def test_truncated_thumbnail_source_is_classified_as_invalid_media(self):
+        if importlib.util.find_spec("PIL") is None:
+            self.skipTest("Pillow is not installed")
+        from PIL import Image
+
+        source = self.write_input("truncated.png", b"")
+        Image.new("RGB", (256, 256), (255, 0, 0)).save(source, "PNG")
+        with open(source, "rb") as handle:
+            encoded = handle.read()
+        with open(source, "wb") as handle:
+            handle.write(encoded[: len(encoded) // 2])
+
+        with self.assertRaises(server.InvalidThumbnail):
+            self.library.thumbnail("truncated.png", 256)
+        self.assertEqual({}, self.library._thumbnail_locks)
+
+    def test_thumbnail_source_filesystem_errors_are_not_classified_as_invalid_media(self):
+        if importlib.util.find_spec("PIL") is None:
+            self.skipTest("Pillow is not installed")
+        from PIL import Image
+
+        self.write_input("unreadable.png", b"placeholder")
+        denied = PermissionError(errno.EACCES, "permission denied")
+        with mock.patch.object(Image, "open", side_effect=denied):
+            with self.assertRaises(PermissionError):
+                self.library.thumbnail("unreadable.png", 256)
+        self.assertEqual({}, self.library._thumbnail_locks)
+
 
 class UploadValidationTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -488,6 +557,42 @@ class UploadValidationTest(unittest.IsolatedAsyncioTestCase):
                 ],
             )
         )
+
+    async def test_parses_refresh_snapshot_flag_and_defaults_to_false(self):
+        cases = (
+            (
+                UploadRequestStub(
+                    "multipart/form-data",
+                    [
+                        MultipartPartStub("image", filename="image.png", contents=b"image"),
+                        MultipartPartStub("refresh_snapshot", text_value="true"),
+                    ],
+                ),
+                True,
+            ),
+            (
+                UploadRequestStub(
+                    "multipart/form-data",
+                    [MultipartPartStub("image", filename="image.png", contents=b"image")],
+                ),
+                False,
+            ),
+        )
+        for request, expected_refresh in cases:
+            with self.subTest(expected_refresh=expected_refresh):
+                temporary_path, filename, subfolder, size, digest, refresh = await server._read_upload(
+                    request,
+                    self.service,
+                )
+                try:
+                    self.assertEqual("image.png", filename)
+                    self.assertEqual("", subfolder)
+                    self.assertEqual(len(b"image"), size)
+                    self.assertEqual(server.hashlib.sha256(b"image").hexdigest(), digest)
+                    self.assertEqual(expected_refresh, refresh)
+                finally:
+                    os.unlink(temporary_path)
+        self.assertEqual([], os.listdir(self.upload_root))
 
 
 class PathValidationTest(unittest.TestCase):

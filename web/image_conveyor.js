@@ -693,7 +693,16 @@ const canvasDropCoordinator = {
 
     const files = await getDroppedImageFiles(event)
     if (!files.length) return
-    await uploadViaNode(node, files)
+    try {
+      await uploadViaNode(node, files)
+    } catch (error) {
+      console.error('Image Conveyor: drop import failed.', error)
+      const ctx = node.__bil
+      if (ctx && !ctx.removed) {
+        ctx.browser.input.error = error?.message || 'Import failed'
+        scheduleRenderNode(node)
+      }
+    }
   },
 
   handleDragLeave(event) {
@@ -1324,20 +1333,26 @@ async function cleanManagedDuplicates(node) {
     )
     if (!confirmed) return
 
-    const plannedReplacements = groups.flatMap((group) => group.duplicates.map((duplicate) => ({
-      relative_path: duplicate.relative_path,
-      keep_path: group.keep_path
-    })))
+    const protectedPaths = getQueuedLegacyInputPaths()
+    const plannedReplacements = groups.flatMap((group) => group.duplicates
+      .filter((duplicate) => !protectedPaths.has(normalizeSourcePath(duplicate.relative_path)))
+      .map((duplicate) => ({
+        relative_path: duplicate.relative_path,
+        keep_path: group.keep_path
+      })))
     const preRewritten = rewriteLiveInputReferences(plannedReplacements)
     button.textContent = 'Deleting duplicates…'
     const deleteResponse = await api.fetchApi('/image-conveyor/managed-duplicates/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groups })
+      body: JSON.stringify({ groups, protected_paths: Array.from(protectedPaths) })
     })
     const result = await readJsonResponse(deleteResponse, 'Duplicate cleanup failed')
     const deleted = Array.isArray(result?.deleted) ? result.deleted : []
     const skipped = Array.isArray(result?.skipped) ? result.skipped : []
+    const reservationSkipReason = 'The duplicate is reserved by a queued Conveyor item.'
+    const reservationSkips = skipped.filter((entry) => entry?.reason === reservationSkipReason).length
+    const changedSkips = skipped.length - reservationSkips
     const rewrittenAfterDelete = rewriteLiveInputReferences(deleted)
     const rewritten = preRewritten + rewrittenAfterDelete
     await Promise.all(
@@ -1349,7 +1364,8 @@ async function cleanManagedDuplicates(node) {
       `Deleted ${deleted.length} exact duplicate${deleted.length === 1 ? '' : 's'} ` +
       `and reclaimed ${formatByteCount(result?.reclaimed_bytes)}.`,
       rewritten ? `Updated ${rewritten} open Conveyor reference${rewritten === 1 ? '' : 's'}.` : '',
-      skipped.length ? `${skipped.length} file${skipped.length === 1 ? ' was' : 's were'} skipped because the filesystem changed after the preview.` : ''
+      reservationSkips ? `${reservationSkips} newly queued file${reservationSkips === 1 ? ' was' : 's were'} protected.` : '',
+      changedSkips ? `${changedSkips} file${changedSkips === 1 ? ' was' : 's were'} skipped because the filesystem changed after the preview.` : ''
     ].filter(Boolean).join('\n')
     if (node.__bil === ctx && !ctx.removed) window.alert(summary)
   } catch (error) {
@@ -2620,6 +2636,7 @@ async function uploadViaNode(node, files) {
       ctx.inputVersion += 1
       updateFolderOptions(ctx)
     }
+    if (uploaded.length && !errors.length) ctx.browser.input.error = ''
     if (uploaded.length) updateState(node, state, uiState)
     if (errors.length) {
       const firstFailure = errors[0].error.message

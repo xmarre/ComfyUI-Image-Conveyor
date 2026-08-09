@@ -703,17 +703,27 @@ class InputLibrary:
             return None
         return lexical_path, FileRecord(relative, size, mtime_ns, content_hash), (after.st_dev, after.st_ino)
 
-    def delete_managed_duplicates(self, groups: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    def delete_managed_duplicates(
+        self,
+        groups: Sequence[Dict[str, Any]],
+        protected_paths: Sequence[str] = (),
+    ) -> Dict[str, Any]:
         deleted = []
         skipped = []
         removed_paths = []
-        planned_duplicates = sum(
-            len(group.get("duplicates", []))
-            for group in groups
-            if isinstance(group, dict) and isinstance(group.get("duplicates"), list)
-        )
-        if planned_duplicates > 10000:
-            raise InvalidUpload("The duplicate cleanup plan is too large.")
+        if not isinstance(groups, (list, tuple)) or len(groups) > 10000:
+            raise InvalidUpload("The duplicate cleanup plan is malformed or too large.")
+        if not isinstance(protected_paths, (list, tuple)) or len(protected_paths) > 10000:
+            raise InvalidUpload("The duplicate cleanup reservation is malformed or too large.")
+        protected = set()
+        for protected_path in protected_paths:
+            relative_path = normalize_relative_path(protected_path)
+            if not self._is_managed_path(relative_path):
+                raise InvalidUpload("Duplicate cleanup reservations are restricted to the image_conveyor folder.")
+            protected.add(relative_path)
+
+        plan = []
+        planned_duplicates = 0
         for group in groups:
             if not isinstance(group, dict):
                 raise InvalidUpload("The duplicate cleanup plan is malformed.")
@@ -724,27 +734,42 @@ class InputLibrary:
                 raise InvalidUpload("The duplicate cleanup plan contains an invalid digest.")
             if not isinstance(duplicates, list):
                 raise InvalidUpload("The duplicate cleanup plan is malformed.")
-            if len(duplicates) > 10000:
+            planned_duplicates += len(duplicates)
+            if planned_duplicates > 10000:
                 raise InvalidUpload("The duplicate cleanup plan is too large.")
 
+            relative_paths = []
+            for duplicate in duplicates:
+                if not isinstance(duplicate, dict):
+                    raise InvalidUpload("The duplicate cleanup plan is malformed.")
+                relative_path = normalize_relative_path(duplicate.get("relative_path"))
+                if relative_path == keep_path or not self._is_managed_path(relative_path):
+                    raise InvalidUpload("Duplicate cleanup is restricted to the image_conveyor folder.")
+                relative_paths.append(relative_path)
+            plan.append((digest, keep_path, relative_paths))
+
+        for digest, keep_path, relative_paths in plan:
             with self._key_lock(self._digest_locks, digest):
                 keep = self._record_with_digest(FileRecord(keep_path, -1, -1))
                 if keep is None or keep.content_hash != digest:
-                    for duplicate in duplicates:
+                    for relative_path in relative_paths:
                         skipped.append(
                             {
-                                "relative_path": str(duplicate.get("relative_path") or ""),
+                                "relative_path": relative_path,
                                 "reason": "The retained file changed or disappeared.",
                             }
                         )
                     continue
 
-                for duplicate in duplicates:
-                    if not isinstance(duplicate, dict):
-                        raise InvalidUpload("The duplicate cleanup plan is malformed.")
-                    relative_path = normalize_relative_path(duplicate.get("relative_path"))
-                    if relative_path == keep_path or not self._is_managed_path(relative_path):
-                        raise InvalidUpload("Duplicate cleanup is restricted to the image_conveyor folder.")
+                for relative_path in relative_paths:
+                    if relative_path in protected:
+                        skipped.append(
+                            {
+                                "relative_path": relative_path,
+                                "reason": "The duplicate is reserved by a queued Conveyor item.",
+                            }
+                        )
+                        continue
                     with self._key_lock(self._destination_locks, relative_path.casefold()):
                         managed = self._managed_regular_file(relative_path)
                         if managed is None or managed[1].content_hash != digest:
@@ -838,14 +863,19 @@ class InputLibrary:
                                 opened.seek(0)
                             except EOFError:
                                 pass
+                            opened.load()
                             image = ImageOps.exif_transpose(opened)
                             resampling = getattr(Image, "Resampling", Image)
                             image.thumbnail((bucket, bucket), resampling.LANCZOS, reducing_gap=2.0)
                             has_alpha = image.mode in {"RGBA", "LA"} or "transparency" in image.info
                             image = image.convert("RGBA" if has_alpha else "RGB")
-                            image.save(temporary, "WEBP", quality=84, method=4)
                     except UnidentifiedImageError as exc:
                         raise InvalidThumbnail("The thumbnail source is not a readable image.") from exc
+                    except OSError as exc:
+                        if exc.errno is not None:
+                            raise
+                        raise InvalidThumbnail("The thumbnail source is not a readable image.") from exc
+                    image.save(temporary, "WEBP", quality=84, method=4)
                     os.replace(temporary, target)
                 finally:
                     try:
@@ -1020,9 +1050,12 @@ def register_routes() -> None:
         try:
             payload = await request.json()
             groups = payload.get("groups") if isinstance(payload, dict) else None
+            protected_paths = payload.get("protected_paths", []) if isinstance(payload, dict) else None
             if not isinstance(groups, list) or len(groups) > 10000:
                 raise InvalidUpload("The duplicate cleanup plan is malformed or too large.")
-            result = await asyncio.to_thread(service.delete_managed_duplicates, groups)
+            if not isinstance(protected_paths, list) or len(protected_paths) > 10000:
+                raise InvalidUpload("The duplicate cleanup reservation is malformed or too large.")
+            result = await asyncio.to_thread(service.delete_managed_duplicates, groups, protected_paths)
             return web.json_response(result)
         except (InvalidUpload, InvalidInputPath, json.JSONDecodeError, ValueError) as exc:
             return web.json_response({"error": str(exc)}, status=400)

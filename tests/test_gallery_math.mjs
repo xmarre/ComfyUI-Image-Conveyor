@@ -146,5 +146,7 @@ test('duplicate cleanup excludes queued paths and recomputes the confirmed scope
   assert.equal(result.duplicateCount, 1)
   assert.equal(result.reclaimableBytes, 250)
   assert.equal(result.groups.length, 1)
+  assert.match(result.groups[0].digest, /^[0-9a-f]{64}$/)
+  assert.equal(result.groups[0].keep_path, 'original.png')
   assert.equal(result.groups[0].duplicates[0].relative_path, 'image_conveyor/delete.png')
 })
