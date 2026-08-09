@@ -6,7 +6,8 @@ import {
   isDragLeavingDocument,
   isHighVelocityScroll,
   planCardSlotReuse,
-  planViewScrollSwitch
+  planViewScrollSwitch,
+  prepareManagedDuplicateCleanup
 } from '../web/image_conveyor_math.mjs'
 
 test('responsive metrics add columns as width grows', () => {
@@ -119,4 +120,31 @@ test('external drag exit distinguishes viewport exits from child transitions', (
     isDragLeavingDocument({ target: documentNode, relatedTarget: insideNode }, documentElement),
     true
   )
+})
+
+test('duplicate cleanup excludes queued paths and recomputes the confirmed scope', () => {
+  const result = prepareManagedDuplicateCleanup(
+    [
+      {
+        digest: 'a'.repeat(64),
+        keep_path: 'original.png',
+        duplicates: [
+          { relative_path: 'image_conveyor/queued.png', size: 100 },
+          { relative_path: 'image_conveyor/delete.png', size: 250 }
+        ]
+      },
+      {
+        digest: 'b'.repeat(64),
+        keep_path: 'other.png',
+        duplicates: [{ relative_path: 'image_conveyor/also-queued.png', size: 500 }]
+      }
+    ],
+    new Set(['image_conveyor/queued.png', 'image_conveyor/also-queued.png'])
+  )
+
+  assert.equal(result.protectedCount, 2)
+  assert.equal(result.duplicateCount, 1)
+  assert.equal(result.reclaimableBytes, 250)
+  assert.equal(result.groups.length, 1)
+  assert.equal(result.groups[0].duplicates[0].relative_path, 'image_conveyor/delete.png')
 })

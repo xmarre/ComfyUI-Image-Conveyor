@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import stat as stat_module
 import tempfile
 import threading
 import time
@@ -19,7 +20,7 @@ LOGGER = logging.getLogger(__name__)
 SUPPORTED_IMAGE_EXTENSIONS = frozenset(
     {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".avif"}
 )
-UPLOAD_SUBFOLDER = "image_conveyor"
+LEGACY_UPLOAD_SUBFOLDER = "image_conveyor"
 HASH_CHUNK_SIZE = 1024 * 1024
 SNAPSHOT_TTL_SECONDS = 2.0
 THUMBNAIL_BUCKETS = (160, 256, 384, 512)
@@ -383,20 +384,41 @@ class InputLibrary:
             self._snapshot_wall_ms = int(time.time() * 1000)
             self._snapshot_version += 1
 
-    def _candidate_records(self, file_size: int) -> List[FileRecord]:
+    def _candidate_records(self, file_size: int, intended_path: str = "") -> List[FileRecord]:
         candidates = {record.relative_path: record for record in self._snapshot if record.size == file_size}
         try:
             for record in self.index.records_by_size(file_size):
                 candidates[record.relative_path] = record
         except (sqlite3.Error, OSError):
             pass
+        if intended_path:
+            try:
+                intended = resolve_under_root(self.input_root, intended_path, must_exist=True)
+                stat = os.stat(intended)
+                if stat.st_size == file_size:
+                    cached = candidates.get(intended_path)
+                    cached_hash = (
+                        cached.content_hash
+                        if cached is not None
+                        and cached.size == stat.st_size
+                        and cached.mtime_ns == stat.st_mtime_ns
+                        else None
+                    )
+                    candidates[intended_path] = FileRecord(
+                        intended_path,
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        cached_hash,
+                    )
+            except (InvalidInputPath, FileNotFoundError, OSError):
+                pass
         return list(candidates.values())
 
     @staticmethod
     def _canonical_rank(relative_path: str, intended_path: str) -> Tuple[int, str, str]:
         if relative_path == intended_path:
             rank = 0
-        elif relative_path == UPLOAD_SUBFOLDER or relative_path.startswith(f"{UPLOAD_SUBFOLDER}/"):
+        elif relative_path != LEGACY_UPLOAD_SUBFOLDER and not relative_path.startswith(f"{LEGACY_UPLOAD_SUBFOLDER}/"):
             rank = 1
         else:
             rank = 2
@@ -404,7 +426,7 @@ class InputLibrary:
 
     def _find_duplicate(self, intended_path: str, size: int, digest: str) -> Optional[FileRecord]:
         candidates = sorted(
-            self._candidate_records(size),
+            self._candidate_records(size, intended_path),
             key=lambda record: self._canonical_rank(record.relative_path, intended_path),
         )
         for cached in candidates:
@@ -508,6 +530,7 @@ class InputLibrary:
         subfolder: str,
         size: int,
         digest: str,
+        refresh_snapshot: bool = False,
     ) -> Tuple[FileRecord, bool]:
         filename = normalize_filename(filename)
         normalized_subfolder = normalize_relative_path(subfolder, allow_empty=True)
@@ -516,7 +539,7 @@ class InputLibrary:
 
         # Enumeration is metadata-only and cached across a batch. It makes fresh installs
         # aware of pre-existing same-size candidates without hashing the whole input tree.
-        self.list_files(force=False)
+        self.list_files(force=refresh_snapshot)
 
         with self._key_lock(self._digest_locks, digest):
             duplicate = self._find_duplicate(intended, size, digest)
@@ -544,6 +567,228 @@ class InputLibrary:
                 LOGGER.warning("Image Conveyor saved an upload but could not update its cache index: %s", exc)
             self._patch_snapshot(record)
             return record, False
+
+    @staticmethod
+    def _is_managed_path(relative_path: str) -> bool:
+        return relative_path == LEGACY_UPLOAD_SUBFOLDER or relative_path.startswith(f"{LEGACY_UPLOAD_SUBFOLDER}/")
+
+    def _record_with_digest(self, record: FileRecord) -> Optional[FileRecord]:
+        try:
+            path = resolve_under_root(self.input_root, record.relative_path, must_exist=True)
+            stat = os.stat(path)
+        except (InvalidInputPath, FileNotFoundError, OSError):
+            return None
+        content_hash = record.content_hash
+        if record.size != stat.st_size or record.mtime_ns != stat.st_mtime_ns:
+            content_hash = None
+        if content_hash is None:
+            hashed = stable_file_digest(path)
+            if hashed is None:
+                return None
+            content_hash, size, mtime_ns = hashed
+            current = FileRecord(record.relative_path, size, mtime_ns, content_hash)
+            try:
+                self.index.update_digest(current, content_hash)
+            except (sqlite3.Error, OSError):
+                pass
+            return current
+        return FileRecord(record.relative_path, stat.st_size, stat.st_mtime_ns, content_hash)
+
+    def find_managed_duplicates(self) -> Dict[str, Any]:
+        records, snapshot_version, _scanned_at = self.list_files(force=True)
+        by_size: Dict[int, List[FileRecord]] = {}
+        for record in records:
+            by_size.setdefault(record.size, []).append(record)
+
+        duplicate_groups = []
+        total_reclaimable_bytes = 0
+        for size_records in by_size.values():
+            if len(size_records) < 2 or not any(self._is_managed_path(record.relative_path) for record in size_records):
+                continue
+            by_digest: Dict[str, List[FileRecord]] = {}
+            for record in size_records:
+                current = self._record_with_digest(record)
+                if current is not None and current.content_hash:
+                    by_digest.setdefault(current.content_hash, []).append(current)
+            for digest, matches in by_digest.items():
+                if len(matches) < 2:
+                    continue
+                matches.sort(key=lambda record: self._canonical_rank(record.relative_path, ""))
+                keep = matches[0]
+                redundant = [
+                    record for record in matches[1:]
+                    if self._is_managed_path(record.relative_path)
+                ]
+                if not redundant:
+                    continue
+                total_reclaimable_bytes += sum(record.size for record in redundant)
+                duplicate_groups.append(
+                    {
+                        "digest": digest,
+                        "keep_path": keep.relative_path,
+                        "duplicates": [
+                            {
+                                "relative_path": record.relative_path,
+                                "size": record.size,
+                                "mtime_ns": record.mtime_ns,
+                            }
+                            for record in redundant
+                        ],
+                    }
+                )
+
+        duplicate_groups.sort(key=lambda group: (group["keep_path"].casefold(), group["keep_path"]))
+        return {
+            "groups": duplicate_groups,
+            "duplicate_count": sum(len(group["duplicates"]) for group in duplicate_groups),
+            "reclaimable_bytes": total_reclaimable_bytes,
+            "snapshot_version": snapshot_version,
+        }
+
+    def _remove_snapshot_paths(self, relative_paths: Iterable[str]) -> None:
+        removed = set(relative_paths)
+        if not removed:
+            return
+        with self._snapshot_lock:
+            self._snapshot = tuple(record for record in self._snapshot if record.relative_path not in removed)
+            self._snapshot_at = time.monotonic()
+            self._snapshot_wall_ms = int(time.time() * 1000)
+            self._snapshot_version += 1
+
+    def _prune_empty_managed_directories(self) -> None:
+        managed_root = os.path.join(self.input_root, LEGACY_UPLOAD_SUBFOLDER)
+        if not os.path.isdir(managed_root) or os.path.islink(managed_root):
+            return
+        for directory, _subdirectories, _files in os.walk(managed_root, topdown=False, followlinks=False):
+            try:
+                if not os.listdir(directory):
+                    os.rmdir(directory)
+            except (FileNotFoundError, OSError):
+                pass
+
+    def _managed_regular_file(self, relative_path: str) -> Optional[Tuple[str, FileRecord, Tuple[int, int]]]:
+        relative = normalize_relative_path(relative_path)
+        if not self._is_managed_path(relative):
+            raise InvalidUpload("Duplicate cleanup is restricted to the image_conveyor folder.")
+        lexical_path = os.path.abspath(os.path.join(self.input_root, *relative.split("/")))
+        parent_real = os.path.realpath(os.path.dirname(lexical_path))
+        try:
+            contained = os.path.commonpath((self.input_root, lexical_path)) == self.input_root
+            parent_contained = os.path.commonpath((self.input_root, parent_real)) == self.input_root
+        except ValueError:
+            contained = False
+            parent_contained = False
+        if not contained or not parent_contained:
+            raise InvalidInputPath("The duplicate path escapes the ComfyUI input directory.")
+        try:
+            before = os.lstat(lexical_path)
+        except (FileNotFoundError, OSError):
+            return None
+        if not stat_module.S_ISREG(before.st_mode):
+            return None
+        hashed = stable_file_digest(lexical_path)
+        if hashed is None:
+            return None
+        content_hash, size, mtime_ns = hashed
+        try:
+            after = os.lstat(lexical_path)
+        except (FileNotFoundError, OSError):
+            return None
+        if (
+            not stat_module.S_ISREG(after.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or after.st_size != size
+            or after.st_mtime_ns != mtime_ns
+        ):
+            return None
+        return lexical_path, FileRecord(relative, size, mtime_ns, content_hash), (after.st_dev, after.st_ino)
+
+    def delete_managed_duplicates(self, groups: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        deleted = []
+        skipped = []
+        removed_paths = []
+        planned_duplicates = sum(
+            len(group.get("duplicates", []))
+            for group in groups
+            if isinstance(group, dict) and isinstance(group.get("duplicates"), list)
+        )
+        if planned_duplicates > 10000:
+            raise InvalidUpload("The duplicate cleanup plan is too large.")
+        for group in groups:
+            if not isinstance(group, dict):
+                raise InvalidUpload("The duplicate cleanup plan is malformed.")
+            digest = str(group.get("digest") or "").strip().lower()
+            keep_path = normalize_relative_path(group.get("keep_path"))
+            duplicates = group.get("duplicates")
+            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+                raise InvalidUpload("The duplicate cleanup plan contains an invalid digest.")
+            if not isinstance(duplicates, list):
+                raise InvalidUpload("The duplicate cleanup plan is malformed.")
+            if len(duplicates) > 10000:
+                raise InvalidUpload("The duplicate cleanup plan is too large.")
+
+            with self._key_lock(self._digest_locks, digest):
+                keep = self._record_with_digest(FileRecord(keep_path, -1, -1))
+                if keep is None or keep.content_hash != digest:
+                    for duplicate in duplicates:
+                        skipped.append(
+                            {
+                                "relative_path": str(duplicate.get("relative_path") or ""),
+                                "reason": "The retained file changed or disappeared.",
+                            }
+                        )
+                    continue
+
+                for duplicate in duplicates:
+                    if not isinstance(duplicate, dict):
+                        raise InvalidUpload("The duplicate cleanup plan is malformed.")
+                    relative_path = normalize_relative_path(duplicate.get("relative_path"))
+                    if relative_path == keep_path or not self._is_managed_path(relative_path):
+                        raise InvalidUpload("Duplicate cleanup is restricted to the image_conveyor folder.")
+                    with self._key_lock(self._destination_locks, relative_path.casefold()):
+                        managed = self._managed_regular_file(relative_path)
+                        if managed is None or managed[1].content_hash != digest:
+                            skipped.append(
+                                {
+                                    "relative_path": relative_path,
+                                    "reason": "The duplicate changed or disappeared.",
+                                }
+                            )
+                            continue
+                        lexical_path, current, expected_identity = managed
+                        try:
+                            identity = os.lstat(lexical_path)
+                            if (
+                                not stat_module.S_ISREG(identity.st_mode)
+                                or (identity.st_dev, identity.st_ino) != expected_identity
+                                or identity.st_size != current.size
+                                or identity.st_mtime_ns != current.mtime_ns
+                            ):
+                                raise FileNotFoundError("The duplicate changed after final validation.")
+                            os.unlink(lexical_path)
+                        except (FileNotFoundError, OSError) as exc:
+                            skipped.append({"relative_path": relative_path, "reason": str(exc)})
+                            continue
+                        try:
+                            self.index.remove(relative_path)
+                        except (sqlite3.Error, OSError):
+                            pass
+                        removed_paths.append(relative_path)
+                        deleted.append(
+                            {
+                                "relative_path": relative_path,
+                                "keep_path": keep_path,
+                                "size": current.size,
+                            }
+                        )
+
+        self._remove_snapshot_paths(removed_paths)
+        self._prune_empty_managed_directories()
+        return {
+            "deleted": deleted,
+            "skipped": skipped,
+            "reclaimed_bytes": sum(entry["size"] for entry in deleted),
+        }
 
     def verify_image(self, path: str) -> None:
         from PIL import Image
@@ -634,7 +879,7 @@ def get_service(folder_paths_module) -> InputLibrary:
         return _SERVICE
 
 
-async def _read_upload(request, service: InputLibrary) -> Tuple[str, str, str, int, str]:
+async def _read_upload(request, service: InputLibrary) -> Tuple[str, str, str, int, str, bool]:
     content_type = request.content_type or ""
     if not content_type.startswith("multipart/"):
         raise InvalidUpload("Expected a multipart upload.")
@@ -645,6 +890,7 @@ async def _read_upload(request, service: InputLibrary) -> Tuple[str, str, str, i
     filename = ""
     subfolder = ""
     upload_type = "input"
+    refresh_snapshot = False
     size = 0
     digest = hashlib.sha256()
     try:
@@ -667,6 +913,8 @@ async def _read_upload(request, service: InputLibrary) -> Tuple[str, str, str, i
                     subfolder = (await part.text()).strip()
                 elif part.name == "type":
                     upload_type = (await part.text()).strip()
+                elif part.name == "refresh_snapshot":
+                    refresh_snapshot = (await part.text()).strip().lower() in {"1", "true", "yes"}
                 else:
                     await part.release()
             output.flush()
@@ -678,7 +926,7 @@ async def _read_upload(request, service: InputLibrary) -> Tuple[str, str, str, i
             raise InvalidUpload("Image Conveyor uploads are restricted to ComfyUI input storage.")
         normalize_relative_path(subfolder, allow_empty=True)
         await asyncio.to_thread(service.verify_image, temporary_path)
-        return temporary_path, filename, subfolder, size, digest.hexdigest()
+        return temporary_path, filename, subfolder, size, digest.hexdigest(), refresh_snapshot
     except Exception:
         try:
             os.unlink(temporary_path)
@@ -720,7 +968,7 @@ def register_routes() -> None:
         service = get_service(folder_paths)
         temporary_path = None
         try:
-            temporary_path, filename, subfolder, size, digest = await _read_upload(request, service)
+            temporary_path, filename, subfolder, size, digest, refresh_snapshot = await _read_upload(request, service)
             record, reused = await asyncio.to_thread(
                 service.resolve_upload,
                 temporary_path,
@@ -728,6 +976,7 @@ def register_routes() -> None:
                 subfolder,
                 size,
                 digest,
+                refresh_snapshot,
             )
             relative = PurePosixPath(record.relative_path)
             parent = "" if str(relative.parent) == "." else str(relative.parent)
@@ -754,6 +1003,32 @@ def register_routes() -> None:
                     os.unlink(temporary_path)
                 except OSError:
                     pass
+
+    @routes.post("/image-conveyor/managed-duplicates/scan")
+    async def image_conveyor_scan_managed_duplicates(_request):
+        service = get_service(folder_paths)
+        try:
+            report = await asyncio.to_thread(service.find_managed_duplicates)
+            return web.json_response(report)
+        except Exception:
+            LOGGER.exception("Image Conveyor failed to scan managed duplicates.")
+            return web.json_response({"error": "Unable to scan for exact duplicates."}, status=500)
+
+    @routes.post("/image-conveyor/managed-duplicates/delete")
+    async def image_conveyor_delete_managed_duplicates(request):
+        service = get_service(folder_paths)
+        try:
+            payload = await request.json()
+            groups = payload.get("groups") if isinstance(payload, dict) else None
+            if not isinstance(groups, list) or len(groups) > 10000:
+                raise InvalidUpload("The duplicate cleanup plan is malformed or too large.")
+            result = await asyncio.to_thread(service.delete_managed_duplicates, groups)
+            return web.json_response(result)
+        except (InvalidUpload, InvalidInputPath, json.JSONDecodeError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception:
+            LOGGER.exception("Image Conveyor failed to delete managed duplicates.")
+            return web.json_response({"error": "Unable to delete exact duplicates."}, status=500)
 
     @routes.get("/image-conveyor/thumbnail")
     async def image_conveyor_thumbnail(request):

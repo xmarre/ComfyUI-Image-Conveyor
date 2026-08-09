@@ -22,7 +22,7 @@ Images can be added through:
 - optional canvas-wide drop capture;
 - **Add** / **Add selected** from the Input Folder tab.
 
-The first four paths import an external file into ComfyUI input storage. The Input Folder path creates a queue reference to a file that already exists there.
+The first four paths import an external file into ComfyUI input storage. Individual files are stored directly in the input root; dropped folders preserve their own input-relative directory structure. The Input Folder path creates a queue reference to a file that already exists there.
 
 ## Exact duplicate resolution
 
@@ -31,12 +31,14 @@ External imports are resolved by exact file contents using SHA-256:
 - byte-identical files reuse one existing physical file even when their incoming names or source folders differ;
 - files with the same size and different bytes remain separate;
 - re-encoded or merely similar images remain separate;
-- existing duplicate files are left untouched;
+- existing duplicates are reused without creating another file;
 - repeated queue entries may intentionally reference the same physical input file.
 
-Canonical selection is deterministic: an identical intended target is preferred, then an identical file already under `input/image_conveyor/`, then stable relative-path order.
+Canonical selection is deterministic: an identical intended target is preferred, followed by an ordinary input path and then a legacy path under `input/image_conveyor/`, with stable relative-path ordering inside each category. New imports no longer create the `image_conveyor` subfolder. Existing unique files there remain valid and are not moved automatically.
 
-The resolver keeps a persistent SQLite cache under ComfyUI's user cache directory. Input listing records path, size, and modification time without decoding or hashing image contents. An incoming file is streamed and hashed once; only same-size existing candidates whose cached digest is missing or stale are hashed. Simultaneous identical imports are serialized by digest so they produce one physical file.
+The resolver keeps a persistent SQLite cache under ComfyUI's user cache directory. Input listing records path, size, and modification time without decoding or hashing image contents. Each import batch performs one fresh metadata reconciliation, then each incoming file is streamed and hashed once; only same-size existing candidates whose cached digest is missing or stale are hashed. Simultaneous identical imports are serialized by digest so they produce one physical file.
+
+**Clean exact duplicates** is available under **Queue options and bulk tools**. It previews byte-identical redundant files under the legacy `input/image_conveyor/` folder, shows the retained path and reclaimable size, and requires confirmation before deletion. Queued Conveyor paths are protected, open-node references are changed to the retained file before deletion, and the server hashes both sides again immediately before each deletion. Files changed since the preview are skipped; unique files and duplicates outside the legacy folder remain untouched; empty legacy directories are pruned. Run cleanup with no generation active. A saved workflow that is not open can still contain a deleted legacy path; the confirmation calls out that limitation explicitly.
 
 ## Gallery and large-list navigation
 
@@ -59,13 +61,13 @@ Search and filters change the browser presentation only. Applying a Conveyor sor
 
 - The gallery is virtualized by logical rows. Its live card count tracks the viewport plus a small overscan, rather than the total collection size.
 - Only visible and near-visible cards request cached, bounded WebP thumbnails. Full-resolution images load only for explicit preview.
-- Input Folder enumeration uses lightweight `os.scandir()` metadata in a worker thread and a short-lived snapshot cache.
+- Input Folder enumeration and the one-per-import-batch reconciliation use lightweight `os.scandir()` metadata in a worker thread and a short-lived snapshot cache.
 - Folder browsing performs no content hashing and no filesystem writes.
 - Tab changes, scrolling, searching, filtering, focus, and thumbnail-size changes do not serialize `state_json`.
 - The Input Folder dataset is runtime-only and never enlarges workflow JSON.
 - Queue mutations still commit the compatible version-1 queue schema.
 
-The backend exposes input-only routes for recursive listing, exact upload resolution, and thumbnails. Relative paths are containment-checked against ComfyUI's actual input directory; traversal, absolute paths, and symlink escapes are rejected.
+The backend exposes input-only routes for recursive listing, exact upload resolution, managed duplicate cleanup, and thumbnails. Relative paths are containment-checked against ComfyUI's actual input directory; traversal, absolute paths, and symlink escapes are rejected.
 
 ## Queue behavior
 
@@ -86,7 +88,8 @@ Available queue controls include:
 - apply queue sorting;
 - enable **Auto queue all pending**;
 - enable **Don't consume**;
-- enable **Catch canvas drops**.
+- enable **Catch canvas drops**;
+- preview and clean exact duplicates from the legacy managed input folder.
 
 Deleting a Conveyor card removes the queue entry. The Input Folder tab is a non-destructive source picker and does not delete files.
 
@@ -144,4 +147,4 @@ node --test tests/test_gallery_math.mjs
 node --check web/image_conveyor.js
 ```
 
-The Python suite covers duplicate resolution, stale metadata, canonical selection, concurrent uploads, index recovery, recursive listing, thumbnails, path containment, and queue compatibility. The JavaScript tests verify responsive gallery geometry and bounded virtualization for a 10,000-item collection.
+The Python suite covers duplicate resolution, stale metadata, canonical selection, managed duplicate cleanup and revalidation, concurrent uploads, index recovery, recursive listing, thumbnails, path containment, and queue compatibility. The JavaScript tests verify responsive gallery geometry, drag lifecycle behavior, tab scroll restoration, high-speed card reuse, and bounded virtualization for a 10,000-item collection.

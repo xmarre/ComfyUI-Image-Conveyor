@@ -119,3 +119,21 @@ export function isDragLeavingDocument(event, documentElement) {
     return true
   }
 }
+
+export function prepareManagedDuplicateCleanup(groups, protectedPaths = new Set()) {
+  const protectedSet = protectedPaths instanceof Set ? protectedPaths : new Set(protectedPaths ?? [])
+  let protectedCount = 0
+  const cleanupGroups = (Array.isArray(groups) ? groups : []).map((group) => ({
+    ...group,
+    duplicates: (Array.isArray(group?.duplicates) ? group.duplicates : []).filter((duplicate) => {
+      if (!protectedSet.has(String(duplicate?.relative_path ?? ''))) return true
+      protectedCount += 1
+      return false
+    })
+  })).filter((group) => group.duplicates.length)
+  const duplicateCount = cleanupGroups.reduce((count, group) => count + group.duplicates.length, 0)
+  const reclaimableBytes = cleanupGroups.reduce((total, group) => (
+    total + group.duplicates.reduce((subtotal, duplicate) => subtotal + (Number(duplicate?.size) || 0), 0)
+  ), 0)
+  return { groups: cleanupGroups, duplicateCount, reclaimableBytes, protectedCount }
+}

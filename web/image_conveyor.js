@@ -8,7 +8,8 @@ import {
   isDragLeavingDocument,
   isHighVelocityScroll,
   planCardSlotReuse,
-  planViewScrollSwitch
+  planViewScrollSwitch,
+  prepareManagedDuplicateCleanup
 } from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
@@ -19,7 +20,6 @@ const QUEUE_WIDGET = 'queue_item_json'
 const CUSTOM_WIDGET_INPUT = 'batch_loader_ui'
 const CUSTOM_WIDGET_TYPE = 'BATCH_IMAGE_LOADER_UI'
 const DOM_WIDGET_NAME = 'batch_loader_ui'
-const DEFAULT_SUBFOLDER = 'image_conveyor'
 const STYLE_ID = 'comfy-batch-image-loader-style'
 const STATE_VERSION = 1
 const IMAGE_EXTENSIONS = new Set([
@@ -834,13 +834,12 @@ function getItemDisplayPath(item, uiState = null) {
 }
 
 /**
- * Build the upload subfolder path used for image uploads.
- * @param {string} relativeSubfolder - A relative subfolder path (may be empty or contain redundant segments); treated as relative to the base upload folder.
- * @returns {string} The resulting upload subfolder path; if `relativeSubfolder` is empty or normalizes to empty, returns the base upload folder.
+ * Build the input-relative upload folder while preserving a dropped directory's structure.
+ * @param {string} relativeSubfolder - A relative subfolder path (may be empty or contain redundant segments).
+ * @returns {string} The normalized input-relative subfolder, or an empty string for the input root.
  */
 function buildUploadSubfolder(relativeSubfolder = '') {
-  const normalized = normalizeRelativeSubfolder(relativeSubfolder)
-  return normalized ? `${DEFAULT_SUBFOLDER}/${normalized}` : DEFAULT_SUBFOLDER
+  return normalizeRelativeSubfolder(relativeSubfolder)
 }
 
 function normalizeUploadFiles(files) {
@@ -1166,13 +1165,17 @@ function makeItemFromUploadResponse(data) {
 async function uploadFiles(files) {
   const uploaded = []
   const errors = []
-  for (const entry of normalizeUploadFiles(files)) {
+  const entries = normalizeUploadFiles(files)
+  let snapshotRefreshed = false
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]
     const { file, relativeSubfolder } = entry
     try {
       const body = new FormData()
       body.append('image', file)
       body.append('type', 'input')
       body.append('subfolder', buildUploadSubfolder(relativeSubfolder))
+      if (!snapshotRefreshed) body.append('refresh_snapshot', 'true')
       const response = await api.fetchApi('/image-conveyor/resolve-upload', {
         method: 'POST',
         body
@@ -1199,11 +1202,169 @@ async function uploadFiles(files) {
       }
       payload.source_path = getSourcePathHint(entry)
       uploaded.push(payload)
+      snapshotRefreshed = true
     } catch (error) {
       errors.push({ file, error: error instanceof Error ? error : new Error(String(error)) })
     }
   }
   return { uploaded, errors }
+}
+
+function formatByteCount(value) {
+  const bytes = Math.max(0, Number(value) || 0)
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KiB', 'MiB', 'GiB', 'TiB']
+  let amount = bytes
+  let unit = -1
+  do {
+    amount /= 1024
+    unit += 1
+  } while (amount >= 1024 && unit < units.length - 1)
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${units[unit]}`
+}
+
+async function readJsonResponse(response, fallbackMessage) {
+  let payload = null
+  try {
+    payload = await response.json()
+  } catch {
+    // The fallback below includes the HTTP status when the response is not JSON.
+  }
+  if (!response.ok) {
+    throw new Error(payload?.error || `${fallbackMessage} (${response.status} ${response.statusText})`)
+  }
+  return payload
+}
+
+function rewriteLiveInputReferences(replacements) {
+  const byDeletedPath = new Map(
+    replacements
+      .filter((entry) => entry?.relative_path && entry?.keep_path)
+      .map((entry) => [normalizeSourcePath(entry.relative_path), normalizeSourcePath(entry.keep_path)])
+  )
+  if (!byDeletedPath.size) return 0
+
+  let rewritten = 0
+  for (const node of autoQueueCoordinator.nodes) {
+    const ctx = node?.__bil
+    if (!ctx || ctx.removed) continue
+    const { state, uiState } = getRenderableState(node)
+    let changed = false
+    for (const item of state.items) {
+      if (item.type !== 'input') continue
+      const oldPath = normalizeSourcePath(stripAnnotatedStorageTypeSuffix(item.annotated))
+      const keepPath = byDeletedPath.get(oldPath)
+      if (!keepPath) continue
+      const separator = keepPath.lastIndexOf('/')
+      item.annotated = `${keepPath} [input]`
+      item.filename = separator >= 0 ? keepPath.slice(separator + 1) : keepPath
+      item.subfolder = separator >= 0 ? keepPath.slice(0, separator) : ''
+      if (normalizeSourcePath(item.source_path) === oldPath) item.source_path = keepPath
+      if (normalizeSourcePath(uiState.source_paths[item.id]) === oldPath) uiState.source_paths[item.id] = keepPath
+      rewritten += 1
+      changed = true
+    }
+    if (changed) updateState(node, state, uiState)
+  }
+  return rewritten
+}
+
+function getQueuedLegacyInputPaths() {
+  const paths = new Set()
+  for (const node of autoQueueCoordinator.nodes) {
+    const ctx = node?.__bil
+    if (!ctx || ctx.removed) continue
+    const { state } = getRenderableState(node)
+    for (const item of state.items) {
+      if (item.type !== 'input' || item.status !== 'queued') continue
+      const path = normalizeSourcePath(stripAnnotatedStorageTypeSuffix(item.annotated))
+      if (path === 'image_conveyor' || path.startsWith('image_conveyor/')) paths.add(path)
+    }
+  }
+  return paths
+}
+
+async function cleanManagedDuplicates(node) {
+  const ctx = node.__bil
+  if (!ctx || ctx.duplicateCleanupBusy) return
+  ctx.duplicateCleanupBusy = true
+  const button = ctx.cleanDuplicatesBtn
+  const previousLabel = button.textContent
+  button.disabled = true
+  button.textContent = 'Scanning duplicates…'
+  try {
+    const scanResponse = await api.fetchApi('/image-conveyor/managed-duplicates/scan', { method: 'POST' })
+    const report = await readJsonResponse(scanResponse, 'Duplicate scan failed')
+    if (node.__bil !== ctx || ctx.removed) return
+    const cleanup = prepareManagedDuplicateCleanup(report?.groups, getQueuedLegacyInputPaths())
+    const { groups, duplicateCount, reclaimableBytes, protectedCount: queuedCount } = cleanup
+    if (!duplicateCount || !groups.length) {
+      window.alert(queuedCount
+        ? 'The managed duplicates are currently reserved by queued Conveyor items. Run cleanup after those prompts finish or are released.'
+        : 'No byte-identical redundant files were found under input/image_conveyor.')
+      return
+    }
+
+    const mappings = groups.flatMap((group) => (
+      (Array.isArray(group.duplicates) ? group.duplicates : []).map((duplicate) => (
+        `${duplicate.relative_path}  →  ${group.keep_path}`
+      ))
+    ))
+    const previewLimit = 8
+    const preview = mappings.slice(0, previewLimit).join('\n')
+    const omitted = mappings.length > previewLimit ? `\n…and ${mappings.length - previewLimit} more` : ''
+    const confirmed = window.confirm(
+      `Found ${duplicateCount} byte-identical managed duplicate${duplicateCount === 1 ? '' : 's'} ` +
+      `(${formatByteCount(reclaimableBytes)}).` +
+      (queuedCount ? ` ${queuedCount} queued file${queuedCount === 1 ? ' is' : 's are'} protected and will be left in place.` : '') +
+      `\n\n${preview}${omitted}\n\n` +
+      'Delete the image_conveyor copies and keep the listed input files? ' +
+      'Open Conveyor nodes will be relinked before deletion. Start cleanup when no generation is running. ' +
+      'Saved workflows that are not currently open can still reference a deleted legacy path.'
+    )
+    if (!confirmed) return
+
+    const plannedReplacements = groups.flatMap((group) => group.duplicates.map((duplicate) => ({
+      relative_path: duplicate.relative_path,
+      keep_path: group.keep_path
+    })))
+    const preRewritten = rewriteLiveInputReferences(plannedReplacements)
+    button.textContent = 'Deleting duplicates…'
+    const deleteResponse = await api.fetchApi('/image-conveyor/managed-duplicates/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groups })
+    })
+    const result = await readJsonResponse(deleteResponse, 'Duplicate cleanup failed')
+    const deleted = Array.isArray(result?.deleted) ? result.deleted : []
+    const skipped = Array.isArray(result?.skipped) ? result.skipped : []
+    const rewrittenAfterDelete = rewriteLiveInputReferences(deleted)
+    const rewritten = preRewritten + rewrittenAfterDelete
+    await Promise.all(
+      Array.from(autoQueueCoordinator.nodes)
+        .filter((candidate) => candidate?.__bil && !candidate.__bil.removed)
+        .map((candidate) => refreshInputFiles(candidate, { force: true }))
+    )
+    const summary = [
+      `Deleted ${deleted.length} exact duplicate${deleted.length === 1 ? '' : 's'} ` +
+      `and reclaimed ${formatByteCount(result?.reclaimed_bytes)}.`,
+      rewritten ? `Updated ${rewritten} open Conveyor reference${rewritten === 1 ? '' : 's'}.` : '',
+      skipped.length ? `${skipped.length} file${skipped.length === 1 ? ' was' : 's were'} skipped because the filesystem changed after the preview.` : ''
+    ].filter(Boolean).join('\n')
+    if (node.__bil === ctx && !ctx.removed) window.alert(summary)
+  } catch (error) {
+    if (node.__bil === ctx && !ctx.removed) {
+      ctx.browser.input.error = error?.message || 'Duplicate cleanup failed'
+      scheduleRenderNode(node)
+      window.alert(ctx.browser.input.error)
+    }
+  } finally {
+    if (node.__bil === ctx && !ctx.removed) {
+      ctx.duplicateCleanupBusy = false
+      button.disabled = false
+      button.textContent = previousLabel
+    }
+  }
 }
 
 function ensureStyles() {
@@ -2144,7 +2305,9 @@ function buildGalleryDom(node) {
   const clearQueuedBtn = document.createElement('button'); clearQueuedBtn.className = 'bil-btn'; clearQueuedBtn.type = 'button'; clearQueuedBtn.textContent = 'Clear queued'
   const clearProcessedBtn = document.createElement('button'); clearProcessedBtn.className = 'bil-btn'; clearProcessedBtn.type = 'button'; clearProcessedBtn.textContent = 'Remove processed'
   const jumpPendingBtn = document.createElement('button'); jumpPendingBtn.className = 'bil-btn'; jumpPendingBtn.type = 'button'; jumpPendingBtn.textContent = 'Jump to next pending'
-  settingsRow.append(autoQueue.label, dontConsume.label, canvasDrop.label, selectVisibleBtn, clearQueuedBtn, clearProcessedBtn, jumpPendingBtn)
+  const cleanDuplicatesBtn = document.createElement('button'); cleanDuplicatesBtn.className = 'bil-btn'; cleanDuplicatesBtn.type = 'button'; cleanDuplicatesBtn.textContent = 'Clean exact duplicates'
+  cleanDuplicatesBtn.title = 'Preview and remove byte-identical redundant files from the legacy input/image_conveyor folder'
+  settingsRow.append(autoQueue.label, dontConsume.label, canvasDrop.label, selectVisibleBtn, clearQueuedBtn, clearProcessedBtn, jumpPendingBtn, cleanDuplicatesBtn)
   settings.append(settingsSummary, settingsRow)
 
   const list = document.createElement('div')
@@ -2164,6 +2327,7 @@ function buildGalleryDom(node) {
     searchInput, conveyorFilter, folderSelect, conveyorSort, inputSort, sizeSelect,
     applySortBtn, refreshBtn, addSelectedInputBtn, summary, nextText, contextBar,
     contextLabel, setPendingBtn, setProcessedBtn, deleteSelectedBtn, contextAddBtn,
+    cleanDuplicatesBtn,
     autoQueueCheckbox: autoQueue.checkbox, dontConsumeCheckbox: dontConsume.checkbox,
     canvasDropCheckbox: canvasDrop.checkbox, list, listInner, listWindow,
     browser: createBrowserState(), visibleItems: [], cardPool: [],
@@ -2177,7 +2341,7 @@ function buildGalleryDom(node) {
     documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
     documentKeyHandler: null, inputAbortController: null, inputRequestId: 0,
     searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
-    uploadDepth: 0, dropzoneLabel: '',
+    uploadDepth: 0, dropzoneLabel: '', duplicateCleanupBusy: false,
     clearExternalDragState: null,
     queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map(),
     thumbnailUrlCache: new WeakMap()
@@ -2200,6 +2364,7 @@ function buildGalleryDom(node) {
   refreshBtn.addEventListener('click', () => void refreshInputFiles(node, { force: true }))
   addSelectedInputBtn.addEventListener('click', () => addSelectedInputEntries(node))
   contextAddBtn.addEventListener('click', () => addSelectedInputEntries(node))
+  cleanDuplicatesBtn.addEventListener('click', () => void cleanManagedDuplicates(node))
 
   searchInput.addEventListener('input', () => {
     clearTimeout(ctx.searchTimer)

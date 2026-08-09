@@ -125,6 +125,44 @@ class InputLibraryTest(unittest.TestCase):
         self.assertEqual("references/original.png", record.relative_path)
         self.assertFalse(os.path.exists(os.path.join(self.input_root, "image_conveyor", "drop", "renamed.png")))
 
+    def test_root_upload_reuses_same_named_file_added_after_cached_snapshot(self):
+        self.write_input("already-indexed.png", b"other")
+        self.library.list_files(force=True)
+        self.write_input("fresh.png", b"fresh")
+
+        record, reused = self.resolve(b"fresh", "fresh.png", "")
+
+        self.assertTrue(reused)
+        self.assertEqual("fresh.png", record.relative_path)
+        self.assertFalse(os.path.exists(os.path.join(self.input_root, "image_conveyor", "fresh.png")))
+
+    def test_batch_refresh_finds_differently_named_file_added_after_cached_snapshot(self):
+        self.write_input("already-indexed.png", b"other")
+        self.library.list_files(force=True)
+        self.write_input("fresh-existing.png", b"fresh")
+        path, size, digest = self.make_upload(b"fresh")
+        try:
+            record, reused = self.library.resolve_upload(
+                path,
+                "incoming-name.png",
+                "",
+                size,
+                digest,
+                refresh_snapshot=True,
+            )
+        finally:
+            os.unlink(path)
+
+        self.assertTrue(reused)
+        self.assertEqual("fresh-existing.png", record.relative_path)
+        self.assertFalse(os.path.exists(os.path.join(self.input_root, "incoming-name.png")))
+
+    def test_new_root_upload_does_not_create_managed_subfolder(self):
+        record, reused = self.resolve(b"new", "new.png", "")
+        self.assertFalse(reused)
+        self.assertEqual("new.png", record.relative_path)
+        self.assertFalse(os.path.exists(os.path.join(self.input_root, "image_conveyor")))
+
     def test_same_filename_different_bytes_is_collision_safe(self):
         first, _ = self.resolve(b"first", "same.png")
         second, reused = self.resolve(b"other", "same.png")
@@ -163,7 +201,7 @@ class InputLibraryTest(unittest.TestCase):
         self.assertFalse(reused)
         self.assertEqual("image_conveyor/replacement.png", record.relative_path)
 
-    def test_canonical_selection_prefers_intended_then_conveyor_then_path(self):
+    def test_canonical_selection_prefers_intended_then_regular_input_then_managed_path(self):
         self.write_input("a.png", b"same")
         self.write_input("image_conveyor/z.png", b"same")
         self.write_input("intended/exact.png", b"same")
@@ -175,7 +213,86 @@ class InputLibraryTest(unittest.TestCase):
         self.library.invalidate_snapshot()
         record, reused = self.resolve(b"same", "other.png", "somewhere")
         self.assertTrue(reused)
-        self.assertEqual("image_conveyor/z.png", record.relative_path)
+        self.assertEqual("a.png", record.relative_path)
+
+    def test_managed_duplicate_report_keeps_regular_input_and_ignores_unique_files(self):
+        self.write_input("original.png", b"same")
+        self.write_input("also-original.png", b"same")
+        self.write_input("image_conveyor/copy.png", b"same")
+        self.write_input("image_conveyor/unique.png", b"unique")
+
+        report = self.library.find_managed_duplicates()
+
+        self.assertEqual(1, report["duplicate_count"])
+        self.assertEqual(len(b"same"), report["reclaimable_bytes"])
+        self.assertEqual("also-original.png", report["groups"][0]["keep_path"])
+        self.assertEqual(
+            ["image_conveyor/copy.png"],
+            [entry["relative_path"] for entry in report["groups"][0]["duplicates"]],
+        )
+
+    def test_managed_duplicate_cleanup_revalidates_deletes_and_prunes_empty_folder(self):
+        self.write_input("original.png", b"same")
+        duplicate = self.write_input("image_conveyor/copy.png", b"same")
+        report = self.library.find_managed_duplicates()
+
+        result = self.library.delete_managed_duplicates(report["groups"])
+
+        self.assertEqual(
+            [{"relative_path": "image_conveyor/copy.png", "keep_path": "original.png", "size": 4}],
+            result["deleted"],
+        )
+        self.assertEqual([], result["skipped"])
+        self.assertFalse(os.path.exists(duplicate))
+        self.assertFalse(os.path.exists(os.path.join(self.input_root, "image_conveyor")))
+        self.assertTrue(os.path.exists(os.path.join(self.input_root, "original.png")))
+        self.assertNotIn(
+            "image_conveyor/copy.png",
+            {record.relative_path for record in self.library.list_files(force=False)[0]},
+        )
+
+    def test_managed_duplicate_cleanup_skips_file_changed_after_preview(self):
+        self.write_input("original.png", b"same")
+        duplicate = self.write_input("image_conveyor/copy.png", b"same")
+        report = self.library.find_managed_duplicates()
+        with open(duplicate, "wb") as handle:
+            handle.write(b"changed")
+
+        result = self.library.delete_managed_duplicates(report["groups"])
+
+        self.assertEqual([], result["deleted"])
+        self.assertEqual("image_conveyor/copy.png", result["skipped"][0]["relative_path"])
+        self.assertTrue(os.path.exists(duplicate))
+
+    def test_managed_duplicate_cleanup_never_unlinks_symlink_destination(self):
+        original = self.write_input("original.png", b"same")
+        duplicate = self.write_input("image_conveyor/copy.png", b"same")
+        report = self.library.find_managed_duplicates()
+        os.unlink(duplicate)
+        try:
+            os.symlink(original, duplicate)
+        except (OSError, NotImplementedError):
+            self.skipTest("Symlinks are unavailable on this platform")
+
+        result = self.library.delete_managed_duplicates(report["groups"])
+
+        self.assertEqual([], result["deleted"])
+        self.assertEqual("image_conveyor/copy.png", result["skipped"][0]["relative_path"])
+        self.assertTrue(os.path.exists(original))
+        self.assertTrue(os.path.islink(duplicate))
+
+    def test_managed_duplicate_cleanup_rejects_deletion_outside_legacy_folder(self):
+        first = self.write_input("first.png", b"same")
+        second = self.write_input("second.png", b"same")
+        digest = server.hashlib.sha256(b"same").hexdigest()
+
+        with self.assertRaises(server.InvalidUpload):
+            self.library.delete_managed_duplicates(
+                [{"digest": digest, "keep_path": "first.png", "duplicates": [{"relative_path": "second.png"}]}]
+            )
+
+        self.assertTrue(os.path.exists(first))
+        self.assertTrue(os.path.exists(second))
 
     def test_concurrent_identical_uploads_create_one_file(self):
         barrier = threading.Barrier(2)
