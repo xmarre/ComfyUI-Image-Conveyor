@@ -5,6 +5,8 @@ import {
   CARD_FOOTER_HEIGHT,
   calculateGalleryMetrics,
   calculateVisibleCardRange,
+  chooseViewAfterClose,
+  groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
   planCardSlotReuse,
@@ -40,6 +42,7 @@ const MIN_NODE_HEIGHT = 760
 const CARD_GAP = 10
 const GALLERY_OVERSCAN_ROWS = 2
 const FAST_SCROLL_SETTLE_MS = 80
+const LOCAL_OBJECT_URL_LIMIT = 512
 const CARD_SIZES = {
   small: { minWidth: 124, thumbnail: 160 },
   medium: { minWidth: 172, thumbnail: 256 },
@@ -513,6 +516,7 @@ function setCanvasDropTargetActive(node, active) {
   if (!ctx) return
   ctx.root.classList.toggle('bil-dragover', active)
   ctx.dropzone.classList.toggle('bil-dragover', active)
+  if (!active) ctx.tabs?.classList.remove('bil-folder-drop-ready', 'bil-folder-drop-hover')
   if (!active && ctx.cardPool) clearCardDragTargets(ctx)
 }
 
@@ -906,6 +910,12 @@ function hasExternalFileDrag(event) {
   return files.some((file) => isProbablyImageFile(file))
 }
 
+function hasExternalDirectoryDrag(event) {
+  return Array.from(event?.dataTransfer?.items ?? [])
+    .filter((item) => item?.kind === 'file')
+    .some((item) => getTransferItemEntry(item)?.isDirectory)
+}
+
 function hasPotentialExternalFileDrag(event) {
   const transfer = event?.dataTransfer
   if (!transfer) return false
@@ -1030,6 +1040,64 @@ async function getDroppedImageFiles(event) {
   return normalizeUploadFiles(fallbackFiles)
 }
 
+async function collectFolderSourceFromEntry(entry) {
+  if (!entry?.isDirectory || typeof entry.createReader !== 'function') return null
+  const source = {
+    id: makeId(),
+    name: String(entry.name || 'Folder').trim() || 'Folder',
+    files: [],
+    directories: new Set([''])
+  }
+
+  const walk = async (directory, parentPath) => {
+    const reader = directory.createReader()
+    const children = await readDirectoryEntries(reader)
+    children.sort(compareFileSystemEntryNames)
+    for (const child of children) {
+      const childPath = normalizeRelativeSubfolder(
+        parentPath ? `${parentPath}/${child.name}` : child.name
+      )
+      if (child.isDirectory) {
+        source.directories.add(childPath)
+        await walk(child, childPath)
+        continue
+      }
+      if (!child.isFile) continue
+      const file = await new Promise((resolve, reject) => child.file(resolve, reject))
+      if (isProbablyImageFile(file)) source.files.push({ file, relativePath: childPath })
+    }
+  }
+
+  await walk(entry, '')
+  return source
+}
+
+async function getDroppedFolderSources(event) {
+  const items = Array.from(event?.dataTransfer?.items ?? []).filter((item) => item?.kind === 'file')
+  const directoryEntries = items
+    .map((item) => getTransferItemEntry(item))
+    .filter((entry) => entry?.isDirectory)
+  const sources = []
+  for (const entry of directoryEntries) {
+    try {
+      const source = await collectFolderSourceFromEntry(entry)
+      if (source) sources.push(source)
+    } catch (error) {
+      console.error(`Image Conveyor: failed to read folder '${entry?.name || 'unknown'}'.`, error)
+    }
+  }
+  return sources
+}
+
+function makePickerFolderSources(files) {
+  return groupDirectoryPickerFiles(files, isProbablyImageFile).map((group) => ({
+    id: makeId(),
+    name: group.name,
+    files: group.files,
+    directories: new Set(group.directories)
+  }))
+}
+
 function consumeExternalFileDrag(event) {
   if (!hasExternalFileDrag(event)) return false
   finalizeExternalFileDrag(event)
@@ -1085,7 +1153,44 @@ function isModifiedPlainTextPaste(event) {
   return event.shiftKey && (event.ctrlKey || event.metaKey)
 }
 
-function filePreviewUrl(item) {
+function pruneLocalObjectUrls(ctx) {
+  if (ctx.localObjectUrls.size <= LOCAL_OBJECT_URL_LIMIT) return
+  const inUse = new Set(ctx.cardPool.map((slot) => slot.previewUrl).filter(Boolean))
+  const lightboxUrl = ctx.lightbox?.image?.getAttribute?.('src')
+  if (lightboxUrl) inUse.add(lightboxUrl)
+  for (const [file, entry] of ctx.localObjectUrls) {
+    if (ctx.localObjectUrls.size <= LOCAL_OBJECT_URL_LIMIT) break
+    if (inUse.has(entry.url)) continue
+    URL.revokeObjectURL(entry.url)
+    ctx.localObjectUrls.delete(file)
+  }
+}
+
+function localObjectUrl(ctx, item) {
+  const file = item?.localFile
+  if (!(file instanceof File)) return ''
+  const existing = ctx.localObjectUrls.get(file)
+  if (existing) {
+    ctx.localObjectUrls.delete(file)
+    ctx.localObjectUrls.set(file, existing)
+    return existing.url
+  }
+  const url = URL.createObjectURL(file)
+  ctx.localObjectUrls.set(file, { url, sourceId: item.sourceId })
+  pruneLocalObjectUrls(ctx)
+  return url
+}
+
+function releaseLocalSourceUrls(ctx, sourceId) {
+  for (const [file, entry] of ctx.localObjectUrls) {
+    if (entry.sourceId !== sourceId) continue
+    URL.revokeObjectURL(entry.url)
+    ctx.localObjectUrls.delete(file)
+  }
+}
+
+function filePreviewUrl(item, ctx = null) {
+  if (item?.localFile && ctx) return localObjectUrl(ctx, item)
   const params = new URLSearchParams()
   params.set(
     'filename',
@@ -1118,6 +1223,7 @@ function thumbnailUrl(item, density = 'medium') {
 }
 
 function cachedThumbnailUrl(ctx, item, density) {
+  if (item?.localFile) return localObjectUrl(ctx, item)
   if (!item?.source_version) return thumbnailUrl(item, density)
   let urls = ctx.thumbnailUrlCache.get(item)
   if (!urls) {
@@ -1400,12 +1506,26 @@ function ensureStyles() {
     .bil-root.bil-dragover { outline: 2px dashed #73aef5; outline-offset: -3px; border-radius: 10px; background: rgba(90,155,235,.08); }
     .bil-header, .bil-browserbar, .bil-summary, .bil-contextbar, .bil-settings-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
     .bil-header { justify-content: space-between; }
-    .bil-tabs { display: flex; gap: 3px; min-width: 0; }
+    .bil-tabs { display: flex; flex: 1 1 0; gap: 3px; min-width: 0; overflow-x: auto; overflow-y: hidden; padding: 2px; border-radius: 8px; scrollbar-width: none; }
+    .bil-tabs::-webkit-scrollbar { display: none; }
+    .bil-tabs.bil-folder-drop-ready { outline: 1px dashed rgba(115,175,250,.75); outline-offset: -2px; }
+    .bil-tabs.bil-folder-drop-hover { outline: 2px solid #73aef5; background: rgba(90,155,235,.16); }
+    .bil-tabs > .bil-tab, .bil-tab-shell { flex: 1 1 150px; min-width: 24px; max-width: 210px; }
+    .bil-tab-shell { position: relative; display: flex; overflow: hidden; }
+    .bil-tab-shell.bil-tab-active { min-width: 54px; }
+    .bil-tab-shell > .bil-tab { width: 100%; min-width: 0; padding-right: 8px; }
+    .bil-tab-shell.bil-tab-active > .bil-tab { padding-right: 25px; }
+    .bil-tab-label { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bil-tab-close { position: absolute; top: 50%; right: 5px; width: 18px; height: 18px; transform: translateY(-50%); padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; font: 16px/17px system-ui, sans-serif; cursor: pointer; }
+    .bil-tab-close:hover { background: rgba(255,255,255,.16); }
+    .bil-tab-close[hidden] { display: none; }
     .bil-tab, .bil-btn, .bil-select, .bil-input, .bil-icon-btn {
       border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.055);
       color: inherit; border-radius: 7px; padding: 5px 8px; font: inherit; box-sizing: border-box;
     }
+    .bil-tab { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .bil-tab, .bil-btn, .bil-icon-btn { cursor: pointer; }
+    .bil-tabs > .bil-tab[aria-selected="true"] { min-width: 54px; }
     .bil-tab[aria-selected="true"] { background: rgba(105,165,240,.20); border-color: rgba(115,175,250,.65); }
     .bil-btn:disabled, .bil-icon-btn:disabled { opacity: .4; cursor: not-allowed; }
     .bil-add-btn { font-weight: 650; white-space: nowrap; }
@@ -1442,6 +1562,9 @@ function ensureStyles() {
     .bil-badge { padding: 2px 6px; border-radius: 999px; font-size: 10px; text-transform: uppercase; letter-spacing: .025em; background: rgba(20,20,20,.82); }
     .bil-badge-pending { color: #e2e2e2; } .bil-badge-queued { color: #ffd276; } .bil-badge-processed { color: #8bea9e; }
     .bil-count-badge { color: #cce4ff; text-transform: none; }
+    .bil-folder-card .bil-media { display: flex; align-items: center; justify-content: center; }
+    .bil-folder-icon { position: relative; width: 48%; height: 34%; border-radius: 7px; background: linear-gradient(145deg, #78b8f8, #4d86c7); box-shadow: 0 10px 24px rgba(0,0,0,.22); }
+    .bil-folder-icon::before { content: ''; position: absolute; left: 8%; top: -28%; width: 42%; height: 36%; border-radius: 6px 6px 0 0; background: #78b8f8; }
     .bil-card-footer { flex: 0 0 ${CARD_FOOTER_HEIGHT}px; display: flex; flex-direction: column; justify-content: center; gap: 4px; padding: 5px 7px 6px; min-width: 0; }
     .bil-card-title-row, .bil-card-actions { display: flex; align-items: center; gap: 4px; min-width: 0; }
     .bil-name { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 620; }
@@ -1516,6 +1639,9 @@ function chainNodeCallback(node, key, handler) {
 function createBrowserState() {
   return {
     activeView: 'conveyor',
+    tabOrder: ['conveyor', 'input'],
+    folderSources: new Map(),
+    folderViews: new Map(),
     conveyor: {
       query: '', filter: 'all', sort: 'manual', size: 'medium', scrollTop: 0,
       focusedId: null, lastSelectedId: null, selected: new Set()
@@ -1528,8 +1654,80 @@ function createBrowserState() {
   }
 }
 
+function browserForView(ctx, view) {
+  return ctx.browser[view] ?? ctx.browser.folderViews.get(view)
+}
+
 function activeBrowser(ctx) {
-  return ctx.browser[ctx.browser.activeView]
+  return browserForView(ctx, ctx.browser.activeView)
+}
+
+function isFolderView(ctx, view = ctx.browser.activeView) {
+  return ctx.browser.folderViews.has(view)
+}
+
+function isLibraryView(ctx, view = ctx.browser.activeView) {
+  return view === 'input' || isFolderView(ctx, view)
+}
+
+function getViewItemId(ctx, item, view = ctx.browser.activeView) {
+  return isLibraryView(ctx, view) ? item.key ?? item.relative_path : item.id
+}
+
+function relativeParent(path) {
+  const normalized = normalizeRelativeSubfolder(path)
+  const separator = normalized.lastIndexOf('/')
+  return separator < 0 ? '' : normalized.slice(0, separator)
+}
+
+function relativeName(path) {
+  const normalized = normalizeRelativeSubfolder(path)
+  const separator = normalized.lastIndexOf('/')
+  return separator < 0 ? normalized : normalized.slice(separator + 1)
+}
+
+function createFolderBrowserState(source, folderPath = '') {
+  const currentPath = normalizeRelativeSubfolder(folderPath)
+  const entries = []
+  for (const directory of source.directories) {
+    if (!directory || relativeParent(directory) !== currentPath) continue
+    const fullPath = `${source.name}/${directory}`
+    entries.push({
+      kind: 'folder',
+      key: `folder:${source.id}:${directory}`,
+      sourceId: source.id,
+      folderPath: directory,
+      filename: relativeName(directory),
+      relative_path: fullPath,
+      subfolder: source.name
+    })
+  }
+  for (const entry of source.files) {
+    const relativePath = normalizeRelativeSubfolder(entry.relativePath)
+    if (!relativePath || relativeParent(relativePath) !== currentPath) continue
+    const fullPath = `${source.name}/${relativePath}`
+    entries.push({
+      kind: 'local-image',
+      key: `local:${source.id}:${relativePath}`,
+      sourceId: source.id,
+      filename: relativeName(relativePath),
+      relative_path: fullPath,
+      subfolder: relativeParent(fullPath),
+      relativeSubfolder: relativeParent(fullPath),
+      type: 'local',
+      size: Number(entry.file?.size || 0),
+      mtime_ns: Number(entry.file?.lastModified || 0),
+      source_version: `${Number(entry.file?.size || 0)}-${Number(entry.file?.lastModified || 0)}`,
+      localFile: entry.file
+    })
+  }
+  return {
+    sourceId: source.id,
+    folderPath: currentPath,
+    query: '', sort: 'name_asc', size: 'medium', scrollTop: 0,
+    focusedId: null, lastSelectedId: null, entries, selected: new Set(),
+    loading: false, error: ''
+  }
 }
 
 function compareNatural(left, right) {
@@ -1542,20 +1740,22 @@ function compareNatural(left, right) {
 function getViewItems(node) {
   const ctx = node.__bil
   const browser = activeBrowser(ctx)
-  if (ctx.browser.activeView === 'input') {
+  if (isLibraryView(ctx)) {
     const query = browser.query.trim().toLocaleLowerCase()
-    const items = browser.files.filter((entry) => {
-      if (browser.folder !== 'all') {
+    const sourceItems = ctx.browser.activeView === 'input' ? browser.files : browser.entries
+    const items = sourceItems.filter((entry) => {
+      if (ctx.browser.activeView === 'input' && browser.folder !== 'all') {
         const folder = String(entry.subfolder || '')
         if (folder !== browser.folder && !folder.startsWith(`${browser.folder}/`)) return false
       }
       return !query || `${entry.filename} ${entry.relative_path}`.toLocaleLowerCase().includes(query)
     })
+    const folderFirst = (left, right) => Number(right.kind === 'folder') - Number(left.kind === 'folder')
     switch (browser.sort) {
-      case 'name_desc': items.sort((a, b) => compareNatural(b.relative_path, a.relative_path)); break
-      case 'newest': items.sort((a, b) => (b.mtime_ns || 0) - (a.mtime_ns || 0) || compareNatural(a.relative_path, b.relative_path)); break
-      case 'oldest': items.sort((a, b) => (a.mtime_ns || 0) - (b.mtime_ns || 0) || compareNatural(a.relative_path, b.relative_path)); break
-      default: items.sort((a, b) => compareNatural(a.relative_path, b.relative_path)); break
+      case 'name_desc': items.sort((a, b) => folderFirst(a, b) || compareNatural(b.relative_path, a.relative_path)); break
+      case 'newest': items.sort((a, b) => folderFirst(a, b) || (b.mtime_ns || 0) - (a.mtime_ns || 0) || compareNatural(a.relative_path, b.relative_path)); break
+      case 'oldest': items.sort((a, b) => folderFirst(a, b) || (a.mtime_ns || 0) - (b.mtime_ns || 0) || compareNatural(a.relative_path, b.relative_path)); break
+      default: items.sort((a, b) => folderFirst(a, b) || compareNatural(a.relative_path, b.relative_path)); break
     }
     return items
   }
@@ -1601,7 +1801,7 @@ function getViewSelectedIds(node) {
 function renderSelectionContext(node) {
   const ctx = node.__bil
   if (!ctx) return
-  const inputView = ctx.browser.activeView === 'input'
+  const inputView = isLibraryView(ctx)
   const selected = getViewSelectedIds(node)
   ctx.contextBar.hidden = selected.size === 0
   ctx.contextLabel.textContent = `${selected.size} selected`
@@ -1615,16 +1815,16 @@ function setItemSelected(node, itemId, checked, event = null) {
   const ctx = node.__bil
   const browser = activeBrowser(ctx)
   const items = ctx.visibleItems || []
-  const itemIdentifier = ctx.browser.activeView === 'input'
-    ? (item) => item.relative_path
-    : (item) => item.id
+  const itemIdentifier = (item) => getViewItemId(ctx, item)
+  const currentItem = items.find((item) => itemIdentifier(item) === itemId)
+  if (currentItem?.kind === 'folder') return
   const selected = browser.selected
   if (event?.shiftKey && browser.lastSelectedId) {
     const anchor = items.findIndex((item) => itemIdentifier(item) === browser.lastSelectedId)
     const current = items.findIndex((item) => itemIdentifier(item) === itemId)
     if (anchor >= 0 && current >= 0) {
       for (let index = Math.min(anchor, current); index <= Math.max(anchor, current); index += 1) {
-        selected.add(itemIdentifier(items[index]))
+        if (items[index].kind !== 'folder') selected.add(itemIdentifier(items[index]))
       }
     }
   } else if (checked) selected.add(itemId)
@@ -1653,6 +1853,7 @@ function createLightbox(node) {
   const hide = () => {
     lightbox.hidden = true
     image.removeAttribute('src')
+    delete lightbox.dataset.sourceId
     node.__bil?.root.focus({ preventScroll: true })
   }
   close.addEventListener('click', hide)
@@ -1663,11 +1864,12 @@ function createLightbox(node) {
 
 function openPreview(node, item) {
   const ctx = node.__bil
-  if (!ctx?.lightbox || !item) return
+  if (!ctx?.lightbox || !item || item.kind === 'folder') return
   const label = item.filename || item.relative_path || getItemDisplayPath(item)
-  ctx.lightbox.image.src = filePreviewUrl(item)
+  ctx.lightbox.image.src = filePreviewUrl(item, ctx)
   ctx.lightbox.image.alt = label
   ctx.lightbox.label.textContent = label
+  if (item.sourceId) ctx.lightbox.root.dataset.sourceId = item.sourceId
   ctx.lightbox.root.hidden = false
   ctx.lightbox.close.focus({ preventScroll: true })
 }
@@ -1675,6 +1877,134 @@ function openPreview(node, item) {
 function clearCardDragTargets(ctx, except = null) {
   for (const slot of ctx.cardPool) {
     if (slot.card !== except) slot.card.classList.remove('bil-drag-target')
+  }
+}
+
+function folderViewId(sourceId, folderPath = '') {
+  return `folder:${sourceId}:${normalizeRelativeSubfolder(folderPath)}`
+}
+
+function folderTabLabel(source, folderPath) {
+  return folderPath ? relativeName(folderPath) : source.name
+}
+
+function createFolderTabElement(node, viewId, source, folderPath) {
+  const ctx = node.__bil
+  const shell = document.createElement('div')
+  shell.className = 'bil-tab-shell'
+  const tab = document.createElement('button')
+  tab.className = 'bil-tab'
+  tab.type = 'button'
+  tab.id = `${ctx.tabSetId}-${viewId.replace(/[^a-zA-Z0-9_-]/g, '-')}`
+  tab.setAttribute('role', 'tab')
+  tab.setAttribute('aria-controls', ctx.list.id)
+  const label = document.createElement('span')
+  label.className = 'bil-tab-label'
+  label.textContent = folderTabLabel(source, folderPath)
+  const fullPath = folderPath ? `${source.name}/${folderPath}` : source.name
+  tab.title = fullPath
+  tab.appendChild(label)
+  const close = document.createElement('button')
+  close.className = 'bil-tab-close'
+  close.type = 'button'
+  close.textContent = '×'
+  close.hidden = true
+  close.setAttribute('aria-label', `Close ${fullPath} tab`)
+  tab.addEventListener('click', () => switchBrowserView(node, viewId))
+  close.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    closeFolderView(node, viewId)
+  })
+  shell.append(tab, close)
+  ctx.tabs.appendChild(shell)
+  ctx.folderTabElements.set(viewId, { shell, tab, close, label })
+}
+
+function openFolderView(node, sourceId, folderPath = '') {
+  const ctx = node.__bil
+  const source = ctx?.browser.folderSources.get(sourceId)
+  if (!ctx || !source) return
+  const normalizedPath = normalizeRelativeSubfolder(folderPath)
+  if (normalizedPath && !source.directories.has(normalizedPath)) return
+  const viewId = folderViewId(sourceId, normalizedPath)
+  if (!ctx.browser.folderViews.has(viewId)) {
+    ctx.browser.folderViews.set(viewId, createFolderBrowserState(source, normalizedPath))
+    ctx.browser.tabOrder.push(viewId)
+    createFolderTabElement(node, viewId, source, normalizedPath)
+  }
+  switchBrowserView(node, viewId)
+}
+
+function addFolderSources(node, sources) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return 0
+  let added = 0
+  for (const source of Array.from(sources ?? [])) {
+    if (!source?.id || !source?.name || !(source.directories instanceof Set) || !Array.isArray(source.files)) continue
+    source.files.sort((left, right) => compareNatural(left.relativePath, right.relativePath))
+    ctx.browser.folderSources.set(source.id, source)
+    openFolderView(node, source.id, '')
+    added += 1
+  }
+  return added
+}
+
+function closeFolderView(node, viewId) {
+  const ctx = node.__bil
+  const view = ctx?.browser.folderViews.get(viewId)
+  if (!ctx || !view) return
+  const nextView = chooseViewAfterClose(
+    ctx.browser.tabOrder,
+    ctx.browser.activeView,
+    viewId,
+    'input'
+  )
+  const wasActive = ctx.browser.activeView === viewId
+  if (wasActive) {
+    switchBrowserView(node, nextView)
+    hideUnusedCards(ctx)
+  }
+  ctx.browser.folderViews.delete(viewId)
+  ctx.browser.tabOrder = ctx.browser.tabOrder.filter((entry) => entry !== viewId)
+  ctx.folderTabElements.get(viewId)?.shell.remove()
+  ctx.folderTabElements.delete(viewId)
+  const sourceStillOpen = Array.from(ctx.browser.folderViews.values())
+    .some((candidate) => candidate.sourceId === view.sourceId)
+  if (!sourceStillOpen) {
+    if (ctx.lightbox?.root?.dataset?.sourceId === view.sourceId) ctx.lightbox.hide()
+    releaseLocalSourceUrls(ctx, view.sourceId)
+    ctx.browser.folderSources.delete(view.sourceId)
+  }
+  scheduleRenderNode(node, { forceVisibleRows: true })
+}
+
+function renderTabs(ctx) {
+  const activeView = ctx.browser.activeView
+  const inputSelected = activeView === 'input'
+  const conveyorSelected = activeView === 'conveyor'
+  ctx.conveyorTab.setAttribute('aria-selected', String(conveyorSelected))
+  ctx.inputTab.setAttribute('aria-selected', String(inputSelected))
+  for (const [viewId, elements] of ctx.folderTabElements) {
+    const selected = viewId === activeView
+    elements.tab.setAttribute('aria-selected', String(selected))
+    elements.shell.classList.toggle('bil-tab-active', selected)
+    elements.close.hidden = !selected
+  }
+  const activeTab = activeView === 'conveyor'
+    ? ctx.conveyorTab
+    : activeView === 'input'
+      ? ctx.inputTab
+      : ctx.folderTabElements.get(activeView)?.tab
+  if (activeTab) {
+    ctx.list.setAttribute('aria-labelledby', activeTab.id)
+    const activeElement = activeTab.parentElement?.classList.contains('bil-tab-shell')
+      ? activeTab.parentElement
+      : activeTab
+    const tabsRect = ctx.tabs.getBoundingClientRect()
+    const activeRect = activeElement.getBoundingClientRect()
+    if (activeRect.left < tabsRect.left) ctx.tabs.scrollLeft -= tabsRect.left - activeRect.left
+    else if (activeRect.right > tabsRect.right) ctx.tabs.scrollLeft += activeRect.right - tabsRect.right
   }
 }
 
@@ -1688,6 +2018,7 @@ function createCardSlot(node, ctx) {
     item: null,
     itemIndex: -1,
     inputView: null,
+    itemKind: '',
     label: '',
     displayPath: '',
     subfolder: '',
@@ -1724,6 +2055,10 @@ function createCardSlot(node, ctx) {
   media.className = 'bil-media'
   media.addEventListener('click', (event) => {
     if (!slot.itemId) return
+    if (slot.item?.kind === 'folder') {
+      openFolderView(node, slot.item.sourceId, slot.item.folderPath)
+      return
+    }
     activeBrowser(ctx).focusedId = slot.itemId
     if (event.ctrlKey || event.metaKey || event.shiftKey) {
       const selected = getViewSelectedIds(node)
@@ -1736,6 +2071,9 @@ function createCardSlot(node, ctx) {
   thumb.loading = 'lazy'
   thumb.decoding = 'async'
   thumb.draggable = false
+  const folderIcon = document.createElement('div')
+  folderIcon.className = 'bil-folder-icon'
+  folderIcon.hidden = true
   const overlay = document.createElement('div')
   overlay.className = 'bil-card-overlay'
   const checkbox = document.createElement('input')
@@ -1748,7 +2086,7 @@ function createCardSlot(node, ctx) {
   const badge = document.createElement('span')
   badge.className = 'bil-badge'
   overlay.append(checkbox, badge)
-  media.append(thumb, overlay)
+  media.append(thumb, folderIcon, overlay)
 
   const footer = document.createElement('div')
   footer.className = 'bil-card-footer'
@@ -1790,11 +2128,15 @@ function createCardSlot(node, ctx) {
     delete uiState.source_paths[slot.itemId]
     updateState(node, state, uiState)
   })
-  addBtn.addEventListener('click', () => { if (slot.item) addInputEntries(node, [slot.item]) })
+  addBtn.addEventListener('click', () => {
+    if (!slot.item) return
+    if (slot.item.kind === 'folder') openFolderView(node, slot.item.sourceId, slot.item.folderPath)
+    else void addLibraryEntries(node, [slot.item])
+  })
   actions.append(path, pendingBtn, processedBtn, deleteBtn, addBtn)
   footer.append(titleRow, actions)
   card.append(media, footer)
-  Object.assign(slot, { media, thumb, checkbox, badge, name, indexText, path, pendingBtn, processedBtn, deleteBtn, addBtn })
+  Object.assign(slot, { media, thumb, folderIcon, checkbox, badge, name, indexText, path, pendingBtn, processedBtn, deleteBtn, addBtn })
   return slot
 }
 
@@ -1810,6 +2152,7 @@ function ensureCardPool(node, needed) {
 function resetCardThumbnail(slot) {
   slot.bindToken += 1
   slot.previewUrl = ''
+  slot.thumbnailIdentity = ''
   slot.thumb.onload = null
   slot.thumb.onerror = null
   slot.thumb.classList.remove('bil-thumb-ready', 'bil-thumb-error')
@@ -1835,33 +2178,40 @@ function bindCardThumbnail(slot, url) {
 function hideUnusedCards(ctx, start = 0) {
   for (let index = start; index < ctx.cardPool.length; index += 1) {
     const slot = ctx.cardPool[index]
-    slot.itemId = null; slot.item = null; slot.itemIndex = -1; slot.inputView = null
+    slot.itemId = null; slot.item = null; slot.itemIndex = -1; slot.inputView = null; slot.itemKind = ''
     slot.layoutKey = ''; slot.badgeKey = ''; slot.selected = null; slot.focused = null
     slot.card.style.display = 'none'
-    slot.card.classList.remove('bil-selected', 'bil-focused', 'bil-drag-target')
+    slot.card.classList.remove('bil-selected', 'bil-focused', 'bil-drag-target', 'bil-folder-card')
+    slot.folderIcon.hidden = true
+    slot.checkbox.hidden = false
     resetCardThumbnail(slot)
   }
 }
 
 function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotatedCounts, uiState, allowThumbnailLoad) {
   const ctx = node.__bil
-  const inputView = ctx.browser.activeView === 'input'
-  const itemId = inputView ? item.relative_path : item.id
+  const inputView = isLibraryView(ctx)
+  const folderItem = item.kind === 'folder'
+  const localItem = item.kind === 'local-image'
+  const itemId = getViewItemId(ctx, item)
   const displayPath = inputView ? item.relative_path : getItemDisplayPath(item, uiState)
   const label = item.filename || item.relative_path || displayPath
   const browser = activeBrowser(ctx)
-  const url = cachedThumbnailUrl(ctx, item, browser.size)
-  const thumbnailChanged = slot.previewUrl !== url
-  if (thumbnailChanged && slot.previewUrl) resetCardThumbnail(slot)
+  const thumbnailIdentity = folderItem
+    ? `folder:${itemId}`
+    : `${itemId}:${item.source_version || item.mtime_ns || ''}:${browser.size}`
+  if (slot.thumbnailIdentity !== thumbnailIdentity && (slot.previewUrl || slot.thumbnailIdentity)) resetCardThumbnail(slot)
+  slot.thumbnailIdentity = thumbnailIdentity
 
-  const subfolder = inputView ? (item.subfolder || 'input root') : ''
+  const subfolder = inputView ? (item.subfolder || (localItem ? 'Selected folder' : 'input root')) : ''
   const staticContentChanged = slot.itemIndex !== itemIndex ||
     slot.inputView !== inputView ||
+    slot.itemKind !== item.kind ||
     slot.label !== label ||
     slot.displayPath !== displayPath ||
     slot.subfolder !== subfolder
   slot.itemId = itemId; slot.item = item
-  slot.itemIndex = itemIndex; slot.inputView = inputView
+  slot.itemIndex = itemIndex; slot.inputView = inputView; slot.itemKind = item.kind || ''
   slot.label = label; slot.displayPath = displayPath; slot.subfolder = subfolder
   if (slot.card.style.display !== 'flex') slot.card.style.display = 'flex'
   const layoutKey = `${itemIndex}:${metrics.columns}:${metrics.cardWidth}:${metrics.cardHeight}`
@@ -1895,6 +2245,10 @@ function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotate
     slot.path.title = slot.path.textContent
     slot.thumb.alt = label
   }
+  slot.card.classList.toggle('bil-folder-card', folderItem)
+  slot.folderIcon.hidden = !folderItem
+  slot.thumb.hidden = folderItem
+  slot.checkbox.hidden = folderItem
   const draggable = !inputView && canReorderConveyor(ctx)
   if (slot.draggable !== draggable) {
     slot.draggable = draggable
@@ -1904,12 +2258,13 @@ function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotate
   if (slot.processedBtn.hidden !== inputView) slot.processedBtn.hidden = inputView
   if (slot.deleteBtn.hidden !== inputView) slot.deleteBtn.hidden = inputView
   if (slot.addBtn.hidden === inputView) slot.addBtn.hidden = !inputView
+  if (inputView) slot.addBtn.textContent = folderItem ? 'Open' : '+ Add'
   if (inputView) {
-    const count = annotatedCounts.get(item.relative_path) || 0
-    const badgeKey = `input:${count}`
+    const count = localItem || folderItem ? 0 : annotatedCounts.get(item.relative_path) || 0
+    const badgeKey = folderItem ? 'folder' : localItem ? 'local' : `input:${count}`
     if (slot.badgeKey !== badgeKey) {
       slot.badge.className = 'bil-badge bil-count-badge'
-      slot.badge.textContent = count ? `In conveyor ×${count}` : 'Input'
+      slot.badge.textContent = folderItem ? 'Folder' : localItem ? 'Local' : count ? `In conveyor ×${count}` : 'Input'
       slot.badgeKey = badgeKey
     }
   } else {
@@ -1920,7 +2275,10 @@ function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotate
       slot.badgeKey = badgeKey
     }
   }
-  if (allowThumbnailLoad && slot.previewUrl !== url) bindCardThumbnail(slot, url)
+  if (!folderItem && allowThumbnailLoad && !slot.previewUrl) {
+    const url = cachedThumbnailUrl(ctx, item, browser.size)
+    if (url) bindCardThumbnail(slot, url)
+  }
 }
 
 function renderVisibleCards(node) {
@@ -1978,9 +2336,7 @@ function renderVisibleCards(node) {
   if (ctx.renderedRangeKey === key) return
   const needed = range.end - range.start
   ensureCardPool(node, needed)
-  const nextItemIds = items.slice(range.start, range.end).map((item) => (
-    view === 'input' ? item.relative_path : item.id
-  ))
+  const nextItemIds = items.slice(range.start, range.end).map((item) => getViewItemId(ctx, item, view))
   const assignments = planCardSlotReuse(ctx.cardPool.map((slot) => slot.itemId), nextItemIds)
   const assigned = new Set(assignments)
   ctx.cardPool = [
@@ -2034,7 +2390,9 @@ function renderGalleryNode(node) {
     Array.from(ctx.browser.conveyor.selected).filter((id) => validQueueIds.has(id))
   )
   ctx.visibleItems = getViewItems(node)
-  const inputView = ctx.browser.activeView === 'input'
+  const inputRootView = ctx.browser.activeView === 'input'
+  const inputView = isLibraryView(ctx)
+  const folderView = isFolderView(ctx)
   const browser = activeBrowser(ctx)
   const pending = countItemsByStatus(state, 'pending')
   const queued = countItemsByStatus(state, 'queued')
@@ -2043,27 +2401,31 @@ function renderGalleryNode(node) {
 
   ctx.conveyorTab.textContent = `Conveyor ${state.items.length}`
   ctx.inputTab.textContent = `Input Folder ${ctx.browser.input.files.length}`
-  ctx.conveyorTab.setAttribute('aria-selected', String(!inputView))
-  ctx.inputTab.setAttribute('aria-selected', String(inputView))
-  ctx.list.setAttribute('aria-labelledby', inputView ? ctx.inputTab.id : ctx.conveyorTab.id)
+  renderTabs(ctx)
   if (document.activeElement !== ctx.searchInput) ctx.searchInput.value = browser.query
   ctx.sizeSelect.value = browser.size
   ctx.conveyorFilter.hidden = inputView
-  ctx.folderSelect.hidden = !inputView
+  ctx.folderSelect.hidden = !inputRootView
   ctx.conveyorSort.hidden = inputView
   ctx.inputSort.hidden = !inputView
   ctx.applySortBtn.hidden = inputView
-  ctx.refreshBtn.hidden = !inputView
+  ctx.refreshBtn.hidden = !inputRootView
   ctx.addSelectedInputBtn.hidden = !inputView
   ctx.conveyorFilter.value = ctx.browser.conveyor.filter
-  ctx.folderSelect.value = ctx.browser.input.folder
+  if (inputRootView) ctx.folderSelect.value = ctx.browser.input.folder
   ctx.conveyorSort.value = ctx.browser.conveyor.sort
-  ctx.inputSort.value = ctx.browser.input.sort
-  ctx.summary.textContent = inputView
+  if (inputView) ctx.inputSort.value = browser.sort
+  const source = folderView ? ctx.browser.folderSources.get(browser.sourceId) : null
+  const folderLabel = folderView
+    ? (browser.folderPath ? `${source?.name || 'Folder'}/${browser.folderPath}` : source?.name || 'Folder')
+    : ''
+  ctx.summary.textContent = inputRootView
     ? `${ctx.visibleItems.length} shown · ${ctx.browser.input.files.length} images${ctx.browser.input.loading ? ' · refreshing…' : ''}${ctx.browser.input.error ? ` · ${ctx.browser.input.error}` : ''}`
-    : `${state.items.length} total · ${pending} pending · ${queued} queued · ${processed} processed`
+    : folderView
+      ? `${folderLabel} · ${ctx.visibleItems.length} item${ctx.visibleItems.length === 1 ? '' : 's'}${browser.error ? ` · ${browser.error}` : ''}`
+      : `${state.items.length} total · ${pending} pending · ${queued} queued · ${processed} processed`
   const focusedIndex = browser.focusedId
-    ? ctx.visibleItems.findIndex((item) => (inputView ? item.relative_path : item.id) === browser.focusedId)
+    ? ctx.visibleItems.findIndex((item) => getViewItemId(ctx, item) === browser.focusedId)
     : -1
   const position = focusedIndex >= 0 ? `${focusedIndex + 1} of ${ctx.visibleItems.length}` : ''
   ctx.nextText.textContent = inputView
@@ -2081,8 +2443,10 @@ function renderGalleryNode(node) {
     if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) ctx.pendingScrollRestore = null
     if (ctx.list.scrollTop) ctx.list.scrollTop = 0
     if (!ctx.empty) { ctx.empty = document.createElement('div'); ctx.empty.className = 'bil-empty' }
-    ctx.empty.textContent = inputView
+    ctx.empty.textContent = inputRootView
       ? (ctx.browser.input.loading ? 'Loading the ComfyUI input folder…' : 'No images match this input-folder view.')
+      : folderView
+        ? 'No images or subfolders match this folder view.'
       : 'Drop images or folders here, click Add images, or browse the Input Folder tab.'
     if (ctx.empty.parentElement !== ctx.listWindow) ctx.listWindow.appendChild(ctx.empty)
   } else {
@@ -2141,27 +2505,60 @@ function addInputEntries(node, entries) {
   updateState(node, state, uiState)
 }
 
-function addSelectedInputEntries(node) {
+async function addLibraryEntries(node, entries) {
+  const localEntries = entries.filter((entry) => entry?.kind === 'local-image' && entry.localFile)
+  const inputEntries = entries.filter((entry) => entry?.kind !== 'folder' && entry?.kind !== 'local-image')
+  if (inputEntries.length) addInputEntries(node, inputEntries)
+  if (localEntries.length) {
+    const uploadEntries = localEntries.map((entry) => ({
+      file: entry.localFile,
+      relativeSubfolder: entry.relativeSubfolder
+    }))
+    const feedbackView = node.__bil?.browser.activeView
+    try {
+      await uploadViaNode(node, uploadEntries, { feedbackView })
+    } catch (error) {
+      const ctx = node.__bil
+      const browser = ctx ? browserForView(ctx, feedbackView) : null
+      if (browser) {
+        browser.error = error?.message || 'Import failed'
+        scheduleRenderNode(node)
+      }
+      console.error('Image Conveyor: folder-tab import failed.', error)
+    }
+  }
+}
+
+async function addSelectedLibraryEntries(node) {
   const ctx = node.__bil
-  const selected = ctx.browser.input.selected
-  addInputEntries(node, ctx.browser.input.files.filter((entry) => selected.has(entry.relative_path)))
+  if (!ctx || !isLibraryView(ctx)) return
+  const browser = activeBrowser(ctx)
+  const selected = browser.selected
+  const entries = (ctx.browser.activeView === 'input' ? browser.files : browser.entries)
+    .filter((entry) => entry.kind !== 'folder' && selected.has(getViewItemId(ctx, entry)))
+  await addLibraryEntries(node, entries)
 }
 
 function switchBrowserView(node, view) {
   const ctx = node.__bil
   if (!ctx || ctx.browser.activeView === view) return
+  const destination = ctx.browser[view] ?? ctx.browser.folderViews.get(view)
+  if (!destination) return
+  const savedScrollTops = Object.fromEntries(ctx.browser.tabOrder.map((viewId) => {
+    const browser = ctx.browser[viewId] ?? ctx.browser.folderViews.get(viewId)
+    return [viewId, browser?.scrollTop || 0]
+  }))
   const plan = planViewScrollSwitch(
     ctx.browser.activeView,
     view,
     ctx.list.scrollTop,
-    {
-      conveyor: ctx.browser.conveyor.scrollTop,
-      input: ctx.browser.input.scrollTop
-    },
+    savedScrollTops,
     ctx.pendingScrollRestore?.view ?? null
   )
-  ctx.browser.conveyor.scrollTop = plan.positions.conveyor
-  ctx.browser.input.scrollTop = plan.positions.input
+  for (const [viewId, scrollTop] of Object.entries(plan.positions)) {
+    const browser = ctx.browser[viewId] ?? ctx.browser.folderViews.get(viewId)
+    if (browser) browser.scrollTop = scrollTop
+  }
   ctx.browser.activeView = view
   ctx.pendingScrollRestore = plan.restore
   ctx.renderedRangeKey = ''
@@ -2190,7 +2587,7 @@ function handleGalleryKeyDown(node, event) {
   const items = ctx.visibleItems || []
   if (!items.length) return
   const browser = activeBrowser(ctx)
-  const itemId = (item) => ctx.browser.activeView === 'input' ? item.relative_path : item.id
+  const itemId = (item) => getViewItemId(ctx, item)
   let index = items.findIndex((item) => itemId(item) === browser.focusedId)
   if (index < 0) index = 0
   const metrics = getGalleryMetrics(ctx)
@@ -2205,9 +2602,14 @@ function handleGalleryKeyDown(node, event) {
     case 'End': next = items.length - 1; break
     case 'PageUp': next -= page; break
     case 'PageDown': next += page; break
-    case 'Enter': event.preventDefault(); openPreview(node, items[index]); return
+    case 'Enter':
+      event.preventDefault()
+      if (items[index].kind === 'folder') openFolderView(node, items[index].sourceId, items[index].folderPath)
+      else openPreview(node, items[index])
+      return
     case ' ': {
       event.preventDefault()
+      if (items[index].kind === 'folder') return
       const id = itemId(items[index]); const selected = getViewSelectedIds(node)
       setItemSelected(node, id, !selected.has(id), event); return
     }
@@ -2232,6 +2634,12 @@ function buildGalleryDom(node) {
   fileInput.accept = 'image/*,.png,.jpg,.jpeg,.webp,.bmp,.gif,.tif,.tiff,.avif'
   fileInput.multiple = true
   fileInput.hidden = true
+  const folderInput = document.createElement('input')
+  folderInput.type = 'file'
+  folderInput.multiple = true
+  folderInput.hidden = true
+  folderInput.setAttribute('webkitdirectory', '')
+  folderInput.setAttribute('directory', '')
 
   const header = document.createElement('div')
   header.className = 'bil-header'
@@ -2245,10 +2653,15 @@ function buildGalleryDom(node) {
   const tabSetId = makeId()
   conveyorTab.id = `${tabSetId}-conveyor-tab`
   inputTab.id = `${tabSetId}-input-tab`
+  conveyorTab.title = 'Conveyor'
+  inputTab.title = 'ComfyUI Input Folder'
   tabs.append(conveyorTab, inputTab)
   const addImagesBtn = document.createElement('button')
   addImagesBtn.className = 'bil-btn bil-add-btn'; addImagesBtn.type = 'button'; addImagesBtn.textContent = '+ Add images'
-  header.append(tabs, addImagesBtn)
+  const addFoldersBtn = document.createElement('button')
+  addFoldersBtn.className = 'bil-btn bil-add-btn'; addFoldersBtn.type = 'button'; addFoldersBtn.textContent = '+ Add folders'
+  addFoldersBtn.title = 'Browse folders as tabs without importing their images'
+  header.append(tabs)
 
   const browserbar = document.createElement('div')
   browserbar.className = 'bil-browserbar'
@@ -2287,7 +2700,7 @@ function buildGalleryDom(node) {
   refreshBtn.className = 'bil-btn'; refreshBtn.type = 'button'; refreshBtn.textContent = 'Refresh'; refreshBtn.hidden = true
   const addSelectedInputBtn = document.createElement('button')
   addSelectedInputBtn.className = 'bil-btn'; addSelectedInputBtn.type = 'button'; addSelectedInputBtn.textContent = 'Add selected'; addSelectedInputBtn.hidden = true
-  secondary.append(applySortBtn, refreshBtn, addSelectedInputBtn)
+  secondary.append(applySortBtn, addImagesBtn, addFoldersBtn, refreshBtn, addSelectedInputBtn)
 
   const summaryRow = document.createElement('div')
   summaryRow.className = 'bil-summary'
@@ -2337,10 +2750,11 @@ function buildGalleryDom(node) {
   const listInner = document.createElement('div'); listInner.className = 'bil-list-inner'
   const listWindow = document.createElement('div'); listWindow.className = 'bil-list-window'
   listInner.appendChild(listWindow); list.appendChild(listInner)
-  root.append(fileInput, header, browserbar, secondary, summaryRow, contextBar, settings, list)
+  root.append(fileInput, folderInput, header, browserbar, secondary, summaryRow, contextBar, settings, list)
 
   node.__bil = {
-    root, dropzone: addImagesBtn, addImagesBtn, fileInput, conveyorTab, inputTab,
+    root, tabs, tabSetId, dropzone: addImagesBtn, addImagesBtn, addFoldersBtn, fileInput, folderInput,
+    conveyorTab, inputTab, folderTabElements: new Map(),
     searchInput, conveyorFilter, folderSelect, conveyorSort, inputSort, sizeSelect,
     applySortBtn, refreshBtn, addSelectedInputBtn, summary, nextText, contextBar,
     contextLabel, setPendingBtn, setProcessedBtn, deleteSelectedBtn, contextAddBtn,
@@ -2363,7 +2777,7 @@ function buildGalleryDom(node) {
     uploadDepth: 0, dropzoneLabel: '', duplicateCleanupBusy: false,
     clearExternalDragState: null,
     queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map(),
-    thumbnailUrlCache: new WeakMap()
+    thumbnailUrlCache: new WeakMap(), localObjectUrls: new Map(), activePickerInput: null
   }
   const ctx = node.__bil
   ctx.lightbox = createLightbox(node)
@@ -2378,14 +2792,16 @@ function buildGalleryDom(node) {
   }
   const restoreFocusAfterFilePicker = () => {
     if (!ctx.filePickerPending || ctx.removed) return
+    const pickerInput = ctx.activePickerInput
     ctx.filePickerPending = false
+    ctx.activePickerInput = null
     clearTimeout(ctx.filePickerFocusTimer)
     ctx.filePickerFocusTimer = 0
     if (ctx.filePickerFocusFrame) cancelAnimationFrame(ctx.filePickerFocusFrame)
     ctx.filePickerFocusFrame = requestAnimationFrame(() => {
       ctx.filePickerFocusFrame = 0
       if (ctx.removed) return
-      restoreCanvasFocusAfterFilePicker(fileInput, app.canvas?.canvas)
+      restoreCanvasFocusAfterFilePicker(pickerInput, app.canvas?.canvas)
     })
   }
   const schedulePickerFocusRestore = () => {
@@ -2393,15 +2809,19 @@ function buildGalleryDom(node) {
     clearTimeout(ctx.filePickerFocusTimer)
     ctx.filePickerFocusTimer = setTimeout(restoreFocusAfterFilePicker, 0)
   }
-  addImagesBtn.addEventListener('click', () => {
+  const openPicker = (pickerInput) => {
     ctx.filePickerPending = true
+    ctx.activePickerInput = pickerInput
     try {
-      fileInput.click()
+      pickerInput.click()
     } catch (error) {
       ctx.filePickerPending = false
+      ctx.activePickerInput = null
       throw error
     }
-  })
+  }
+  addImagesBtn.addEventListener('click', () => openPicker(fileInput))
+  addFoldersBtn.addEventListener('click', () => openPicker(folderInput))
   fileInput.addEventListener('change', () => {
     const files = fileInput.files
     restoreFocusAfterFilePicker()
@@ -2409,13 +2829,24 @@ function buildGalleryDom(node) {
     fileInput.value = ''
   })
   fileInput.addEventListener('cancel', restoreFocusAfterFilePicker)
+  folderInput.addEventListener('change', () => {
+    const sources = makePickerFolderSources(folderInput.files)
+    restoreFocusAfterFilePicker()
+    folderInput.value = ''
+    if (!sources.length) {
+      window.alert('No browsable folder was selected. Choose a folder containing files, or drag folders onto the tab bar.')
+      return
+    }
+    addFolderSources(node, sources)
+  })
+  folderInput.addEventListener('cancel', restoreFocusAfterFilePicker)
   ctx.windowFocusHandler = schedulePickerFocusRestore
   window.addEventListener('focus', ctx.windowFocusHandler)
   conveyorTab.addEventListener('click', () => switchBrowserView(node, 'conveyor'))
   inputTab.addEventListener('click', () => switchBrowserView(node, 'input'))
   refreshBtn.addEventListener('click', () => void refreshInputFiles(node, { force: true }))
-  addSelectedInputBtn.addEventListener('click', () => addSelectedInputEntries(node))
-  contextAddBtn.addEventListener('click', () => addSelectedInputEntries(node))
+  addSelectedInputBtn.addEventListener('click', () => void addSelectedLibraryEntries(node))
+  contextAddBtn.addEventListener('click', () => void addSelectedLibraryEntries(node))
   cleanDuplicatesBtn.addEventListener('click', () => void cleanManagedDuplicates(node))
 
   searchInput.addEventListener('input', () => {
@@ -2423,27 +2854,29 @@ function buildGalleryDom(node) {
     const targetView = ctx.browser.activeView
     const query = searchInput.value
     ctx.searchTimer = setTimeout(() => {
-      ctx.browser[targetView].query = query
-      ctx.browser[targetView].scrollTop = 0
+      const targetBrowser = browserForView(ctx, targetView)
+      if (!targetBrowser) return
+      targetBrowser.query = query
+      targetBrowser.scrollTop = 0
       if (ctx.browser.activeView === targetView) list.scrollTop = 0
       scheduleRenderNode(node)
     }, 70)
   })
   conveyorFilter.addEventListener('change', () => { ctx.browser.conveyor.filter = conveyorFilter.value; list.scrollTop = 0; scheduleRenderNode(node) })
   folderSelect.addEventListener('change', () => { ctx.browser.input.folder = folderSelect.value; list.scrollTop = 0; scheduleRenderNode(node) })
-  inputSort.addEventListener('change', () => { ctx.browser.input.sort = inputSort.value; scheduleRenderNode(node) })
+  inputSort.addEventListener('change', () => { if (isLibraryView(ctx)) activeBrowser(ctx).sort = inputSort.value; scheduleRenderNode(node) })
   conveyorSort.addEventListener('change', () => { ctx.browser.conveyor.sort = conveyorSort.value })
   sizeSelect.addEventListener('change', () => {
     const items = ctx.visibleItems || []
     const previous = getGalleryMetrics(ctx)
     const anchorIndex = Math.min(items.length - 1, Math.max(0, Math.floor(list.scrollTop / previous.rowStride) * previous.columns))
-    const anchorId = items[anchorIndex] ? (ctx.browser.activeView === 'input' ? items[anchorIndex].relative_path : items[anchorIndex].id) : null
+    const anchorId = items[anchorIndex] ? getViewItemId(ctx, items[anchorIndex]) : null
     activeBrowser(ctx).size = sizeSelect.value
     ctx.renderedRangeKey = ''
     scheduleRenderNode(node, { forceVisibleRows: true })
     requestAnimationFrame(() => {
       if (!anchorId || !node.__bil) return
-      const newIndex = (ctx.visibleItems || []).findIndex((item) => (ctx.browser.activeView === 'input' ? item.relative_path : item.id) === anchorId)
+      const newIndex = (ctx.visibleItems || []).findIndex((item) => getViewItemId(ctx, item) === anchorId)
       if (newIndex >= 0) { const metrics = getGalleryMetrics(ctx); list.scrollTop = Math.floor(newIndex / metrics.columns) * metrics.rowStride }
     })
   })
@@ -2476,15 +2909,18 @@ function buildGalleryDom(node) {
     updateState(node, state, uiState)
   })
   clearSelectionBtn.addEventListener('click', () => {
-    if (ctx.browser.activeView === 'input') {
-      ctx.browser.input.selected.clear(); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    if (isLibraryView(ctx)) {
+      activeBrowser(ctx).selected.clear(); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
     } else {
       ctx.browser.conveyor.selected.clear(); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
     }
   })
   selectVisibleBtn.addEventListener('click', () => {
-    if (ctx.browser.activeView === 'input') {
-      ctx.browser.input.selected = new Set(ctx.browser.input.files.map((item) => item.relative_path)); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    if (isLibraryView(ctx)) {
+      const browser = activeBrowser(ctx)
+      const entries = ctx.browser.activeView === 'input' ? browser.files : browser.entries
+      browser.selected = new Set(entries.filter((item) => item.kind !== 'folder').map((item) => getViewItemId(ctx, item)))
+      renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
     } else {
       const { state } = getRenderableState(node); ctx.browser.conveyor.selected = new Set(state.items.map((item) => item.id)); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
     }
@@ -2551,14 +2987,14 @@ function buildGalleryDom(node) {
         ? Math.min(items.length - 1, Math.max(0, Math.floor(list.scrollTop / previous.rowStride) * previous.columns))
         : -1
       const anchorId = anchorIndex >= 0
-        ? (ctx.browser.activeView === 'input' ? items[anchorIndex].relative_path : items[anchorIndex].id)
+        ? getViewItemId(ctx, items[anchorIndex])
         : null
       ctx.renderedRangeKey = ''
       scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
       if (anchorId && previous && previous.width !== Math.floor(list.clientWidth || 0)) {
         requestAnimationFrame(() => {
           if (ctx.removed) return
-          const index = (ctx.visibleItems || []).findIndex((item) => (ctx.browser.activeView === 'input' ? item.relative_path : item.id) === anchorId)
+          const index = (ctx.visibleItems || []).findIndex((item) => getViewItemId(ctx, item) === anchorId)
           if (index >= 0) {
             const metrics = getGalleryMetrics(ctx)
             list.scrollTop = Math.floor(index / metrics.columns) * metrics.rowStride
@@ -2599,15 +3035,29 @@ function buildGalleryDom(node) {
   document.addEventListener('paste', ctx.documentPasteHandler, true)
 
   let externalDragDepth = 0
-  const setDragActive = (active) => { root.classList.toggle('bil-dragover', active); if (!active) clearCardDragTargets(ctx) }
+  const isFolderTabDropTarget = (target) => target instanceof Node && tabs.contains(target)
+  const setDragActive = (active, folderReady = false, folderHover = false) => {
+    root.classList.toggle('bil-dragover', active)
+    tabs.classList.toggle('bil-folder-drop-ready', active && folderReady)
+    tabs.classList.toggle('bil-folder-drop-hover', active && folderReady && folderHover)
+    if (!active) clearCardDragTargets(ctx)
+  }
   const clearExternalDragState = () => { externalDragDepth = 0; setDragActive(false) }
   ctx.clearExternalDragState = clearExternalDragState
-  root.addEventListener('dragenter', (event) => { if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return; externalDragDepth += 1; setDragActive(true) }, true)
-  root.addEventListener('dragover', (event) => { if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return; setDragActive(true) }, true)
+  root.addEventListener('dragenter', (event) => { if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return; externalDragDepth += 1; const folderReady = hasExternalDirectoryDrag(event); setDragActive(true, folderReady, isFolderTabDropTarget(event.target)) }, true)
+  root.addEventListener('dragover', (event) => { if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return; const folderReady = hasExternalDirectoryDrag(event); setDragActive(true, folderReady, isFolderTabDropTarget(event.target)) }, true)
   root.addEventListener('dragleave', (event) => { if (!(externalDragDepth > 0 || hasExternalFileDrag(event))) return; event.preventDefault(); event.stopPropagation(); externalDragDepth = Math.max(0, externalDragDepth - 1); if (!externalDragDepth) setDragActive(false) }, true)
   root.addEventListener('drop', async (event) => {
-    if (!consumeExternalFileDrag(event)) { clearExternalDragState(); return }
-    const files = await getDroppedImageFiles(event); clearExternalDragState(); if (files.length) runUpload(files)
+    if (!hasExternalFileDrag(event)) { clearExternalDragState(); return }
+    const folderTarget = isFolderTabDropTarget(event.target)
+    finalizeExternalFileDrag(event)
+    const pending = folderTarget ? getDroppedFolderSources(event) : getDroppedImageFiles(event)
+    clearExternalDragState()
+    const entries = await pending
+    if (folderTarget) {
+      if (entries.length) addFolderSources(node, entries)
+      else window.alert('Drop one or more folders onto the tab bar. Image files dropped there are not added to the Conveyor.')
+    } else if (entries.length) runUpload(entries)
   }, true)
   root.addEventListener('dragend', clearExternalDragState, true)
 
@@ -2622,9 +3072,10 @@ function buildGalleryDom(node) {
  *
  * @param {object} node - The ComfyUI node instance that hosts the batch image loader widget.
  * @param {FileList|File[]|Array<{file: File, relativeSubfolder?: string}>} files - Files or normalized file entries to upload.
+ * @param {{feedbackView?: string}} [options] - Browser view that receives import errors.
  * @returns {boolean} `true` if one or more files were uploaded and applied to the node state, `false` if the node widget context is missing or no valid image files were provided.
  */
-async function uploadViaNode(node, files) {
+async function uploadViaNode(node, files, { feedbackView = 'input' } = {}) {
   const ctx = node.__bil
   if (!ctx) return false
   const validFiles = normalizeUploadFiles(files)
@@ -2672,11 +3123,12 @@ async function uploadViaNode(node, files) {
       ctx.inputVersion += 1
       updateFolderOptions(ctx)
     }
-    if (uploaded.length && !errors.length) ctx.browser.input.error = ''
+    const feedbackBrowser = browserForView(ctx, feedbackView) ?? ctx.browser.input
+    if (uploaded.length && !errors.length) feedbackBrowser.error = ''
     if (uploaded.length) updateState(node, state, uiState)
     if (errors.length) {
       const firstFailure = errors[0].error.message
-      ctx.browser.input.error = errors.length === 1
+      feedbackBrowser.error = errors.length === 1
         ? firstFailure
         : `${errors.length} images failed to import. First error: ${firstFailure}`
       console.error('Image Conveyor: some images failed to import.', ...errors.map(({ error }) => error))
@@ -2810,6 +3262,7 @@ function initializeNode(node, widget) {
       ctx.windowFocusHandler = null
     }
     ctx.filePickerPending = false
+    ctx.activePickerInput = null
     clearTimeout(ctx.filePickerFocusTimer)
     ctx.filePickerFocusTimer = 0
     if (ctx.filePickerFocusFrame) cancelAnimationFrame(ctx.filePickerFocusFrame)
@@ -2827,6 +3280,11 @@ function initializeNode(node, widget) {
     for (const slot of ctx.cardPool) resetCardThumbnail(slot)
     ctx.cardPool.length = 0
     ctx.thumbnailUrlCache = new WeakMap()
+    for (const entry of ctx.localObjectUrls.values()) URL.revokeObjectURL(entry.url)
+    ctx.localObjectUrls.clear()
+    ctx.browser.folderViews.clear()
+    ctx.browser.folderSources.clear()
+    ctx.folderTabElements.clear()
     if (!ctx.renderFrame) return
     cancelAnimationFrame(ctx.renderFrame)
     ctx.renderFrame = 0

@@ -116,6 +116,51 @@ export function planViewScrollSwitch(
   }
 }
 
+export function chooseViewAfterClose(tabOrder, activeView, closingView, fallbackView = 'input') {
+  const order = Array.isArray(tabOrder) ? tabOrder : []
+  if (activeView !== closingView) return activeView
+  const index = order.indexOf(closingView)
+  if (index < 0) return fallbackView
+  return order[index + 1] ?? order[index - 1] ?? fallbackView
+}
+
+function normalizePickerRelativePath(value) {
+  const parts = String(value ?? '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .map((part) => part.trim())
+    .filter((part) => part && part !== '.')
+  if (parts.length < 2 || parts.some((part) => part === '..')) return null
+  return parts
+}
+
+export function groupDirectoryPickerFiles(files, isSupportedFile = () => true) {
+  const groups = new Map()
+  for (const file of Array.from(files ?? [])) {
+    const parts = normalizePickerRelativePath(file?.webkitRelativePath)
+    if (!parts) continue
+    const rootName = parts[0]
+    let group = groups.get(rootName)
+    if (!group) {
+      group = { name: rootName, files: [], directories: new Set(['']) }
+      groups.set(rootName, group)
+    }
+    for (let index = 1; index < parts.length - 1; index += 1) {
+      group.directories.add(parts.slice(1, index + 1).join('/'))
+    }
+    if (!isSupportedFile(file)) continue
+    group.files.push({
+      file,
+      relativePath: parts.slice(1).join('/')
+    })
+  }
+  return Array.from(groups.values()).map((group) => ({
+    name: group.name,
+    files: group.files,
+    directories: Array.from(group.directories)
+  }))
+}
+
 export function isDragLeavingDocument(event, documentElement) {
   if (!documentElement) return false
 

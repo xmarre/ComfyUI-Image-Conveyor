@@ -4,12 +4,27 @@ A sequential, visual image queue for ComfyUI with an integrated input-folder bro
 
 ## What it does
 
-Image Conveyor keeps a visible queue inside the graph and loads one image per prompt execution. The node has two independent browser tabs:
+Image Conveyor keeps a visible queue inside the graph and loads one image per prompt execution. The node starts with two permanent browser tabs:
 
 - **Conveyor** is the ordered execution queue. Items retain their pending, queued, and processed states.
 - **Input Folder** browses the current ComfyUI `input/` directory recursively and adds existing images to the queue without uploading, copying, renaming, or serializing the folder listing into the workflow.
 
-Both tabs use a responsive, thumbnail-first gallery. Each tab remembers its own search, filter, sort, selection, keyboard focus, thumbnail size, and scroll position while the node is open.
+Selected local folders can be opened as additional, removable tabs. Every tab uses the responsive, thumbnail-first gallery and remembers its own search, filter, sort, selection, keyboard focus, thumbnail size, and scroll position while the node is open.
+
+## Browsing local folders as tabs
+
+**Add folders** opens local folders as browser tabs without importing their images. You can also drag one or more folders onto the tab strip. Nested directories appear as folder cards; clicking one opens that directory in another tab.
+
+Folder tabs compress automatically as the strip fills. A close button appears only on the currently selected removable tab, keeping compressed inactive tabs safe to select. **Conveyor** and **Input Folder** cannot be closed.
+
+The tab strip and main gallery are separate drop targets:
+
+- dropping folders on the tab strip opens them for browsing;
+- dropping the same folders elsewhere on the node keeps the established behavior and imports their supported images into the Conveyor recursively.
+
+The directory picker requests multiple folders and accepts every top-level folder returned by the browser. Some Chromium/platform picker combinations allow only one directory per dialog; use **Add folders** again or multi-folder drag/drop in that case.
+
+Local folder access is runtime-only. The folder contents and tabs are not serialized into the workflow and must be selected again after reloading the page. Closing the last tab belonging to a selected folder releases its browser file references and cached preview URLs. Adding a local image or selection to the Conveyor sends those files through the normal input upload and exact-deduplication pipeline.
 
 ## Adding images
 
@@ -20,9 +35,10 @@ Images can be added through:
 - recursive folder drag/drop with relative folders preserved;
 - image paste while the node is focused or hovered;
 - optional canvas-wide drop capture;
-- **Add** / **Add selected** from the Input Folder tab.
+- **Add** / **Add selected** from the Input Folder tab;
+- **Add** / **Add selected** from a local folder tab.
 
-The first four paths import an external file into ComfyUI input storage. Individual files are stored directly in the input root; dropped folders preserve their own input-relative directory structure. The Input Folder path creates a queue reference to a file that already exists there.
+Picker, drop, paste, canvas-capture, and local-folder-tab additions import external files into ComfyUI input storage. Individual files are stored directly in the input root; dropped or selected folders preserve their own input-relative directory structure. The Input Folder path creates a queue reference to a file that already exists there.
 
 ## Exact duplicate resolution
 
@@ -48,6 +64,7 @@ The main browser provides:
 - filename/path search;
 - pending, queued, and processed Conveyor filters;
 - recursive folder filtering in Input Folder;
+- clickable nested-directory cards in local folder tabs;
 - name/date sorting;
 - visible multi-selection and contextual bulk actions;
 - a larger full-resolution preview on double-click or Enter;
@@ -61,10 +78,11 @@ Search and filters change the browser presentation only. Applying a Conveyor sor
 
 - The gallery is virtualized by logical rows. Its live card count tracks the viewport plus a small overscan, rather than the total collection size.
 - Only visible and near-visible cards request cached, bounded WebP thumbnails. Full-resolution images load only for explicit preview.
+- Local folder tabs create browser object URLs lazily for visible cards, cap the URL cache, and defer new decodes during high-speed scrolling.
 - Input Folder enumeration and the one-per-import-batch reconciliation use lightweight `os.scandir()` metadata in a worker thread and a short-lived snapshot cache.
-- Folder browsing performs no content hashing and no filesystem writes.
+- Opening and navigating a local folder tab performs no upload, content hashing, or server-side filesystem write.
 - Tab changes, scrolling, searching, filtering, focus, and thumbnail-size changes do not serialize `state_json`.
-- The Input Folder dataset is runtime-only and never enlarges workflow JSON.
+- Input Folder and local-folder browsing datasets are runtime-only and never enlarge workflow JSON.
 - Queue mutations still commit the compatible version-1 queue schema.
 
 The backend exposes input-only routes for recursive listing, exact upload resolution, managed duplicate cleanup, and thumbnails. Relative paths are containment-checked against ComfyUI's actual input directory; traversal, absolute paths, and symlink escapes are rejected.
@@ -147,4 +165,4 @@ node --test tests/test_gallery_math.mjs
 node --check web/image_conveyor.js
 ```
 
-The Python suite covers duplicate resolution, stale metadata, canonical selection, managed duplicate cleanup and revalidation, concurrent uploads, index recovery, recursive listing, thumbnails, path containment, and queue compatibility. The JavaScript tests verify responsive gallery geometry, drag lifecycle behavior, tab scroll restoration, high-speed card reuse, and bounded virtualization for a 10,000-item collection.
+The Python suite covers duplicate resolution, stale metadata, canonical selection, managed duplicate cleanup and revalidation, concurrent uploads, index recovery, recursive listing, thumbnails, path containment, and queue compatibility. The JavaScript tests verify responsive gallery geometry, drag lifecycle behavior, fixed and removable tab state, directory-picker grouping, high-speed card reuse, and bounded virtualization for a 10,000-item collection.

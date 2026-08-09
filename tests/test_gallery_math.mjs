@@ -3,6 +3,8 @@ import test from 'node:test'
 import {
   calculateGalleryMetrics,
   calculateVisibleCardRange,
+  chooseViewAfterClose,
+  groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
   planCardSlotReuse,
@@ -106,6 +108,42 @@ test('rapid tab switches do not replace an unrendered destination position', () 
   )
   assert.equal(switchedBack.positions.input, 317_250)
   assert.deepEqual(switchedBack.restore, { view: 'conveyor', scrollTop: 42_500 })
+})
+
+test('dynamic folder tabs retain independent scroll positions', () => {
+  const folderView = 'folder:source:nested'
+  const switched = planViewScrollSwitch(
+    'input',
+    folderView,
+    12_000,
+    { conveyor: 900, input: 1_000, [folderView]: 88_000 }
+  )
+  assert.equal(switched.positions.input, 12_000)
+  assert.equal(switched.positions[folderView], 88_000)
+  assert.deepEqual(switched.restore, { view: folderView, scrollTop: 88_000 })
+})
+
+test('closing a folder tab chooses the adjacent tab only when it was active', () => {
+  const order = ['conveyor', 'input', 'folder-a', 'folder-b']
+  assert.equal(chooseViewAfterClose(order, 'folder-a', 'folder-a'), 'folder-b')
+  assert.equal(chooseViewAfterClose(order, 'folder-b', 'folder-b'), 'folder-a')
+  assert.equal(chooseViewAfterClose(order, 'input', 'folder-a'), 'input')
+  assert.equal(chooseViewAfterClose(['conveyor', 'folder-a'], 'folder-a', 'folder-a'), 'conveyor')
+})
+
+test('directory picker files become independent nested folder sources', () => {
+  const files = [
+    { name: 'one.png', webkitRelativePath: 'First/one.png' },
+    { name: 'two.jpg', webkitRelativePath: 'First/Nested/two.jpg' },
+    { name: 'notes.txt', webkitRelativePath: 'First/Nested/Deep/notes.txt' },
+    { name: 'three.webp', webkitRelativePath: 'Second/three.webp' },
+    { name: 'loose.png', webkitRelativePath: '' }
+  ]
+  const groups = groupDirectoryPickerFiles(files, (file) => /\.(png|jpg|webp)$/.test(file.name))
+  assert.deepEqual(groups.map((group) => group.name), ['First', 'Second'])
+  assert.deepEqual(groups[0].files.map((entry) => entry.relativePath), ['one.png', 'Nested/two.jpg'])
+  assert.deepEqual(groups[0].directories, ['', 'Nested', 'Nested/Deep'])
+  assert.deepEqual(groups[1].files.map((entry) => entry.relativePath), ['three.webp'])
 })
 
 test('external drag exit distinguishes viewport exits from child transitions', () => {
