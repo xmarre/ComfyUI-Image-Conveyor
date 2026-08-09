@@ -1195,8 +1195,8 @@ function ensureStyles() {
     .bil-card.bil-selected { border-color: rgba(110,175,255,.95); box-shadow: inset 0 0 0 1px rgba(110,175,255,.34); background: rgba(80,145,225,.11); }
     .bil-card.bil-focused { outline: 2px solid rgba(150,200,255,.95); outline-offset: -3px; }
     .bil-card.bil-drag-target { outline: 2px dashed rgba(120,185,255,.95); outline-offset: -4px; }
-    .bil-media { position: relative; flex: 1 1 auto; min-height: 0; background: rgba(255,255,255,.045); cursor: pointer; }
-    .bil-thumb { width: 100%; height: 100%; display: block; object-fit: contain; background: repeating-conic-gradient(rgba(255,255,255,.035) 0 25%, transparent 0 50%) 50% / 14px 14px; }
+    .bil-media { position: relative; flex: 1 1 auto; min-height: 0; background: transparent; cursor: pointer; }
+    .bil-thumb { width: 100%; height: 100%; display: block; object-fit: contain; background: transparent; }
     .bil-thumb-error { opacity: .32; filter: grayscale(1); outline: 1px dashed rgba(255,110,110,.78); outline-offset: -2px; }
     .bil-card-overlay { position: absolute; inset: 6px 6px auto 6px; display: flex; align-items: flex-start; justify-content: space-between; gap: 4px; pointer-events: none; }
     .bil-card-check { pointer-events: auto; width: 17px; height: 17px; margin: 0; accent-color: #6aaef7; }
