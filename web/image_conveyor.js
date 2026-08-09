@@ -5,6 +5,7 @@ import {
   CARD_FOOTER_HEIGHT,
   calculateGalleryMetrics,
   calculateVisibleCardRange,
+  forwardWorkflowSaveShortcut,
   isDragLeavingDocument,
   isHighVelocityScroll,
   planCardSlotReuse,
@@ -2184,7 +2185,7 @@ function isTextControl(target) {
 
 function handleGalleryKeyDown(node, event) {
   const ctx = node.__bil
-  if (!ctx || isTextControl(event.target)) return
+  if (!ctx || forwardWorkflowSaveShortcut(event, app.canvas?.canvas) || isTextControl(event.target)) return
   if (event.key === 'Escape' && !ctx.lightbox.root.hidden) { event.preventDefault(); ctx.lightbox.hide(); return }
   const items = ctx.visibleItems || []
   if (!items.length) return

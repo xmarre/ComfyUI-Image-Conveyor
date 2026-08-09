@@ -3,11 +3,13 @@ import test from 'node:test'
 import {
   calculateGalleryMetrics,
   calculateVisibleCardRange,
+  forwardWorkflowSaveShortcut,
   isDragLeavingDocument,
   isHighVelocityScroll,
   planCardSlotReuse,
   planViewScrollSwitch,
-  prepareManagedDuplicateCleanup
+  prepareManagedDuplicateCleanup,
+  shouldForwardWorkflowSaveShortcut
 } from '../web/image_conveyor_math.mjs'
 
 test('responsive metrics add columns as width grows', () => {
@@ -61,6 +63,47 @@ test('only high-velocity scrolling defers intermediate thumbnail requests', () =
   assert.equal(isHighVelocityScroll(20, 0, 220), false)
   assert.equal(isHighVelocityScroll(240, 16, 220), true)
   assert.equal(isHighVelocityScroll(350, 100, 220), true)
+})
+
+test('workflow save chords are forwarded from the focused gallery', () => {
+  assert.equal(shouldForwardWorkflowSaveShortcut({ key: 's', ctrlKey: true }), true)
+  assert.equal(shouldForwardWorkflowSaveShortcut({ key: 'S', metaKey: true }), true)
+  assert.equal(shouldForwardWorkflowSaveShortcut({ key: 's', ctrlKey: true, shiftKey: true }), true)
+  assert.equal(shouldForwardWorkflowSaveShortcut({ key: 's' }), false)
+  assert.equal(shouldForwardWorkflowSaveShortcut({ key: 's', ctrlKey: true, altKey: true }), false)
+  assert.equal(shouldForwardWorkflowSaveShortcut({ key: 's', ctrlKey: true, isComposing: true }), false)
+  assert.equal(shouldForwardWorkflowSaveShortcut({ key: 's', ctrlKey: true, defaultPrevented: true }), false)
+
+  class FakeKeyboardEvent {
+    constructor(type, init) {
+      this.type = type
+      Object.assign(this, init)
+    }
+  }
+  const source = {
+    key: 's',
+    code: 'KeyS',
+    ctrlKey: true,
+    target: { localName: 'button' },
+    preventDefault() { this.prevented = true },
+    stopPropagation() { this.stopped = true }
+  }
+  let forwarded = null
+  const canvas = {
+    dispatchEvent(event) {
+      forwarded = event
+      return true
+    }
+  }
+  assert.equal(forwardWorkflowSaveShortcut(source, canvas, FakeKeyboardEvent), true)
+  assert.equal(source.prevented, true)
+  assert.equal(source.stopped, true)
+  assert.equal(forwarded.type, 'keydown')
+  assert.equal(forwarded.key, 's')
+  assert.equal(forwarded.code, 'KeyS')
+  assert.equal(forwarded.ctrlKey, true)
+  assert.equal(forwarded.bubbles, true)
+  assert.equal(forwarded.cancelable, true)
 })
 
 test('tab switches preserve independent scroll positions', () => {
