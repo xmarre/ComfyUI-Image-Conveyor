@@ -1557,7 +1557,6 @@ function createCardSlot(node, ctx) {
   thumb.className = 'bil-thumb'
   thumb.loading = 'lazy'
   thumb.decoding = 'async'
-  thumb.fetchPriority = 'low'
   thumb.draggable = false
   const overlay = document.createElement('div')
   overlay.className = 'bil-card-overlay'
@@ -2598,6 +2597,9 @@ function initializeNode(node, widget) {
     ctx.listResizeObserver = null
     ctx.clearExternalDragState?.()
     ctx.clearExternalDragState = null
+    for (const slot of ctx.cardPool) resetCardThumbnail(slot)
+    ctx.cardPool.length = 0
+    ctx.thumbnailUrlCache = new WeakMap()
     if (!ctx.renderFrame) return
     cancelAnimationFrame(ctx.renderFrame)
     ctx.renderFrame = 0
