@@ -87,37 +87,14 @@ export function isHighVelocityScroll(deltaPixels, elapsedMs, rowStride) {
   return distance >= stride * 1.5 || distance / elapsed >= stride / 32
 }
 
-export function shouldForwardWorkflowSaveShortcut(event) {
-  if (!event || event.defaultPrevented || event.isComposing || event.altKey) return false
-  if (!(event.ctrlKey || event.metaKey)) return false
-  return String(event.key ?? '').toLowerCase() === 's'
-}
-
-export function forwardWorkflowSaveShortcut(
-  event,
-  canvas,
-  KeyboardEventConstructor = globalThis.KeyboardEvent
-) {
-  if (!shouldForwardWorkflowSaveShortcut(event)) return false
-  if (!canvas || typeof canvas.dispatchEvent !== 'function') return false
-  if (typeof KeyboardEventConstructor !== 'function') return false
-
-  const forwarded = new KeyboardEventConstructor('keydown', {
-    key: event.key,
-    code: event.code,
-    location: event.location,
-    ctrlKey: event.ctrlKey,
-    shiftKey: event.shiftKey,
-    altKey: event.altKey,
-    metaKey: event.metaKey,
-    repeat: event.repeat,
-    bubbles: true,
-    cancelable: true,
-    composed: true
-  })
-  canvas.dispatchEvent(forwarded)
-  event.preventDefault?.()
-  event.stopPropagation?.()
+export function restoreCanvasFocusAfterFilePicker(fileInput, canvas) {
+  fileInput?.blur?.()
+  if (!canvas || typeof canvas.focus !== 'function') return false
+  try {
+    canvas.focus({ preventScroll: true })
+  } catch {
+    canvas.focus()
+  }
   return true
 }
 

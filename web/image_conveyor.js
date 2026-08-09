@@ -5,12 +5,12 @@ import {
   CARD_FOOTER_HEIGHT,
   calculateGalleryMetrics,
   calculateVisibleCardRange,
-  forwardWorkflowSaveShortcut,
   isDragLeavingDocument,
   isHighVelocityScroll,
   planCardSlotReuse,
   planViewScrollSwitch,
-  prepareManagedDuplicateCleanup
+  prepareManagedDuplicateCleanup,
+  restoreCanvasFocusAfterFilePicker
 } from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
@@ -2185,7 +2185,7 @@ function isTextControl(target) {
 
 function handleGalleryKeyDown(node, event) {
   const ctx = node.__bil
-  if (!ctx || forwardWorkflowSaveShortcut(event, app.canvas?.canvas) || isTextControl(event.target)) return
+  if (!ctx || isTextControl(event.target)) return
   if (event.key === 'Escape' && !ctx.lightbox.root.hidden) { event.preventDefault(); ctx.lightbox.hide(); return }
   const items = ctx.visibleItems || []
   if (!items.length) return
@@ -2356,7 +2356,9 @@ function buildGalleryDom(node) {
     listResizeObserver: null, widgetOuterHeight: 0, widgetInnerHeight: 0, widgetWidth: 0,
     pointerInside: false, middlePanPointerId: null, documentPasteHandler: null,
     documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
-    documentKeyHandler: null, inputAbortController: null, inputRequestId: 0,
+    documentKeyHandler: null, windowFocusHandler: null,
+    filePickerPending: false, filePickerFocusTimer: 0, filePickerFocusFrame: 0,
+    inputAbortController: null, inputRequestId: 0,
     searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
     uploadDepth: 0, dropzoneLabel: '', duplicateCleanupBusy: false,
     clearExternalDragState: null,
@@ -2374,8 +2376,41 @@ function buildGalleryDom(node) {
       scheduleRenderNode(node)
     })
   }
-  addImagesBtn.addEventListener('click', () => fileInput.click())
-  fileInput.addEventListener('change', () => { runUpload(fileInput.files); fileInput.value = '' })
+  const restoreFocusAfterFilePicker = () => {
+    if (!ctx.filePickerPending || ctx.removed) return
+    ctx.filePickerPending = false
+    clearTimeout(ctx.filePickerFocusTimer)
+    ctx.filePickerFocusTimer = 0
+    if (ctx.filePickerFocusFrame) cancelAnimationFrame(ctx.filePickerFocusFrame)
+    ctx.filePickerFocusFrame = requestAnimationFrame(() => {
+      ctx.filePickerFocusFrame = 0
+      if (ctx.removed) return
+      restoreCanvasFocusAfterFilePicker(fileInput, app.canvas?.canvas)
+    })
+  }
+  const schedulePickerFocusRestore = () => {
+    if (!ctx.filePickerPending || ctx.removed) return
+    clearTimeout(ctx.filePickerFocusTimer)
+    ctx.filePickerFocusTimer = setTimeout(restoreFocusAfterFilePicker, 0)
+  }
+  addImagesBtn.addEventListener('click', () => {
+    ctx.filePickerPending = true
+    try {
+      fileInput.click()
+    } catch (error) {
+      ctx.filePickerPending = false
+      throw error
+    }
+  })
+  fileInput.addEventListener('change', () => {
+    const files = fileInput.files
+    restoreFocusAfterFilePicker()
+    runUpload(files)
+    fileInput.value = ''
+  })
+  fileInput.addEventListener('cancel', restoreFocusAfterFilePicker)
+  ctx.windowFocusHandler = schedulePickerFocusRestore
+  window.addEventListener('focus', ctx.windowFocusHandler)
   conveyorTab.addEventListener('click', () => switchBrowserView(node, 'conveyor'))
   inputTab.addEventListener('click', () => switchBrowserView(node, 'input'))
   refreshBtn.addEventListener('click', () => void refreshInputFiles(node, { force: true }))
@@ -2770,6 +2805,15 @@ function initializeNode(node, widget) {
       document.removeEventListener('keydown', ctx.documentKeyHandler, true)
       ctx.documentKeyHandler = null
     }
+    if (ctx.windowFocusHandler) {
+      window.removeEventListener('focus', ctx.windowFocusHandler)
+      ctx.windowFocusHandler = null
+    }
+    ctx.filePickerPending = false
+    clearTimeout(ctx.filePickerFocusTimer)
+    ctx.filePickerFocusTimer = 0
+    if (ctx.filePickerFocusFrame) cancelAnimationFrame(ctx.filePickerFocusFrame)
+    ctx.filePickerFocusFrame = 0
     ctx.inputAbortController?.abort?.()
     ctx.inputAbortController = null
     clearTimeout(ctx.searchTimer)
