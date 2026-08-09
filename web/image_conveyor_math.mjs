@@ -12,6 +12,7 @@ export function calculateGalleryMetrics(width, minimumCardWidth, gap = 10) {
     width: safeWidth,
     columns,
     cardWidth,
+    columnStride: cardWidth + safeGap,
     mediaHeight,
     cardHeight,
     rowStride: cardHeight + safeGap
@@ -96,6 +97,49 @@ export function restoreCanvasFocusAfterFilePicker(fileInput, canvas) {
     canvas.focus()
   }
   return true
+}
+
+export function isWorkflowSaveShortcut(event) {
+  if (!event || event.defaultPrevented || event.altKey || event.shiftKey) return false
+  if (!(event.ctrlKey || event.metaKey)) return false
+  return String(event.key || '').toLowerCase() === 's'
+}
+
+export function calculateMarqueeGridIndexes(totalItems, metrics, bounds) {
+  const count = Math.max(0, Math.floor(Number(totalItems) || 0))
+  if (!count || !metrics || !bounds) return []
+
+  const columns = Math.max(1, Math.floor(Number(metrics.columns) || 1))
+  const cardWidth = Math.max(1, Number(metrics.cardWidth) || 1)
+  const cardHeight = Math.max(1, Number(metrics.cardHeight) || 1)
+  const rowStride = Math.max(cardHeight, Number(metrics.rowStride) || cardHeight)
+  const columnStride = Math.max(cardWidth, Number(metrics.columnStride) || cardWidth)
+  const left = Math.min(Number(bounds.left) || 0, Number(bounds.right) || 0)
+  const right = Math.max(Number(bounds.left) || 0, Number(bounds.right) || 0)
+  const top = Math.min(Number(bounds.top) || 0, Number(bounds.bottom) || 0)
+  const bottom = Math.max(Number(bounds.top) || 0, Number(bounds.bottom) || 0)
+  if (right <= left || bottom <= top) return []
+
+  const rows = Math.ceil(count / columns)
+  const firstRow = Math.max(0, Math.floor(top / rowStride))
+  const lastRow = Math.min(rows - 1, Math.floor(bottom / rowStride))
+  const firstColumn = Math.max(0, Math.floor(left / columnStride))
+  const lastColumn = Math.min(columns - 1, Math.floor(right / columnStride))
+  const indexes = []
+
+  for (let row = firstRow; row <= lastRow; row += 1) {
+    const cardTop = row * rowStride
+    const cardBottom = cardTop + cardHeight
+    if (cardBottom <= top || cardTop >= bottom) continue
+    for (let column = firstColumn; column <= lastColumn; column += 1) {
+      const index = row * columns + column
+      if (index >= count) break
+      const cardLeft = column * columnStride
+      const cardRight = cardLeft + cardWidth
+      if (cardRight > left && cardLeft < right) indexes.push(index)
+    }
+  }
+  return indexes
 }
 
 export function planViewScrollSwitch(

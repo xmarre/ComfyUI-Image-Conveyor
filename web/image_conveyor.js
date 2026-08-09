@@ -3,6 +3,7 @@ import { api } from '../../scripts/api.js'
 import '../../scripts/domWidget.js'
 import {
   CARD_FOOTER_HEIGHT,
+  calculateMarqueeGridIndexes,
   calculateGalleryMetrics,
   calculateVisibleCardRange,
   chooseViewAfterClose,
@@ -12,7 +13,8 @@ import {
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
-  restoreCanvasFocusAfterFilePicker
+  restoreCanvasFocusAfterFilePicker,
+  isWorkflowSaveShortcut
 } from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
@@ -42,6 +44,9 @@ const MIN_NODE_HEIGHT = 760
 const CARD_GAP = 10
 const GALLERY_OVERSCAN_ROWS = 2
 const FAST_SCROLL_SETTLE_MS = 80
+const MARQUEE_DRAG_THRESHOLD = 4
+const MARQUEE_AUTOSCROLL_EDGE = 36
+const MARQUEE_AUTOSCROLL_MAX = 18
 const LOCAL_OBJECT_URL_LIMIT = 512
 const CARD_SIZES = {
   small: { minWidth: 124, thumbnail: 160 },
@@ -695,6 +700,7 @@ const canvasDropCoordinator = {
 
     finalizeExternalFileDrag(event)
     this.clearAllDragTargets()
+    node.__bil?.restoreCanvasShortcutFocus?.()
 
     const files = await getDroppedImageFiles(event)
     if (!files.length) return
@@ -1511,14 +1517,17 @@ function ensureStyles() {
     .bil-tabs.bil-folder-drop-ready { outline: 1px dashed rgba(115,175,250,.75); outline-offset: -2px; }
     .bil-tabs.bil-folder-drop-hover { outline: 2px solid #73aef5; background: rgba(90,155,235,.16); }
     .bil-tabs > .bil-tab, .bil-tab-shell { flex: 1 1 150px; min-width: 24px; max-width: 210px; }
-    .bil-tab-shell { position: relative; display: flex; overflow: hidden; }
+    .bil-tab-shell { position: relative; display: flex; overflow: hidden; container: bil-tab / inline-size; }
     .bil-tab-shell.bil-tab-active { min-width: 54px; }
-    .bil-tab-shell > .bil-tab { width: 100%; min-width: 0; padding-right: 8px; }
-    .bil-tab-shell.bil-tab-active > .bil-tab { padding-right: 25px; }
+    .bil-tab-shell > .bil-tab { width: 100%; min-width: 0; padding-right: 25px; }
     .bil-tab-label { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .bil-tab-close { position: absolute; top: 50%; right: 5px; width: 18px; height: 18px; transform: translateY(-50%); padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; font: 16px/17px system-ui, sans-serif; cursor: pointer; }
     .bil-tab-close:hover { background: rgba(255,255,255,.16); }
     .bil-tab-close[hidden] { display: none; }
+    @container bil-tab (max-width: 74px) {
+      .bil-tab-shell:not(.bil-tab-active) > .bil-tab { padding-right: 8px; }
+      .bil-tab-shell:not(.bil-tab-active) > .bil-tab-close { display: none; }
+    }
     .bil-tab, .bil-btn, .bil-select, .bil-input, .bil-icon-btn {
       border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.055);
       color: inherit; border-radius: 7px; padding: 5px 8px; font: inherit; box-sizing: border-box;
@@ -1544,6 +1553,8 @@ function ensureStyles() {
     .bil-toggle input { margin: 0; }
     .bil-list { position: relative; min-height: 0; overflow: auto; flex: 1 1 0; overscroll-behavior: contain; outline: none; }
     .bil-list-inner, .bil-list-window { position: relative; min-height: 100%; }
+    .bil-selection-marquee { position: absolute; z-index: 4; pointer-events: none; box-sizing: border-box; border: 1px solid rgba(125,185,255,.95); background: rgba(80,145,225,.18); box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); }
+    .bil-selection-marquee[hidden] { display: none; }
     .bil-empty { min-height: 100%; display: flex; align-items: center; justify-content: center; box-sizing: border-box; padding: 20px; text-align: center; border: 1px dashed rgba(255,255,255,.14); border-radius: 10px; opacity: .7; }
     .bil-card {
       position: absolute; display: flex; flex-direction: column; overflow: hidden; box-sizing: border-box;
@@ -1834,6 +1845,178 @@ function setItemSelected(node, itemId, checked, event = null) {
   scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
 }
 
+function selectItemFromClick(node, itemId, event) {
+  const ctx = node.__bil
+  if (!ctx) return
+  const browser = activeBrowser(ctx)
+  browser.focusedId = itemId
+  if (event.shiftKey) {
+    setItemSelected(node, itemId, true, event)
+    return
+  }
+  if (event.ctrlKey || event.metaKey) {
+    setItemSelected(node, itemId, !browser.selected.has(itemId), event)
+    return
+  }
+  browser.selected = new Set([itemId])
+  browser.lastSelectedId = itemId
+  renderSelectionContext(node)
+  scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+}
+
+function setsEqual(left, right) {
+  if (left.size !== right.size) return false
+  for (const value of left) if (!right.has(value)) return false
+  return true
+}
+
+function marqueeContentPoint(ctx, clientX, clientY) {
+  const rect = ctx.list.getBoundingClientRect()
+  const x = Math.min(Math.max(clientX - rect.left, 0), ctx.list.clientWidth)
+  const y = Math.min(Math.max(clientY - rect.top, 0), ctx.list.clientHeight)
+  return { x: x + ctx.list.scrollLeft, y: y + ctx.list.scrollTop }
+}
+
+function marqueeAutoscrollVelocity(list, clientY) {
+  const rect = list.getBoundingClientRect()
+  const topDistance = clientY - rect.top
+  if (topDistance < MARQUEE_AUTOSCROLL_EDGE) {
+    return -MARQUEE_AUTOSCROLL_MAX * Math.min(1, (MARQUEE_AUTOSCROLL_EDGE - topDistance) / MARQUEE_AUTOSCROLL_EDGE)
+  }
+  const bottomDistance = rect.bottom - clientY
+  if (bottomDistance < MARQUEE_AUTOSCROLL_EDGE) {
+    return MARQUEE_AUTOSCROLL_MAX * Math.min(1, (MARQUEE_AUTOSCROLL_EDGE - bottomDistance) / MARQUEE_AUTOSCROLL_EDGE)
+  }
+  return 0
+}
+
+function renderMarqueeSelection(node, selection) {
+  const ctx = node.__bil
+  if (!ctx || ctx.marqueeSelection !== selection || ctx.browser.activeView !== selection.view) return
+  const current = marqueeContentPoint(ctx, selection.clientX, selection.clientY)
+  const distance = Math.hypot(selection.clientX - selection.anchorClientX, selection.clientY - selection.anchorClientY)
+  if (!selection.active && distance < MARQUEE_DRAG_THRESHOLD) return
+  selection.active = true
+
+  const bounds = {
+    left: Math.min(selection.anchor.x, current.x),
+    right: Math.max(selection.anchor.x, current.x),
+    top: Math.min(selection.anchor.y, current.y),
+    bottom: Math.max(selection.anchor.y, current.y)
+  }
+  const items = ctx.visibleItems || []
+  const metrics = getGalleryMetrics(ctx)
+  const hitIds = []
+  for (const index of calculateMarqueeGridIndexes(items.length, metrics, bounds)) {
+    const item = items[index]
+    if (!item || item.kind === 'folder') continue
+    hitIds.push(getViewItemId(ctx, item))
+  }
+
+  const next = selection.toggle || selection.additive
+    ? new Set(selection.baseline)
+    : new Set()
+  for (const id of hitIds) {
+    if (selection.toggle && selection.baseline.has(id)) next.delete(id)
+    else next.add(id)
+  }
+  const browser = activeBrowser(ctx)
+  if (!setsEqual(browser.selected, next)) {
+    browser.selected = next
+    renderSelectionContext(node)
+    scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+  }
+  selection.lastHitId = hitIds.at(-1) ?? null
+  Object.assign(ctx.selectionMarquee.style, {
+    left: `${bounds.left}px`,
+    top: `${bounds.top}px`,
+    width: `${Math.max(1, bounds.right - bounds.left)}px`,
+    height: `${Math.max(1, bounds.bottom - bounds.top)}px`
+  })
+  ctx.selectionMarquee.hidden = false
+}
+
+function scheduleMarqueeSelectionFrame(node) {
+  const ctx = node.__bil
+  const selection = ctx?.marqueeSelection
+  if (!selection || selection.frame) return
+  selection.frame = requestAnimationFrame(() => {
+    selection.frame = 0
+    if (ctx.removed || ctx.marqueeSelection !== selection) return
+    const velocity = marqueeAutoscrollVelocity(ctx.list, selection.clientY)
+    const previousTop = ctx.list.scrollTop
+    if (velocity) ctx.list.scrollTop += velocity
+    renderMarqueeSelection(node, selection)
+    if (velocity && ctx.list.scrollTop !== previousTop) scheduleMarqueeSelectionFrame(node)
+  })
+}
+
+function finishMarqueeSelection(node, event, cancelled = false) {
+  const ctx = node.__bil
+  const selection = ctx?.marqueeSelection
+  if (!selection || (event?.pointerId != null && event.pointerId !== selection.pointerId)) return
+  if (selection.frame) cancelAnimationFrame(selection.frame)
+  selection.frame = 0
+  if (!cancelled && event) {
+    selection.clientX = event.clientX
+    selection.clientY = event.clientY
+    renderMarqueeSelection(node, selection)
+  }
+  const browser = browserForView(ctx, selection.view)
+  if (cancelled && browser) {
+    browser.selected = new Set(selection.baseline)
+    renderSelectionContext(node)
+    scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+  } else if (!selection.active && !selection.toggle && !selection.additive && browser) {
+    browser.selected.clear()
+    renderSelectionContext(node)
+    scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+  } else if (selection.lastHitId && browser) {
+    browser.focusedId = selection.lastHitId
+    browser.lastSelectedId = selection.lastHitId
+  }
+  ctx.selectionMarquee.hidden = true
+  ctx.marqueeSelection = null
+  try {
+    ctx.list.releasePointerCapture?.(selection.pointerId)
+  } catch {
+    // The pointer may already have been released by the browser.
+  }
+}
+
+function cancelMarqueeSelection(node, restoreBaseline = true) {
+  finishMarqueeSelection(node, null, restoreBaseline)
+}
+
+function beginMarqueeSelection(node, event) {
+  const ctx = node.__bil
+  if (!ctx || event.button !== 0 || event.isPrimary === false || ctx.marqueeSelection) return false
+  if (event.target instanceof Element && event.target.closest('.bil-card')) return false
+  const rect = ctx.list.getBoundingClientRect()
+  const localX = event.clientX - rect.left
+  const localY = event.clientY - rect.top
+  if (localX < 0 || localY < 0 || localX > ctx.list.clientWidth || localY > ctx.list.clientHeight) return false
+  const browser = activeBrowser(ctx)
+  ctx.marqueeSelection = {
+    pointerId: event.pointerId,
+    view: ctx.browser.activeView,
+    anchor: marqueeContentPoint(ctx, event.clientX, event.clientY),
+    anchorClientX: event.clientX,
+    anchorClientY: event.clientY,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    baseline: new Set(browser.selected),
+    toggle: Boolean(event.ctrlKey || event.metaKey),
+    additive: Boolean(event.shiftKey),
+    active: false,
+    lastHitId: null,
+    frame: 0
+  }
+  ctx.list.setPointerCapture?.(event.pointerId)
+  event.preventDefault()
+  return true
+}
+
 function createLightbox(node) {
   const lightbox = document.createElement('div')
   lightbox.className = 'bil-lightbox'
@@ -1908,7 +2091,7 @@ function createFolderTabElement(node, viewId, source, folderPath) {
   close.className = 'bil-tab-close'
   close.type = 'button'
   close.textContent = '×'
-  close.hidden = true
+  close.hidden = false
   close.setAttribute('aria-label', `Close ${fullPath} tab`)
   tab.addEventListener('click', () => switchBrowserView(node, viewId))
   close.addEventListener('click', (event) => {
@@ -1989,7 +2172,7 @@ function renderTabs(ctx) {
     const selected = viewId === activeView
     elements.tab.setAttribute('aria-selected', String(selected))
     elements.shell.classList.toggle('bil-tab-active', selected)
-    elements.close.hidden = !selected
+    elements.close.hidden = false
   }
   const activeTab = activeView === 'conveyor'
     ? ctx.conveyorTab
@@ -2059,11 +2242,7 @@ function createCardSlot(node, ctx) {
       openFolderView(node, slot.item.sourceId, slot.item.folderPath)
       return
     }
-    activeBrowser(ctx).focusedId = slot.itemId
-    if (event.ctrlKey || event.metaKey || event.shiftKey) {
-      const selected = getViewSelectedIds(node)
-      setItemSelected(node, slot.itemId, !selected.has(slot.itemId), event)
-    } else scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    selectItemFromClick(node, slot.itemId, event)
   })
   media.addEventListener('dblclick', () => openPreview(node, slot.item))
   const thumb = document.createElement('img')
@@ -2544,6 +2723,7 @@ function switchBrowserView(node, view) {
   if (!ctx || ctx.browser.activeView === view) return
   const destination = ctx.browser[view] ?? ctx.browser.folderViews.get(view)
   if (!destination) return
+  cancelMarqueeSelection(node)
   const savedScrollTops = Object.fromEntries(ctx.browser.tabOrder.map((viewId) => {
     const browser = ctx.browser[viewId] ?? ctx.browser.folderViews.get(viewId)
     return [viewId, browser?.scrollTop || 0]
@@ -2620,6 +2800,44 @@ function handleGalleryKeyDown(node, event) {
   browser.focusedId = itemId(items[next])
   scrollItemIntoView(node, next)
   scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+}
+
+function forwardWorkflowSaveShortcut(event) {
+  if (!isWorkflowSaveShortcut(event)) return false
+  const commandManager = app.extensionManager?.command
+  const commandAvailable = typeof commandManager?.execute === 'function' && (
+    !Array.isArray(commandManager.commands) ||
+    commandManager.commands.some((command) => command?.id === 'Comfy.SaveWorkflow')
+  )
+  const canvas = app.canvas?.canvas
+  if (!commandAvailable && typeof canvas?.dispatchEvent !== 'function') return false
+
+  event.preventDefault()
+  event.stopPropagation()
+  event.stopImmediatePropagation?.()
+  if (event.repeat) return true
+
+  if (commandAvailable) {
+    try {
+      commandManager.execute('Comfy.SaveWorkflow', {
+        errorHandler: (error) => console.error('Image Conveyor: workflow save command failed.', error)
+      })
+      return true
+    } catch (error) {
+      console.error('Image Conveyor: workflow save command dispatch failed.', error)
+      if (typeof canvas?.dispatchEvent !== 'function') return true
+    }
+  }
+
+  canvas.dispatchEvent(new KeyboardEvent('keydown', {
+    key: event.key,
+    code: event.code || 'KeyS',
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    bubbles: true,
+    cancelable: true
+  }))
+  return true
 }
 
 function buildGalleryDom(node) {
@@ -2749,7 +2967,9 @@ function buildGalleryDom(node) {
   inputTab.setAttribute('aria-controls', list.id)
   const listInner = document.createElement('div'); listInner.className = 'bil-list-inner'
   const listWindow = document.createElement('div'); listWindow.className = 'bil-list-window'
-  listInner.appendChild(listWindow); list.appendChild(listInner)
+  const selectionMarquee = document.createElement('div')
+  selectionMarquee.className = 'bil-selection-marquee'; selectionMarquee.hidden = true
+  listInner.append(listWindow, selectionMarquee); list.appendChild(listInner)
   root.append(fileInput, folderInput, header, browserbar, secondary, summaryRow, contextBar, settings, list)
 
   node.__bil = {
@@ -2760,7 +2980,7 @@ function buildGalleryDom(node) {
     contextLabel, setPendingBtn, setProcessedBtn, deleteSelectedBtn, contextAddBtn,
     cleanDuplicatesBtn,
     autoQueueCheckbox: autoQueue.checkbox, dontConsumeCheckbox: dontConsume.checkbox,
-    canvasDropCheckbox: canvasDrop.checkbox, list, listInner, listWindow,
+    canvasDropCheckbox: canvasDrop.checkbox, list, listInner, listWindow, selectionMarquee,
     browser: createBrowserState(), visibleItems: [], cardPool: [],
     draggedId: null, empty: null, state: null, uiState: null, renderVersion: 0,
     inputVersion: 0, renderedRangeKey: '', renderFrame: 0, renderViewportOnly: false,
@@ -2770,12 +2990,13 @@ function buildGalleryDom(node) {
     listResizeObserver: null, widgetOuterHeight: 0, widgetInnerHeight: 0, widgetWidth: 0,
     pointerInside: false, middlePanPointerId: null, documentPasteHandler: null,
     documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
+    documentMarqueeMoveHandler: null, documentMarqueeEndHandler: null,
     documentKeyHandler: null, windowFocusHandler: null,
     filePickerPending: false, filePickerFocusTimer: 0, filePickerFocusFrame: 0,
     inputAbortController: null, inputRequestId: 0,
     searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
     uploadDepth: 0, dropzoneLabel: '', duplicateCleanupBusy: false,
-    clearExternalDragState: null,
+    clearExternalDragState: null, restoreCanvasShortcutFocus: null, marqueeSelection: null,
     queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map(),
     thumbnailUrlCache: new WeakMap(), localObjectUrls: new Map(), activePickerInput: null
   }
@@ -2790,6 +3011,16 @@ function buildGalleryDom(node) {
       scheduleRenderNode(node)
     })
   }
+  const scheduleCanvasShortcutFocusRestore = (focusOwner = null) => {
+    if (ctx.removed) return
+    if (ctx.filePickerFocusFrame) cancelAnimationFrame(ctx.filePickerFocusFrame)
+    ctx.filePickerFocusFrame = requestAnimationFrame(() => {
+      ctx.filePickerFocusFrame = 0
+      if (ctx.removed) return
+      restoreCanvasFocusAfterFilePicker(focusOwner, app.canvas?.canvas)
+    })
+  }
+  ctx.restoreCanvasShortcutFocus = () => scheduleCanvasShortcutFocusRestore()
   const restoreFocusAfterFilePicker = () => {
     if (!ctx.filePickerPending || ctx.removed) return
     const pickerInput = ctx.activePickerInput
@@ -2797,12 +3028,7 @@ function buildGalleryDom(node) {
     ctx.activePickerInput = null
     clearTimeout(ctx.filePickerFocusTimer)
     ctx.filePickerFocusTimer = 0
-    if (ctx.filePickerFocusFrame) cancelAnimationFrame(ctx.filePickerFocusFrame)
-    ctx.filePickerFocusFrame = requestAnimationFrame(() => {
-      ctx.filePickerFocusFrame = 0
-      if (ctx.removed) return
-      restoreCanvasFocusAfterFilePicker(pickerInput, app.canvas?.canvas)
-    })
+    scheduleCanvasShortcutFocusRestore(pickerInput)
   }
   const schedulePickerFocusRestore = () => {
     if (!ctx.filePickerPending || ctx.removed) return
@@ -2975,8 +3201,19 @@ function buildGalleryDom(node) {
     activeBrowser(ctx).scrollTop = list.scrollTop
     scheduleRenderNode(node, { viewportOnly: true })
   }, { passive: true })
-  root.addEventListener('keydown', (event) => handleGalleryKeyDown(node, event))
-  ctx.documentKeyHandler = (event) => { if (event.key === 'Escape' && !ctx.lightbox.root.hidden) { event.preventDefault(); ctx.lightbox.hide() } }
+  root.addEventListener('keydown', (event) => {
+    if (!forwardWorkflowSaveShortcut(event)) handleGalleryKeyDown(node, event)
+  })
+  ctx.documentKeyHandler = (event) => {
+    const target = event.composedPath?.()[0] ?? event.target
+    const targetInside = target instanceof Node && root.contains(target)
+    const bodyTarget = target === document || target === document.body || target === document.documentElement
+    if (isWorkflowSaveShortcut(event) && (targetInside || (ctx.pointerInside && bodyTarget))) {
+      forwardWorkflowSaveShortcut(event)
+      return
+    }
+    if (event.key === 'Escape' && !ctx.lightbox.root.hidden) { event.preventDefault(); ctx.lightbox.hide() }
+  }
   document.addEventListener('keydown', ctx.documentKeyHandler, true)
 
   if (typeof ResizeObserver === 'function') {
@@ -3007,6 +3244,7 @@ function buildGalleryDom(node) {
 
   root.addEventListener('pointerenter', () => { ctx.pointerInside = true })
   root.addEventListener('pointerleave', () => { ctx.pointerInside = false })
+  list.addEventListener('pointerdown', (event) => { beginMarqueeSelection(node, event) })
   root.addEventListener('pointerdown', (event) => {
     if (event.button === 1) { if (!app.canvas) return; ctx.middlePanPointerId = event.pointerId; event.preventDefault(); app.canvas.processMouseDown(event); return }
     if (!isTextControl(event.target)) root.focus({ preventScroll: true })
@@ -3025,6 +3263,24 @@ function buildGalleryDom(node) {
   document.addEventListener('pointermove', ctx.documentMiddlePanMoveHandler, true)
   document.addEventListener('pointerup', ctx.documentMiddlePanEndHandler, true)
   document.addEventListener('pointercancel', ctx.documentMiddlePanEndHandler, true)
+  ctx.documentMarqueeMoveHandler = (event) => {
+    const selection = ctx.marqueeSelection
+    if (!selection || event.pointerId !== selection.pointerId) return
+    selection.clientX = event.clientX
+    selection.clientY = event.clientY
+    if (selection.active || Math.hypot(
+      event.clientX - selection.anchorClientX,
+      event.clientY - selection.anchorClientY
+    ) >= MARQUEE_DRAG_THRESHOLD) event.preventDefault()
+    scheduleMarqueeSelectionFrame(node)
+  }
+  ctx.documentMarqueeEndHandler = (event) => {
+    if (!ctx.marqueeSelection || event.pointerId !== ctx.marqueeSelection.pointerId) return
+    finishMarqueeSelection(node, event, event.type === 'pointercancel')
+  }
+  document.addEventListener('pointermove', ctx.documentMarqueeMoveHandler, true)
+  document.addEventListener('pointerup', ctx.documentMarqueeEndHandler, true)
+  document.addEventListener('pointercancel', ctx.documentMarqueeEndHandler, true)
 
   ctx.documentPasteHandler = (event) => {
     if (event.defaultPrevented || isModifiedPlainTextPaste(event) || shouldIgnoreClipboardPasteTarget(event.target)) return
@@ -3053,6 +3309,7 @@ function buildGalleryDom(node) {
     finalizeExternalFileDrag(event)
     const pending = folderTarget ? getDroppedFolderSources(event) : getDroppedImageFiles(event)
     clearExternalDragState()
+    scheduleCanvasShortcutFocusRestore()
     const entries = await pending
     if (folderTarget) {
       if (entries.length) addFolderSources(node, entries)
@@ -3252,7 +3509,17 @@ function initializeNode(node, widget) {
       document.removeEventListener('pointercancel', ctx.documentMiddlePanEndHandler, true)
       ctx.documentMiddlePanEndHandler = null
     }
+    if (ctx.documentMarqueeMoveHandler) {
+      document.removeEventListener('pointermove', ctx.documentMarqueeMoveHandler, true)
+      ctx.documentMarqueeMoveHandler = null
+    }
+    if (ctx.documentMarqueeEndHandler) {
+      document.removeEventListener('pointerup', ctx.documentMarqueeEndHandler, true)
+      document.removeEventListener('pointercancel', ctx.documentMarqueeEndHandler, true)
+      ctx.documentMarqueeEndHandler = null
+    }
     ctx.middlePanPointerId = null
+    cancelMarqueeSelection(node, false)
     if (ctx.documentKeyHandler) {
       document.removeEventListener('keydown', ctx.documentKeyHandler, true)
       ctx.documentKeyHandler = null
@@ -3267,6 +3534,7 @@ function initializeNode(node, widget) {
     ctx.filePickerFocusTimer = 0
     if (ctx.filePickerFocusFrame) cancelAnimationFrame(ctx.filePickerFocusFrame)
     ctx.filePickerFocusFrame = 0
+    ctx.restoreCanvasShortcutFocus = null
     ctx.inputAbortController?.abort?.()
     ctx.inputAbortController = null
     clearTimeout(ctx.searchTimer)

@@ -15,7 +15,7 @@ Selected local folders can be opened as additional, removable tabs. Every tab us
 
 **Add folders** opens local folders as browser tabs without importing their images. You can also drag one or more folders onto the tab strip. Nested directories appear as folder cards; clicking one opens that directory in another tab.
 
-Folder tabs compress automatically as the strip fills. A close button appears only on the currently selected removable tab, keeping compressed inactive tabs safe to select. **Conveyor** and **Input Folder** cannot be closed.
+Folder tabs compress automatically as the strip fills. Inactive removable tabs keep their close button while there is enough room; it disappears below the safe-width cutoff so a compressed tab remains easy to select. The active removable tab always keeps its close button. **Conveyor** and **Input Folder** cannot be closed.
 
 The tab strip and main gallery are separate drop targets:
 
@@ -66,7 +66,8 @@ The main browser provides:
 - recursive folder filtering in Input Folder;
 - clickable nested-directory cards in local folder tabs;
 - name/date sorting;
-- visible multi-selection and contextual bulk actions;
+- direct click selection, Ctrl/Cmd toggling, Shift range selection, and contextual bulk actions;
+- anchored drag-box selection from the gallery background or the gaps between cards, with edge auto-scroll;
 - a larger full-resolution preview on double-click or Enter;
 - arrow-key navigation, Home, End, PageUp, PageDown, Space selection, and Escape to close preview;
 - **Jump to next pending**;

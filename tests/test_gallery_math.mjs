@@ -2,11 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   calculateGalleryMetrics,
+  calculateMarqueeGridIndexes,
   calculateVisibleCardRange,
   chooseViewAfterClose,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
+  isWorkflowSaveShortcut,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
@@ -19,6 +21,50 @@ test('responsive metrics add columns as width grows', () => {
   assert.equal(medium.columns, 2)
   assert.ok(wide.columns > medium.columns)
   assert.ok(medium.mediaHeight / medium.cardHeight >= 0.68)
+  assert.equal(medium.columnStride, medium.cardWidth + 10)
+})
+
+test('marquee hit testing follows virtual card geometry and ignores gaps', () => {
+  const metrics = calculateGalleryMetrics(400, 100, 10)
+  assert.equal(metrics.columns, 3)
+
+  const firstCardRight = metrics.cardWidth
+  assert.deepEqual(
+    calculateMarqueeGridIndexes(20, metrics, {
+      left: firstCardRight + 1,
+      right: metrics.columnStride - 1,
+      top: 10,
+      bottom: 30
+    }),
+    []
+  )
+  assert.deepEqual(
+    calculateMarqueeGridIndexes(20, metrics, {
+      left: firstCardRight - 2,
+      right: metrics.columnStride + 2,
+      top: 10,
+      bottom: 30
+    }),
+    [0, 1]
+  )
+  assert.deepEqual(
+    calculateMarqueeGridIndexes(5, metrics, {
+      left: 0,
+      right: metrics.columnStride * 3,
+      top: metrics.cardHeight - 2,
+      bottom: metrics.rowStride + 2
+    }),
+    [0, 1, 2, 3, 4]
+  )
+})
+
+test('workflow save shortcut recognition is exact and browser-safe', () => {
+  assert.equal(isWorkflowSaveShortcut({ key: 's', ctrlKey: true }), true)
+  assert.equal(isWorkflowSaveShortcut({ key: 'S', metaKey: true }), true)
+  assert.equal(isWorkflowSaveShortcut({ key: 's', ctrlKey: true, shiftKey: true }), false)
+  assert.equal(isWorkflowSaveShortcut({ key: 's', ctrlKey: true, altKey: true }), false)
+  assert.equal(isWorkflowSaveShortcut({ key: 's', ctrlKey: true, defaultPrevented: true }), false)
+  assert.equal(isWorkflowSaveShortcut({ key: 'o', ctrlKey: true }), false)
 })
 
 test('ten thousand items keep a bounded live-card range', () => {
@@ -76,6 +122,9 @@ test('closing the file picker restores native canvas shortcut focus', () => {
 
   assert.equal(restoreCanvasFocusAfterFilePicker(fileInput, null), false)
   assert.deepEqual(calls.at(-1), ['blur'])
+
+  assert.equal(restoreCanvasFocusAfterFilePicker(null, canvas), true)
+  assert.deepEqual(calls.at(-1), ['focus', { preventScroll: true }])
 })
 
 test('tab switches preserve independent scroll positions', () => {
