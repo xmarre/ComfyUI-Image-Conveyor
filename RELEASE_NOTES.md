@@ -38,7 +38,7 @@ This release turns Image Conveyor into a scalable image-library workflow while p
 ## Validation
 
 - `python -m unittest discover -s tests -v`: 40 passed
-- `node --test tests/test_gallery_math.mjs`: 20 passed
+- `node --test tests/test_gallery_math.mjs`: 24 passed
 - `node --check web/image_conveyor.js`: passed
 - `node --check web/image_conveyor_math.mjs`: passed
 - `python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py`: passed
