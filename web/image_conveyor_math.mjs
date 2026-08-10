@@ -100,6 +100,47 @@ export function restoreGraphCanvasFocus(previousOwner, canvas) {
   return !canvas.ownerDocument || canvas.ownerDocument.activeElement === canvas
 }
 
+export function delegateGraphKeyboardEvent(event, processKey, receiver = null, graphTarget = null) {
+  if (!event || event.defaultPrevented || event.isComposing || typeof processKey !== 'function') return false
+  const delegatedEvent = graphTarget && event.target !== graphTarget
+    ? new Proxy(event, {
+        get(source, property) {
+          if (property === 'target') return graphTarget
+          const value = Reflect.get(source, property, source)
+          return typeof value === 'function' ? value.bind(source) : value
+        }
+      })
+    : event
+  processKey.call(receiver, delegatedEvent)
+  return true
+}
+
+const TEXT_INPUT_RESERVED_SHORTCUTS = new Set([
+  'Ctrl+a', 'Ctrl+c', 'Ctrl+v', 'Ctrl+x', 'Ctrl+z', 'Ctrl+y', 'Ctrl+p',
+  'Enter', 'Shift+Enter', 'Ctrl+Backspace', 'Ctrl+Delete',
+  'Home', 'Ctrl+Home', 'Ctrl+Shift+Home',
+  'End', 'Ctrl+End', 'Ctrl+Shift+End',
+  'PageUp', 'Shift+PageUp', 'PageDown', 'Shift+PageDown',
+  'ArrowLeft', 'Ctrl+ArrowLeft', 'Shift+ArrowLeft', 'Ctrl+Shift+ArrowLeft',
+  'ArrowRight', 'Ctrl+ArrowRight', 'Shift+ArrowRight', 'Ctrl+Shift+ArrowRight',
+  'ArrowUp', 'Shift+ArrowUp', 'ArrowDown', 'Shift+ArrowDown'
+])
+
+export function isReservedTextInputShortcut(event) {
+  if (!event) return true
+  const ctrl = Boolean(event.ctrlKey || event.metaKey)
+  const alt = Boolean(event.altKey)
+  const shift = Boolean(event.shiftKey)
+  if (!ctrl && !alt) return true
+  const modifiers = []
+  if (ctrl) modifiers.push('Ctrl')
+  if (alt) modifiers.push('Alt')
+  if (shift) modifiers.push('Shift')
+  const rawKey = String(event.key || '')
+  modifiers.push(rawKey.length === 1 ? rawKey.toLowerCase() : rawKey)
+  return TEXT_INPUT_RESERVED_SHORTCUTS.has(modifiers.join('+'))
+}
+
 export function isConveyorDeleteShortcut(event) {
   if (!event || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false
   return event.key === 'Delete' || event.code === 'Delete'

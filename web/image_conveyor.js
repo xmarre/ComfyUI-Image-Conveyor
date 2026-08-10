@@ -7,10 +7,12 @@ import {
   calculateGalleryMetrics,
   calculateVisibleCardRange,
   chooseViewAfterClose,
+  delegateGraphKeyboardEvent,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
   isConveyorGalleryShortcut,
+  isReservedTextInputShortcut,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
@@ -55,6 +57,7 @@ const CARD_SIZES = {
   large: { minWidth: 224, thumbnail: 384 }
 }
 let keyboardOwnerNode = null
+const keyboardNodes = new Set()
 
 function claimGalleryKeyboardOwnership(node) {
   if (keyboardOwnerNode && keyboardOwnerNode !== node) {
@@ -68,6 +71,81 @@ function claimGalleryKeyboardOwnership(node) {
 function releaseGalleryKeyboardOwnership(node) {
   if (node.__bil) node.__bil.keyboardActive = false
   if (keyboardOwnerNode === node) keyboardOwnerNode = null
+}
+
+function eventOrigin(event) {
+  return event.composedPath?.()[0] ?? event.target
+}
+
+function isNeutralKeyboardTarget(target) {
+  return target === document || target === document.body || target === document.documentElement
+}
+
+function conveyorForKeyboardTarget(target) {
+  if (!(target instanceof Node)) return null
+  for (const node of keyboardNodes) {
+    if (node.__bil?.root?.contains(target)) return node
+  }
+  return null
+}
+
+function isTextEditingControl(target) {
+  if (!(target instanceof Element)) return false
+  const control = target.closest('input, textarea, [contenteditable="true"]')
+  if (!control) return false
+  if (control instanceof HTMLInputElement) {
+    return !['button', 'checkbox', 'color', 'file', 'radio', 'range', 'reset', 'submit'].includes(control.type)
+  }
+  return control instanceof HTMLTextAreaElement || control.isContentEditable
+}
+
+const keyboardCoordinator = {
+  attached: false,
+
+  registerNode(node) {
+    keyboardNodes.add(node)
+    if (this.attached) return
+    document.addEventListener('keydown', this.handleKeyDown, true)
+    this.attached = true
+  },
+
+  unregisterNode(node) {
+    keyboardNodes.delete(node)
+    releaseGalleryKeyboardOwnership(node)
+    if (keyboardNodes.size || !this.attached) return
+    document.removeEventListener('keydown', this.handleKeyDown, true)
+    this.attached = false
+  },
+
+  handleKeyDown(event) {
+    if (event.defaultPrevented || event.isComposing || !keyboardNodes.size) return
+    const target = eventOrigin(event)
+    const canvas = app.canvas?.canvas
+    if (!canvas) return
+
+    // ComfyUI's legacy shortcut entry point is attached directly to the canvas.
+    // DOM widgets and a neutral document body sit outside that event path.
+    const neutralTarget = isNeutralKeyboardTarget(target)
+    const targetNode = target === canvas || neutralTarget
+      ? null
+      : conveyorForKeyboardTarget(target)
+    const owner = keyboardOwnerNode?.__bil ? keyboardOwnerNode : null
+    const ownerOwnsTarget = owner && (
+      target === canvas ||
+      targetNode === owner ||
+      neutralTarget
+    )
+    if (ownerOwnsTarget && isConveyorGalleryShortcut(event) && handleGalleryKeyDown(owner, event)) return
+
+    if (target === canvas) return
+    if (!targetNode && !neutralTarget) return
+    if (isInteractiveWidgetControl(target)) {
+      if (isTextEditingControl(target)) {
+        if (isReservedTextInputShortcut(event)) return
+      } else if (!(event.ctrlKey || event.metaKey || event.altKey)) return
+    }
+    delegateGraphKeyboardEvent(event, app.canvas?.processKey, app.canvas, canvas)
+  }
 }
 
 function structuredCloneCompat(value) {
@@ -3471,12 +3549,6 @@ function initializeNode(node, widget) {
     return true
   }
 
-  chainNodeCallback(node, 'onKeyDown', function (event) {
-    const ctx = node.__bil
-    if (!ctx?.keyboardActive || !isConveyorGalleryShortcut(event)) return
-    handleGalleryKeyDown(node, event)
-  })
-
   chainNodeCallback(node, 'onExecuted', function (output) {
     const payload = output?.batch_image_loader_delta?.[0]
     if (!payload) return
@@ -3512,9 +3584,9 @@ function initializeNode(node, widget) {
   chainNodeCallback(node, 'onRemoved', function () {
     autoQueueCoordinator.unregisterNode(node)
     canvasDropCoordinator.unregisterNode(node)
+    keyboardCoordinator.unregisterNode(node)
     const ctx = node.__bil
     if (!ctx) return
-    releaseGalleryKeyboardOwnership(node)
     ctx.removed = true
     ctx.inputRequestId += 1
     if (ctx.documentPasteHandler) {
@@ -3589,6 +3661,7 @@ function initializeNode(node, widget) {
   }
   cacheRenderableState(node, snapshot.state, snapshot.uiState)
   queueMicrotask(() => scheduleRenderNode(node))
+  keyboardCoordinator.registerNode(node)
   return widget
 }
 

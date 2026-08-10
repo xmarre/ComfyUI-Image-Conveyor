@@ -5,11 +5,13 @@ import {
   calculateMarqueeGridIndexes,
   calculateVisibleCardRange,
   chooseViewAfterClose,
+  delegateGraphKeyboardEvent,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
   isConveyorDeleteShortcut,
   isConveyorGalleryShortcut,
+  isReservedTextInputShortcut,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
@@ -136,6 +138,50 @@ test('widget interactions restore native canvas shortcut focus', () => {
 
   assert.equal(restoreGraphCanvasFocus(null, canvas), true)
   assert.deepEqual(calls.at(-1), ['focus', { preventScroll: true }])
+})
+
+test('neutral workspace keys enter ComfyUI with the original keyboard fields', () => {
+  const body = { localName: 'body' }
+  const canvas = { localName: 'canvas' }
+  const event = {
+    type: 'keydown',
+    key: 's',
+    code: 'KeyS',
+    keyCode: 83,
+    which: 83,
+    ctrlKey: true,
+    target: body,
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true },
+    stopImmediatePropagation() { this.immediatePropagationStopped = true }
+  }
+  const receiver = { calls: [] }
+  function processKey(received) {
+    this.calls.push(received)
+    assert.equal(received.target, canvas)
+    assert.equal(received.keyCode, 83)
+    assert.equal(received.which, 83)
+    received.preventDefault()
+    received.stopImmediatePropagation()
+  }
+
+  assert.equal(delegateGraphKeyboardEvent(event, processKey, receiver, canvas), true)
+  assert.equal(receiver.calls.length, 1)
+  assert.equal(event.target, body)
+  assert.equal(event.defaultPrevented, true)
+  assert.equal(event.immediatePropagationStopped, true)
+})
+
+test('text controls reserve editing chords while allowing ComfyUI commands', () => {
+  assert.equal(isReservedTextInputShortcut({ key: 'a', ctrlKey: true }), true)
+  assert.equal(isReservedTextInputShortcut({ key: 'z', metaKey: true }), true)
+  assert.equal(isReservedTextInputShortcut({ key: 'ArrowLeft', shiftKey: true }), true)
+  assert.equal(isReservedTextInputShortcut({ key: 'Enter' }), true)
+  assert.equal(isReservedTextInputShortcut({ key: 'q' }), true)
+  assert.equal(isReservedTextInputShortcut({ key: 'S', ctrlKey: true }), false)
+  assert.equal(isReservedTextInputShortcut({ key: 's', ctrlKey: true }), false)
+  assert.equal(isReservedTextInputShortcut({ key: 'b', ctrlKey: true }), false)
+  assert.equal(isReservedTextInputShortcut({ key: 'Enter', ctrlKey: true }), false)
 })
 
 test('conveyor keyboard ownership excludes every modified ComfyUI hotkey', () => {
