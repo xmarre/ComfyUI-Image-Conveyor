@@ -489,3 +489,113 @@ export function prepareManagedDuplicateCleanup(groups, protectedPaths = new Set(
   ), 0)
   return { groups: cleanupGroups, duplicateCount, reclaimableBytes, protectedCount }
 }
+
+export function normalizeImagesPerExecution(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return 1
+  return Math.max(1, Math.min(9, Math.trunc(number)))
+}
+
+export function selectExecutionGroup(items, imagesPerExecution, dontConsume = false) {
+  const source = Array.isArray(items) ? items : []
+  const count = normalizeImagesPerExecution(imagesPerExecution)
+  const eligible = source.filter((item) => (
+    dontConsume
+      ? item?.status === 'pending' || item?.status === 'queued'
+      : item?.status === 'pending'
+  ))
+  const candidates = dontConsume && eligible.length === 0 ? source : eligible
+  return candidates.slice(0, count)
+}
+
+function normalizeReservationMember(value) {
+  if (!value || typeof value !== 'object') return null
+  const id = String(value.id ?? '').trim()
+  const annotated = String(value.annotated ?? '').trim()
+  return id && annotated ? { id, annotated } : null
+}
+
+export function makeQueueReservationPayload(items) {
+  const members = (Array.isArray(items) ? items : [])
+    .map(normalizeReservationMember)
+    .filter(Boolean)
+  if (!members.length) return null
+  const first = members[0]
+  if (members.length === 1) return first
+  return { ...first, items: members }
+}
+
+export function queueReservationMembers(payload) {
+  if (!payload || typeof payload !== 'object') return []
+  if (Object.hasOwn(payload, 'items')) {
+    if (!Array.isArray(payload.items) || !payload.items.length) return []
+    const members = payload.items.map(normalizeReservationMember)
+    if (members.some((member) => member == null)) return []
+    const ids = new Set(members.map((member) => member.id))
+    if (ids.size !== members.length) return []
+    const first = normalizeReservationMember(payload)
+    if (first && (first.id !== members[0].id || first.annotated !== members[0].annotated)) return []
+    return members
+  }
+  const member = normalizeReservationMember(payload)
+  return member ? [member] : []
+}
+
+export function markReservedGroupQueued(items, payload, dontConsume = false, now = Date.now()) {
+  if (dontConsume) return 0
+  const members = queueReservationMembers(payload)
+  if (!members.length) return 0
+  const ids = new Set(members.map((member) => member.id))
+  let changed = 0
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!ids.has(item?.id)) continue
+    item.status = 'queued'
+    item.last_queued_at = now
+    changed += 1
+  }
+  return changed
+}
+
+export function processedItemIdsFromDelta(delta) {
+  if (!delta || typeof delta !== 'object' || delta.consumed === false) return []
+  if (Array.isArray(delta.processed_items) && delta.processed_items.length) {
+    const ids = delta.processed_items
+      .map((item) => String(item?.id ?? '').trim())
+      .filter(Boolean)
+    return Array.from(new Set(ids))
+  }
+  const id = String(delta.processed_item_id ?? '').trim()
+  return id ? [id] : []
+}
+
+export function completeExecutionGroupCount(pendingCount, imagesPerExecution) {
+  const pending = Math.max(0, Math.floor(Number(pendingCount) || 0))
+  const count = normalizeImagesPerExecution(imagesPerExecution)
+  return Math.floor(pending / count)
+}
+
+export function calculateAutoQueueExtraExecutions(
+  pendingCount,
+  imagesPerExecution,
+  requestedBatchCount = 1
+) {
+  const completeGroups = completeExecutionGroupCount(pendingCount, imagesPerExecution)
+  const requested = Math.max(1, Math.floor(Number(requestedBatchCount) || 1))
+  return Math.max(0, completeGroups - requested)
+}
+
+export function shouldReanchorGalleryResize(
+  previousWidgetWidth,
+  currentWidgetWidth,
+  previousViewportWidth,
+  currentViewportWidth
+) {
+  const previousWidget = Number(previousWidgetWidth)
+  const currentWidget = Number(currentWidgetWidth)
+  const previousViewport = Number(previousViewportWidth)
+  const currentViewport = Number(currentViewportWidth)
+  return Number.isFinite(previousWidget) && Number.isFinite(currentWidget) &&
+    Number.isFinite(previousViewport) && Number.isFinite(currentViewport) &&
+    previousWidget > 0 && currentWidget > 0 &&
+    previousWidget !== currentWidget && previousViewport !== currentViewport
+}

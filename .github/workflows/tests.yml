@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,10 +32,12 @@ jobs:
         run: python -m pip install --upgrade pillow
 
       - name: Run Python tests
-        run: python -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
 
-      - name: Run gallery math tests
-        run: node --test tests/test_gallery_math.mjs
+      - name: Run frontend pure-function tests
+        run: |
+          node --test tests/test_gallery_math.mjs
+          node --test tests/test_queue_groups.mjs
 
       - name: Check JavaScript syntax
         run: |
@@ -46,4 +48,29 @@ jobs:
         run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py
 
       - name: Check whitespace errors
-        run: git diff --check HEAD^
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_REF" ]]; then
+            git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+            compare_ref="origin/$BASE_REF"
+          elif [[ "$EVENT_NAME" == "push" && -n "$BEFORE_SHA" && "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            if ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "$BEFORE_SHA"
+            fi
+            compare_ref="$BEFORE_SHA"
+          elif git rev-parse --verify origin/main >/dev/null 2>&1; then
+            compare_ref="origin/main"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            compare_ref="HEAD^"
+          else
+            compare_ref="HEAD"
+          fi
+
+          merge_base="$(git merge-base HEAD "$compare_ref")"
+          git diff --check "$merge_base"...HEAD

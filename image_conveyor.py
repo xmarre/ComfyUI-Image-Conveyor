@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import folder_paths
@@ -7,10 +8,21 @@ import nodes
 
 
 _STATE_VERSION = 1
+_MAX_IMAGES_PER_EXECUTION = 9
 
 
 def _deep_copy_json(value: Any) -> Any:
     return json.loads(json.dumps(value))
+
+
+def _normalize_images_per_execution(value: Any) -> int:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 1
+    if not math.isfinite(number):
+        return 1
+    return max(1, min(_MAX_IMAGES_PER_EXECUTION, int(number)))
 
 
 def _default_state() -> Dict[str, Any]:
@@ -20,18 +32,19 @@ def _default_state() -> Dict[str, Any]:
         "auto_queue": False,
         "dont_consume": False,
         "catch_canvas_drops": False,
+        "images_per_execution": 1,
     }
 
 
 def _default_ui_state() -> Dict[str, Any]:
     """
     Return the default persisted UI state used by the node.
-    
+
     The returned state contains the schema version and the UI-specific fields tracked across sessions:
     - `version`: schema version forced to the module `_STATE_VERSION`.
     - `selected_ids`: list of selected item IDs (empty by default).
     - `source_paths`: mapping of `{item_id: path}` that can override an item's stored `source_path` at runtime.
-    
+
     Returns:
         ui_state (Dict[str, Any]): Default UI state with keys `version`, `selected_ids`, and `source_paths`.
     """
@@ -94,16 +107,19 @@ def _normalize_state(raw: Any) -> Dict[str, Any]:
         "auto_queue": bool(state.get("auto_queue", False)) if isinstance(state, dict) else False,
         "dont_consume": bool(state.get("dont_consume", False)) if isinstance(state, dict) else False,
         "catch_canvas_drops": bool(state.get("catch_canvas_drops", False)) if isinstance(state, dict) else False,
+        "images_per_execution": _normalize_images_per_execution(
+            state.get("images_per_execution", 1) if isinstance(state, dict) else 1
+        ),
     }
 
 
 def _normalize_ui_state(raw: Any) -> Dict[str, Any]:
     """
     Normalize a raw UI state payload into the expected runtime UI state structure.
-    
+
     Parameters:
         raw (Any): Raw UI state value, typically a JSON string or already-parsed object.
-    
+
     Returns:
         Dict[str, Any]: Normalized UI state with keys:
             - `version` (int): Schema version (set to the module `_STATE_VERSION`).
@@ -132,41 +148,59 @@ def _normalize_ui_state(raw: Any) -> Dict[str, Any]:
     }
 
 
+def _normalize_queue_member(value: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(value, dict):
+        return None
+    item_id = str(value.get("id", "")).strip()
+    annotated = str(value.get("annotated", "")).strip()
+    if not item_id or not annotated:
+        return None
+    return {"id": item_id, "annotated": annotated}
+
+
 def _parse_queue_item(raw: Any) -> Optional[Dict[str, Any]]:
-    """
-    Parse a queue payload and extract normalized `id` and `annotated` fields.
-    
-    Parameters:
-    	raw (Any): JSON string or object representing a queue payload containing `id` and `annotated`.
-    
-    Returns:
-    	result (Optional[Dict[str, str]]): A dict with keys `"id"` and `"annotated"` containing trimmed, non-empty string values when both are present; `None` if the payload is invalid or required fields are missing.
-    """
+    """Parse a legacy single-item or new ordered group prompt reservation."""
     payload = _safe_json_load(raw, {})
     if not isinstance(payload, dict):
         return None
 
-    item_id = str(payload.get("id", "")).strip()
-    annotated = str(payload.get("annotated", "")).strip()
-    if not item_id or not annotated:
+    if "items" in payload:
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise RuntimeError("Image Conveyor: queued image group reservation is invalid.")
+
+        items: List[Dict[str, str]] = []
+        seen_ids = set()
+        for raw_item in raw_items:
+            member = _normalize_queue_member(raw_item)
+            if member is None or member["id"] in seen_ids:
+                raise RuntimeError("Image Conveyor: queued image group reservation is invalid.")
+            seen_ids.add(member["id"])
+            items.append(member)
+
+        first = items[0]
+        top_level = _normalize_queue_member(payload)
+        if top_level is not None and top_level != first:
+            raise RuntimeError("Image Conveyor: queued image group reservation is inconsistent.")
+        return {
+            "id": first["id"],
+            "annotated": first["annotated"],
+            "items": items,
+            "grouped": True,
+        }
+
+    item = _normalize_queue_member(payload)
+    if item is None:
         return None
     return {
-        "id": item_id,
-        "annotated": annotated,
+        "id": item["id"],
+        "annotated": item["annotated"],
+        "grouped": False,
     }
 
 
 def _get_runtime_source_path(ui_state: Dict[str, Any], item: Dict[str, Any]) -> str:
-    """
-    Resolve the runtime source path for an item, preferring a UI-provided override when present.
-    
-    Parameters:
-        ui_state (dict): UI state that may contain a `source_paths` mapping of item IDs to source path overrides.
-        item (dict): Item dictionary containing at least an `"id"` key and an optional `"source_path"` fallback.
-    
-    Returns:
-        str: The trimmed source path from `ui_state["source_paths"][item["id"]]` if non-empty, otherwise the trimmed `item["source_path"]` (or an empty string if neither is set).
-    """
+    """Resolve the runtime source path, preferring the UI-only source-path override."""
     source_paths = ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
     if isinstance(source_paths, dict):
         source_path = str(source_paths.get(item["id"], "")).strip()
@@ -176,20 +210,87 @@ def _get_runtime_source_path(ui_state: Dict[str, Any], item: Dict[str, Any]) -> 
 
 
 def _find_item_by_id(state: Dict[str, Any], item_id: str) -> Tuple[int, Optional[Dict[str, Any]]]:
-    """
-    Locate an item in the given state by its `id` and return its index and the item.
-    
-    Parameters:
-    	state (Dict[str, Any]): Normalized state dictionary containing an "items" list of item dicts.
-    	item_id (str): The `id` value to search for.
-    
-    Returns:
-    	tuple: A pair `(index, item)` where `index` is the zero-based index of the matching item or `-1` if not found, and `item` is the matching item dictionary or `None` if not found.
-    """
+    """Locate a queue item by its logical queue-entry ID."""
     for index, item in enumerate(state["items"]):
         if item["id"] == item_id:
             return index, item
     return -1, None
+
+
+def _insufficient_group_error(requested: int, available: int) -> RuntimeError:
+    return RuntimeError(
+        f"Image Conveyor: {requested} images per execution requested, "
+        f"but only {available} eligible queue images are available."
+    )
+
+
+def _select_group(
+    state: Dict[str, Any],
+    queue_item_json: Any,
+    *,
+    allow_processed: bool = False,
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """Resolve one complete ordered execution group from reservation or queue state."""
+    count = _normalize_images_per_execution(state.get("images_per_execution", 1))
+    reservation = _parse_queue_item(queue_item_json)
+
+    if reservation is not None and reservation.get("grouped"):
+        reserved_items = reservation["items"]
+        if len(reserved_items) != count:
+            raise RuntimeError(
+                f"Image Conveyor: queued image group contains {len(reserved_items)} images, "
+                f"but this prompt requests {count}."
+            )
+
+        selected: List[Tuple[int, Dict[str, Any]]] = []
+        for reserved in reserved_items:
+            index, item = _find_item_by_id(state, reserved["id"])
+            if item is None:
+                raise RuntimeError(
+                    f"Image Conveyor: reserved queue image '{reserved['id']}' is no longer present."
+                )
+            if item["annotated"] != reserved["annotated"]:
+                raise RuntimeError(
+                    f"Image Conveyor: reserved queue image '{reserved['id']}' changed after it was queued."
+                )
+            selected.append((index, item))
+        return selected
+
+    if reservation is not None:
+        if count != 1:
+            raise RuntimeError(
+                "Image Conveyor: a legacy single-image reservation cannot satisfy "
+                f"{count} images per execution. Queue this prompt again."
+            )
+
+        index, item = _find_item_by_id(state, reservation["id"])
+        if item is not None:
+            return [(index, item)]
+        for idx, candidate in enumerate(state["items"]):
+            if candidate["annotated"] == reservation["annotated"]:
+                return [(idx, candidate)]
+
+    eligible = [
+        (idx, item)
+        for idx, item in enumerate(state["items"])
+        if item["status"] in {"pending", "queued"}
+    ]
+    if eligible:
+        if len(eligible) < count:
+            raise _insufficient_group_error(count, len(eligible))
+        return eligible[:count]
+
+    if allow_processed and state["items"]:
+        if len(state["items"]) < count:
+            raise _insufficient_group_error(count, len(state["items"]))
+        return list(enumerate(state["items"][:count]))
+
+    if count > 1:
+        raise _insufficient_group_error(count, 0)
+    raise RuntimeError(
+        "Image Conveyor: no pending or queued images are available. "
+        "Add images or reset items back to pending."
+    )
 
 
 def _select_item(
@@ -198,33 +299,38 @@ def _select_item(
     *,
     allow_processed: bool = False,
 ) -> Tuple[int, Dict[str, Any]]:
-    queued_item = _parse_queue_item(queue_item_json)
-    if queued_item is not None:
-        index, item = _find_item_by_id(state, queued_item["id"])
-        if item is not None:
-            return index, item
-        for idx, candidate in enumerate(state["items"]):
-            if candidate["annotated"] == queued_item["annotated"]:
-                return idx, candidate
+    """Compatibility wrapper preserving the released single-item selection helper."""
+    single_state = dict(state)
+    single_state["images_per_execution"] = 1
+    return _select_group(single_state, queue_item_json, allow_processed=allow_processed)[0]
 
-    for idx, item in enumerate(state["items"]):
-        if item["status"] in {"pending", "queued"}:
-            return idx, item
 
-    if allow_processed and state["items"]:
-        return 0, state["items"][0]
-
-    raise RuntimeError(
-        "Image Conveyor: no pending or queued images are available. "
-        "Add images or reset items back to pending."
-    )
+def _unresolved_change_hash(state: Dict[str, Any], reason: str) -> str:
+    """Return a stable cache sentinel while input validation reports the real error."""
+    identity = f"unresolved|images_per_execution={state['images_per_execution']}|{reason}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 class ImageConveyor:
     CATEGORY = "image"
     FUNCTION = "load_next"
     HAS_INTERMEDIATE_OUTPUT = True
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "INT", "INT", "STRING")
+    RETURN_TYPES = (
+        "IMAGE",
+        "MASK",
+        "STRING",
+        "INT",
+        "INT",
+        "STRING",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+    )
     RETURN_NAMES = (
         "image",
         "mask",
@@ -232,6 +338,14 @@ class ImageConveyor:
         "index",
         "remaining_pending",
         "source_path",
+        "image_2",
+        "image_3",
+        "image_4",
+        "image_5",
+        "image_6",
+        "image_7",
+        "image_8",
+        "image_9",
     )
     SEARCH_ALIASES = [
         "image conveyor",
@@ -277,113 +391,112 @@ class ImageConveyor:
         del ui_state_json
         state = _normalize_state(state_json)
         if not state["items"]:
-            return hashlib.sha256(str(state_json).encode("utf-8")).hexdigest()
+            empty_identity = f"{state_json}|images_per_execution={state['images_per_execution']}"
+            return hashlib.sha256(empty_identity.encode("utf-8")).hexdigest()
 
-        index, item = _select_item(
-            state, queue_item_json, allow_processed=state["dont_consume"]
-        )
-        path = folder_paths.get_annotated_filepath(item["annotated"])
+        try:
+            selected = _select_group(
+                state, queue_item_json, allow_processed=state["dont_consume"]
+            )
+        except RuntimeError as exc:
+            return _unresolved_change_hash(state, f"selection|{exc}")
 
         hasher = hashlib.sha256()
         hasher.update(b"dont_consume=1" if state["dont_consume"] else b"dont_consume=0")
-        hasher.update(str(index).encode("utf-8"))
-        hasher.update(item["id"].encode("utf-8"))
-        hasher.update(item["annotated"].encode("utf-8"))
-        with open(path, "rb") as handle:
-            hasher.update(handle.read())
+        hasher.update(f"|images_per_execution={state['images_per_execution']}".encode("utf-8"))
+        for slot, (index, item) in enumerate(selected, start=1):
+            hasher.update(f"|slot={slot}|index={index}|".encode("utf-8"))
+            hasher.update(item["id"].encode("utf-8"))
+            hasher.update(b"|")
+            hasher.update(item["annotated"].encode("utf-8"))
+            try:
+                path = folder_paths.get_annotated_filepath(item["annotated"])
+                with open(path, "rb") as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+            except FileNotFoundError:
+                return _unresolved_change_hash(
+                    state,
+                    f"missing|slot={slot}|index={index}|id={item['id']}|annotated={item['annotated']}",
+                )
         return hasher.hexdigest()
 
     @classmethod
     def VALIDATE_INPUTS(cls, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
-        """
-        Validate that a selectable image item exists in the provided state and that its annotated file exists.
-        
-        Parameters:
-        	state_json (Any): Serialized node state or raw state structure to validate.
-        	queue_item_json (Any): Optional queue payload used to select a specific item (e.g., `{"id": "...", "annotated": "..."}`).
-        
-        Returns:
-        	True on successful validation.
-        	str: An error message when validation fails. Possible messages:
-        		"Image Conveyor: no images have been added to the node." — when the state contains no items.
-        		Contents of the selection error (from `_select_item`) — when item selection fails.
-        		"Image Conveyor: missing file '<path>'." — when the selected item's annotated file is not found.
-        """
         del ui_state_json
         state = _normalize_state(state_json)
         if not state["items"]:
             return "Image Conveyor: no images have been added to the node."
 
         try:
-            _index, item = _select_item(
+            selected = _select_group(
                 state, queue_item_json, allow_processed=state["dont_consume"]
             )
         except RuntimeError as exc:
             return str(exc)
 
-        if not folder_paths.exists_annotated_filepath(item["annotated"]):
-            return f"Image Conveyor: missing file '{item['annotated']}'."
+        for _index, item in selected:
+            if not folder_paths.exists_annotated_filepath(item["annotated"]):
+                return f"Image Conveyor: missing file '{item['annotated']}'."
 
         return True
 
     def load_next(self, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
-        """
-        Load the next selected image, compute remaining pending count, and produce a UI state delta.
-        
-        Parameters:
-            state_json (Any): Serialized node state (will be normalized) containing the list of items.
-            ui_state_json (Any): Serialized UI state (will be normalized); used to resolve the runtime source path for the selected item.
-            queue_item_json (Any): Optional queue payload that can influence which item is selected.
-        
-        Returns:
-            dict: A mapping with two keys:
-                - "result": A tuple containing:
-                    - image: The loaded image object.
-                    - mask: The loaded mask object (may be None).
-                    - annotated (str): The resolved annotated file path that was loaded.
-                    - index (int): 1-based index of the selected item within the state list.
-                    - remaining_pending (int): Number of other items in the state whose status is "pending".
-                    - source_path (str): The resolved runtime source path for the selected item (prefers UI override).
-                - "ui": A dict with key "batch_image_loader_delta" whose value is a single-item list containing a JSON string of the delta object with fields:
-                    - version: State schema version.
-                    - processed_item_id: ID of the processed item.
-                    - processed_annotated: Annotated path of the processed item.
-                    - new_status: The new status applied ("processed").
-        """
         state = _normalize_state(state_json)
         ui_state = _normalize_ui_state(ui_state_json)
         dont_consume = state["dont_consume"]
-        index, item = _select_item(
+        selected = _select_group(
             state, queue_item_json, allow_processed=dont_consume
         )
 
-        annotated = item["annotated"]
-        source_path = _get_runtime_source_path(ui_state, item)
-        image, mask = nodes.LoadImage().load_image(annotated)
+        loader = nodes.LoadImage()
+        loaded_images: List[Any] = []
+        first_mask = None
+        for slot, (_index, item) in enumerate(selected):
+            image, mask = loader.load_image(item["annotated"])
+            loaded_images.append(image)
+            if slot == 0:
+                first_mask = mask
 
-        remaining_pending = 0
-        for idx, candidate in enumerate(state["items"]):
-            if not dont_consume and idx == index:
-                continue
-            if candidate["status"] == "pending":
-                remaining_pending += 1
+        first_index, first_item = selected[0]
+        annotated = first_item["annotated"]
+        source_path = _get_runtime_source_path(ui_state, first_item)
+        selected_ids = {item["id"] for _index, item in selected}
+        remaining_pending = sum(
+            1
+            for item in state["items"]
+            if item["status"] == "pending"
+            and (dont_consume or item["id"] not in selected_ids)
+        )
 
+        processed_items = [
+            {"id": item["id"], "annotated": item["annotated"]}
+            for _index, item in selected
+        ]
         delta = {
             "version": _STATE_VERSION,
-            "processed_item_id": item["id"],
+            "processed_item_id": first_item["id"],
             "processed_annotated": annotated,
+            "processed_items": processed_items,
             "new_status": "processed",
             "consumed": not dont_consume,
         }
 
+        additional_images = loaded_images[1:] + [None] * (
+            _MAX_IMAGES_PER_EXECUTION - len(loaded_images)
+        )
         return {
             "result": (
-                image,
-                mask,
+                loaded_images[0],
+                first_mask,
                 annotated,
-                index + 1,
+                first_index + 1,
                 remaining_pending,
                 source_path,
+                *additional_images,
             ),
             "ui": {
                 "batch_image_loader_delta": [json.dumps(delta, separators=(",", ":"))],

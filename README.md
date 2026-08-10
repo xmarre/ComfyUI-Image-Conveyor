@@ -6,7 +6,7 @@ A sequential, visual image queue for ComfyUI with an integrated input-folder bro
 
 ## What it does
 
-Image Conveyor keeps a visible queue inside the graph and loads one image per prompt execution. The node starts with two permanent browser tabs:
+Image Conveyor keeps a visible queue inside the graph and returns one ordered Conveyor image per prompt execution by default. **Images per execution** can be set from 1 through 9 when one node needs to provide several distinct consecutive images during the same execution. The node starts with two permanent browser tabs:
 
 - **Conveyor** is the ordered execution queue. Items retain their pending, queued, and processed states.
 - **Input Folder** browses the current ComfyUI `input/` directory recursively and adds existing images to the queue without uploading, copying, renaming, or serializing the folder listing into the workflow.
@@ -87,6 +87,7 @@ Search and filters change the browser presentation only. Applying a Conveyor sor
 - Tab changes, scrolling, searching, filtering, focus, and thumbnail-size changes do not serialize `state_json`.
 - Input Folder and local-folder browsing datasets are runtime-only and never enlarge workflow JSON.
 - Queue mutations still commit the compatible version-1 queue schema.
+- Multi-image execution loads and hashes only the selected group, with a maximum of nine images. It does not scan image contents across the rest of the Conveyor.
 
 The backend exposes input-only routes for recursive listing, exact upload resolution, managed duplicate cleanup, and thumbnails. Relative paths are containment-checked against ComfyUI's actual input directory; traversal, absolute paths, and symlink escapes are rejected.
 
@@ -98,7 +99,19 @@ Each Conveyor item has one of three states:
 - `queued`
 - `processed`
 
-Queued prompt runs reserve pending items in order. Successful execution marks the selected item processed. If a prompt fails before the node executes, its item may remain queued; **Clear queued** releases those reservations.
+**Images per execution** controls the size of one ordered execution group:
+
+- `1` is the default and retains the normal single-image queue behavior;
+- `2` through `9` reserve that many distinct consecutive queue entries for one prompt execution;
+- consuming mode advances by complete groups;
+- **Don't consume** leaves the selected group reusable, so an unchanged queue returns the same ordered group again;
+- an incomplete group fails validation instead of repeating an image or silently filling missing slots.
+
+Queued prompt runs reserve complete pending groups in Conveyor order. The complete reservation is frozen into the queued prompt, so later live reordering does not change the reference order for that already-queued execution. Successful consuming execution marks every reserved member processed. If a prompt fails before the node executes, its members may remain queued; **Clear queued** releases those individual reservations.
+
+For example, with `A B C D E F`, **Images per execution = 2**, and consuming enabled, three queued prompts reserve `A B`, `C D`, and `E F`. With **Don't consume** enabled, a queue `A B C D` and count `3` returns `A B C` again on the next unchanged execution.
+
+Repeated logical queue entries remain valid. Two different Conveyor entries that both reference the same physical `same.png` file can occupy separate output slots because reservation identity follows the queue-entry IDs.
 
 Available queue controls include:
 
@@ -107,12 +120,31 @@ Available queue controls include:
 - clear queued reservations;
 - remove processed entries;
 - apply queue sorting;
+- set **Images per execution** from 1 through 9;
 - enable **Auto queue all pending**;
 - enable **Don't consume**;
 - enable **Catch canvas drops**;
 - preview and clean exact duplicates from the legacy managed input folder.
 
+**Auto queue all pending** counts complete execution groups. If seven images are pending and the group size is three, two complete prompts can be queued and the seventh image remains pending until enough images exist for another complete group.
+
 Deleting a Conveyor card removes the queue entry. The Input Folder tab is a non-destructive source picker and does not delete files.
+
+## Multi-image wiring
+
+All image outputs are independent ComfyUI `IMAGE` values. Image Conveyor does not stack, resize, pad, or otherwise force selected references to a common geometry.
+
+For a three-image execution group, wire:
+
+```text
+Image Conveyor.image    -> downstream image/reference input 1
+Image Conveyor.image_2  -> downstream image/reference input 2
+Image Conveyor.image_3  -> downstream image/reference input 3
+```
+
+The existing `image` output is always selected image #1. `image_2` through `image_9` map to subsequent queue entries in the reserved order. Outputs above the configured count are inactive.
+
+MiniMax H3 Ref2VA is one practical use case: `image`, `image_2`, `image_3`, and so on can be connected to its separate reference-image inputs while Image Conveyor remains model-agnostic.
 
 ## Canvas-wide drop capture
 
@@ -128,20 +160,32 @@ JSON and workflow drops are left to ComfyUI.
 
 ## Outputs
 
-The node exposes:
+The node exposes these stable output slots:
 
-- `image`
-- `mask`
-- `path`
-- `index`
-- `remaining_pending`
-- `source_path`
+| Slot | Output | Meaning |
+| ---: | --- | --- |
+| 0 | `image` | Selected image #1 |
+| 1 | `mask` | Mask for selected image #1 |
+| 2 | `path` | Annotated ComfyUI path for selected image #1 |
+| 3 | `index` | Conveyor index for selected image #1 |
+| 4 | `remaining_pending` | Pending queue entries remaining under the current consume mode |
+| 5 | `source_path` | Best-effort source hint for selected image #1 |
+| 6 | `image_2` | Selected image #2 when active |
+| 7 | `image_3` | Selected image #3 when active |
+| 8 | `image_4` | Selected image #4 when active |
+| 9 | `image_5` | Selected image #5 when active |
+| 10 | `image_6` | Selected image #6 when active |
+| 11 | `image_7` | Selected image #7 when active |
+| 12 | `image_8` | Selected image #8 when active |
+| 13 | `image_9` | Selected image #9 when active |
 
 `path` is the annotated ComfyUI input path actually loaded. `source_path` is an optional best-effort source hint. Absolute native paths are reduced to filename-only before persistence so exported workflows do not leak arbitrary local paths.
 
 ## Compatibility
 
-The node keeps the existing `ImageConveyor` class, the legacy `SequentialBatchImageLoader` alias, outputs, queue item shape, version-1 state normalization, and prompt reservation/execution delta behavior. Existing workflows load without recreating the node.
+The original six output slots remain at indices `0` through `5` in their existing order. The eight additional `IMAGE` outputs are appended at indices `6` through `13`, so saved links to the original outputs keep their indices.
+
+The node keeps the existing `ImageConveyor` class, the legacy `SequentialBatchImageLoader` alias, version-1 state schema, legacy single-item queue reservation shape, and legacy singular execution-delta fields. Version-1 workflows that do not contain `images_per_execution` normalize to `1`. Group reservations and group deltas extend the existing payloads additively.
 
 The frontend uses ComfyUI's custom widget + DOMWidget integration and remains VueNodes-compatible.
 
@@ -165,7 +209,11 @@ Restart ComfyUI after installation or update.
 ```bash
 python -m unittest discover -s tests -p 'test_*.py' -v
 node --test tests/test_gallery_math.mjs
+node --test tests/test_queue_groups.mjs
 node --check web/image_conveyor.js
+node --check web/image_conveyor_math.mjs
+python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py
+git diff --check
 ```
 
-The Python suite covers duplicate resolution, stale metadata, canonical selection, managed duplicate cleanup and revalidation, concurrent uploads, index recovery, recursive listing, thumbnails, path containment, and queue compatibility. The JavaScript tests verify responsive gallery geometry, drag lifecycle behavior, fixed and removable tab state, directory-picker grouping, high-speed card reuse, and bounded virtualization for a 10,000-item collection.
+The Python suite covers queue/group compatibility, reservation strictness, output mapping, cache identity, duplicate resolution, stale metadata, canonical selection, managed duplicate cleanup and revalidation, concurrent uploads, index recovery, recursive listing, thumbnails, and path containment. The JavaScript tests verify queue-time group reservation, non-overlap, Don't consume behavior, group-aware auto-queue math, backend-delta compatibility, scrollbar-preservation resize behavior, responsive gallery geometry, drag lifecycle behavior, fixed and removable tab state, directory-picker grouping, high-speed card reuse, and bounded virtualization for a 10,000-item collection.
