@@ -74,8 +74,12 @@ class ImageConveyorStateTest(unittest.TestCase):
         payload = conveyor._default_state()
         payload["items"] = entries
         payload.update(options)
+        normalized_count = conveyor._normalize_images_per_execution(options.get("images_per_execution", 1))
+        if normalized_count > 1 and "output_mode" not in options:
+            payload["output_mode"] = conveyor._OUTPUT_MODE_QUEUE_GROUP
         if legacy:
             payload.pop("images_per_execution", None)
+            payload.pop("output_mode", None)
         return json.dumps(payload)
 
     def materialize(self, entry, contents=b"image-bytes"):
@@ -91,8 +95,41 @@ class ImageConveyorStateTest(unittest.TestCase):
 
     def test_legacy_v1_state_without_count_normalizes_to_one(self):
         state = conveyor._normalize_state(self.state([item("one")], legacy=True))
-        self.assertEqual(1, state["version"])
+        self.assertEqual(2, state["version"])
         self.assertEqual(1, state["images_per_execution"])
+        self.assertEqual(conveyor._OUTPUT_MODE_PERSISTENT, state["output_mode"])
+
+    def test_legacy_state_with_multi_count_migrates_to_queue_group(self):
+        payload = conveyor._default_state()
+        payload.pop("output_mode")
+        payload["images_per_execution"] = 3
+        payload["items"] = [item("A"), item("B"), item("C")]
+        state = conveyor._normalize_state(json.dumps(payload))
+        self.assertEqual(conveyor._OUTPUT_MODE_QUEUE_GROUP, state["output_mode"])
+        self.assertEqual(3, conveyor._effective_images_per_execution(state))
+
+    def test_new_default_uses_persistent_references_and_one_queue_item(self):
+        entries = [item("A"), item("B"), item("C")]
+        state = conveyor._normalize_state(self.state(entries, images_per_execution=9, output_mode="persistent_refs"))
+        selected = conveyor._select_group(state, "")
+        self.assertEqual(["A"], [entry["id"] for _, entry in selected])
+
+    def test_reference_slots_normalize_to_fixed_sparse_eight(self):
+        reference = {"annotated": "refs/one.png [input]", "filename": "one.png", "subfolder": "refs", "type": "input"}
+        state = conveyor._normalize_state(self.state([], reference_slots=[reference, "bad", None]))
+        self.assertEqual(8, len(state["reference_slots"]))
+        self.assertEqual(reference, state["reference_slots"][0])
+        self.assertEqual([None] * 7, state["reference_slots"][1:])
+
+    def test_reference_state_rejects_absolute_traversal_output_and_unsupported_paths(self):
+        values = [
+            {"annotated": "/tmp/a.png [input]", "type": "input"},
+            {"annotated": "../a.png [input]", "type": "input"},
+            {"annotated": "a.png [output]", "type": "input"},
+            {"annotated": "a.svg [input]", "type": "input"},
+        ]
+        state = conveyor._normalize_state(self.state([], reference_slots=values))
+        self.assertEqual([None] * 8, state["reference_slots"])
 
     def test_images_per_execution_range_normalization(self):
         cases = {0: 1, -5: 1, "bad": 1, None: 1, 3.5: 3, 10: 9, 999: 9}
@@ -234,6 +271,49 @@ class ImageConveyorStateTest(unittest.TestCase):
             ["A.png [input]", "B.png [input]", "C.png [input]"],
             FakeLoadImage.calls,
         )
+
+    def test_persistent_reference_output_mapping_is_sparse_and_never_consumed(self):
+        entries = [item("A"), item("B")]
+        refs = [
+            {"annotated": "R1.png [input]", "filename": "R1.png", "subfolder": "", "type": "input"},
+            None,
+            {"annotated": "R3.png [input]", "filename": "R3.png", "subfolder": "", "type": "input"},
+        ]
+        result = conveyor.ImageConveyor().load_next(
+            self.state(entries, output_mode="persistent_refs", reference_slots=refs)
+        )["result"]
+        self.assertEqual("image:A.png [input]", result[0])
+        self.assertEqual("image:R1.png [input]", result[6])
+        self.assertIsNone(result[7])
+        self.assertEqual("image:R3.png [input]", result[8])
+        self.assertEqual([None] * 5, list(result[9:]))
+        self.assertEqual(1, result[4])
+        self.assertEqual(["A.png [input]", "R1.png [input]", "R3.png [input]"], FakeLoadImage.calls)
+        delta = json.loads(conveyor.ImageConveyor().load_next(
+            self.state(entries, output_mode="persistent_refs", reference_slots=refs)
+        )["ui"]["batch_image_loader_delta"][0])
+        self.assertEqual(["A"], [entry["id"] for entry in delta["processed_items"]])
+
+    def test_persistent_reference_missing_validation_identifies_slot(self):
+        main = item("A")
+        self.materialize(main)
+        refs = [None, None, None, {"annotated": "missing.png [input]", "type": "input"}]
+        raw = self.state([main], output_mode="persistent_refs", reference_slots=refs)
+        self.assertEqual(
+            "Image Conveyor: reference slot 4 is missing 'missing.png [input]'.",
+            conveyor.ImageConveyor.VALIDATE_INPUTS(raw),
+        )
+
+    def test_is_changed_tracks_reference_contents(self):
+        main = item("A")
+        reference = {"annotated": "R.png [input]", "filename": "R.png", "subfolder": "", "type": "input"}
+        self.materialize(main, b"main")
+        reference_entry = item("R", "R.png [input]")
+        reference_path = self.materialize(reference_entry, b"reference")
+        raw = self.state([main], output_mode="persistent_refs", reference_slots=[reference])
+        baseline = conveyor.ImageConveyor.IS_CHANGED(raw)
+        reference_path.write_bytes(b"changed-reference")
+        self.assertNotEqual(baseline, conveyor.ImageConveyor.IS_CHANGED(raw))
 
     def test_metadata_outputs_describe_first_selected_item(self):
         a, b, c = item("A", source_path="persisted/A.png"), item("B"), item("C")
