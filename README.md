@@ -2,6 +2,8 @@
 
 A sequential, visual image queue for ComfyUI with an integrated input-folder browser.
 
+<img width="673" height="1109" alt="2026-08-10 10_39_14-Bilder und 11 weitere Registerkarten – Explorer" src="https://github.com/user-attachments/assets/34cd4dd3-ae28-49c1-9472-cee8a7e5ea57" />
+
 ## What it does
 
 Image Conveyor keeps a visible queue inside the graph and loads one image per prompt execution. The node starts with two permanent browser tabs:
