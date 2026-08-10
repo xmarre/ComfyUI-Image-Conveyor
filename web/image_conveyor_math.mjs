@@ -599,3 +599,190 @@ export function shouldReanchorGalleryResize(
     previousWidget > 0 && currentWidget > 0 &&
     previousWidget !== currentWidget && previousViewport !== currentViewport
 }
+
+export const OUTPUT_MODE_PERSISTENT = 'persistent_refs'
+export const OUTPUT_MODE_QUEUE_GROUP = 'queue_group'
+export const REFERENCE_SLOT_COUNT = 8
+const REFERENCE_IMAGE_EXTENSIONS = new Set([
+  'png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'tif', 'tiff', 'avif'
+])
+
+export function normalizeOutputMode(value, imagesPerExecution = 1, hasExplicitMode = true) {
+  if (!hasExplicitMode) {
+    return normalizeImagesPerExecution(imagesPerExecution) > 1
+      ? OUTPUT_MODE_QUEUE_GROUP
+      : OUTPUT_MODE_PERSISTENT
+  }
+  return value === OUTPUT_MODE_QUEUE_GROUP
+    ? OUTPUT_MODE_QUEUE_GROUP
+    : OUTPUT_MODE_PERSISTENT
+}
+
+export function effectiveQueueGroupSize(outputMode, imagesPerExecution) {
+  return normalizeOutputMode(outputMode, imagesPerExecution, true) === OUTPUT_MODE_QUEUE_GROUP
+    ? normalizeImagesPerExecution(imagesPerExecution)
+    : 1
+}
+
+export function normalizeReferenceSlot(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const annotated = String(value.annotated ?? '').trim()
+  const type = String(value.type ?? 'input').trim().toLowerCase() || 'input'
+  if (!annotated.endsWith(' [input]') || type !== 'input') return null
+  const relativePath = annotated.slice(0, -' [input]'.length).trim().replaceAll('\\', '/')
+  const parts = relativePath.split('/')
+  const extension = parts.at(-1)?.split('.').at(-1)?.toLowerCase() ?? ''
+  if (
+    !relativePath || relativePath.startsWith('/') || /^[a-zA-Z]:/.test(relativePath) ||
+    parts.some((part) => !part || part === '.' || part === '..') ||
+    !REFERENCE_IMAGE_EXTENSIONS.has(extension)
+  ) return null
+  const filename = parts.at(-1)
+  return {
+    annotated: `${relativePath} [input]`,
+    filename,
+    subfolder: parts.slice(0, -1).join('/'),
+    type: 'input'
+  }
+}
+
+export function normalizeReferenceSlots(value) {
+  const source = Array.isArray(value) ? value : []
+  return Array.from({ length: REFERENCE_SLOT_COUNT }, (_, index) => (
+    normalizeReferenceSlot(source[index])
+  ))
+}
+
+export function updateReferenceSlot(slots, index, value) {
+  const normalized = normalizeReferenceSlots(slots)
+  const numericIndex = Math.trunc(Number(index))
+  if (numericIndex < 0 || numericIndex >= REFERENCE_SLOT_COUNT) return normalized
+  normalized[numericIndex] = normalizeReferenceSlot(value)
+  return normalized
+}
+
+export function applyReferenceAssignments(state, startIndex, references) {
+  const source = state && typeof state === 'object' ? state : {}
+  const next = { ...source, reference_slots: normalizeReferenceSlots(source.reference_slots) }
+  const start = Math.trunc(Number(startIndex))
+  if (!Number.isFinite(start)) return next
+  for (let offset = 0; offset < (Array.isArray(references) ? references.length : 0); offset += 1) {
+    const index = start + offset
+    if (index < 0 || index >= REFERENCE_SLOT_COUNT) break
+    const reference = normalizeReferenceSlot(references[offset])
+    if (reference) next.reference_slots[index] = reference
+  }
+  return next
+}
+
+export function referenceSlotsEqual(left, right) {
+  const a = normalizeReferenceSlots(left)
+  const b = normalizeReferenceSlots(right)
+  return a.every((slot, index) => (
+    slot?.annotated === b[index]?.annotated &&
+    slot?.filename === b[index]?.filename &&
+    slot?.subfolder === b[index]?.subfolder &&
+    slot?.type === b[index]?.type
+  ))
+}
+
+export function relinkReferenceSlots(slots, replacements) {
+  const normalized = normalizeReferenceSlots(slots)
+  const mapping = new Map()
+  for (const entry of Array.isArray(replacements) ? replacements : []) {
+    const oldPath = String(entry?.relative_path ?? '').trim().replaceAll('\\', '/')
+    const keepPath = String(entry?.keep_path ?? '').trim().replaceAll('\\', '/')
+    if (oldPath && keepPath) mapping.set(oldPath, keepPath)
+  }
+  let changed = 0
+  for (let index = 0; index < normalized.length; index += 1) {
+    const slot = normalized[index]
+    if (!slot) continue
+    const oldPath = slot.annotated.slice(0, -' [input]'.length)
+    const keepPath = mapping.get(oldPath)
+    if (!keepPath) continue
+    const replacement = normalizeReferenceSlot({ annotated: `${keepPath} [input]`, type: 'input' })
+    if (!replacement) continue
+    normalized[index] = replacement
+    changed += 1
+  }
+  return { slots: normalized, changed }
+}
+
+export function loadPresetSnapshot(preset) {
+  return {
+    activePresetId: String(preset?.id ?? '').trim(),
+    slots: normalizeReferenceSlots(preset?.slots)
+  }
+}
+
+export function classifyReferenceDrag(item, view, canReorder = false) {
+  if (!item || typeof item !== 'object' || item.kind === 'folder') return null
+  if (view === 'conveyor') return {
+    kind: 'conveyor',
+    requiresImport: false,
+    canReorder: Boolean(canReorder)
+  }
+  if (view === 'input') return { kind: 'input', requiresImport: false, canReorder: false }
+  if (item.localFile) return { kind: 'local', requiresImport: true, canReorder: false }
+  return null
+}
+
+export function calculateReferenceShelfLayout(
+  nodeWidth,
+  widgetY,
+  outputGutter = 112,
+  titleHeight = 30
+) {
+  const width = Math.max(0, Number(nodeWidth) || 0)
+  const bottom = Math.max(titleHeight, Number(widgetY) || 0)
+  const left = 10
+  const top = titleHeight + 2
+  const right = Math.max(left, width - Math.max(72, Number(outputGutter) || 0))
+  const availableWidth = Math.max(0, right - left)
+  const headerHeight = 25
+  const gap = 5
+  const gridTop = top + headerHeight + gap
+  const availableHeight = Math.max(0, bottom - gridTop - 5)
+  const cellWidth = Math.max(0, (availableWidth - gap * 3) / 4)
+  const cellHeight = Math.max(0, (availableHeight - gap) / 2)
+  const slots = Array.from({ length: REFERENCE_SLOT_COUNT }, (_, index) => ({
+    index,
+    x: left + (index % 4) * (cellWidth + gap),
+    y: gridTop + Math.floor(index / 4) * (cellHeight + gap),
+    width: cellWidth,
+    height: cellHeight
+  }))
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    headerHeight,
+    gridTop,
+    width: availableWidth,
+    height: Math.max(0, bottom - top),
+    slots,
+    usable: cellWidth >= 38 && cellHeight >= 28
+  }
+}
+
+export function referenceShelfHit(layout, x, y) {
+  if (!layout?.usable) return null
+  const px = Number(x)
+  const py = Number(y)
+  for (const slot of layout.slots ?? []) {
+    if (px < slot.x || py < slot.y || px > slot.x + slot.width || py > slot.y + slot.height) continue
+    const clearSize = Math.min(18, Math.max(10, slot.height * 0.28))
+    const clear = px >= slot.x + slot.width - clearSize && py <= slot.y + clearSize
+    return { type: clear ? 'clear' : 'slot', index: slot.index }
+  }
+  if (px >= layout.left && px <= layout.right && py >= layout.top && py <= layout.top + layout.headerHeight) {
+    const menuWidth = Math.min(54, layout.width * 0.18)
+    const saveWidth = Math.min(52, layout.width * 0.18)
+    if (px >= layout.right - menuWidth) return { type: 'menu' }
+    if (px >= layout.right - menuWidth - saveWidth) return { type: 'save' }
+    return { type: 'preset' }
+  }
+  return null
+}
