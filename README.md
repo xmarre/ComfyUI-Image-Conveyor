@@ -1,89 +1,128 @@
 # ComfyUI Image Conveyor
 
-A sequential drag-and-drop image queue node for ComfyUI.
-
-<img width="538" height="728" alt="image" src="https://github.com/user-attachments/assets/5dc146c5-1971-493f-8311-12d93b867a05" />
+A sequential, visual image queue for ComfyUI with an integrated input-folder browser.
 
 ## What it does
 
-- Drag and drop any number of images into the node
-- Drag and drop folders onto the node to enqueue supported images recursively
-- Optional **Catch canvas drops** mode can route external image/folder drops from anywhere on the graph canvas into the conveyor
-- Shows the queued images directly in the node UI with thumbnails
-- The visible thumbnail list expands with the node height instead of being capped to a fixed row count; taller nodes show more queued images
-- Processes one image per prompt execution in queue order
-- If you queue multiple prompt runs, the next pending items are reserved and then processed sequentially
-- Optional **Auto queue all pending** mode can expand a single queue action into one queued prompt per pending image
-- Marks processed items automatically when the loader node executes successfully
-- Lets you manually reset items to pending, force them to processed, delete them, reorder them, and sort them
+Image Conveyor keeps a visible queue inside the graph and loads one image per prompt execution. The node starts with two permanent browser tabs:
 
-## Why this exists
+- **Conveyor** is the ordered execution queue. Items retain their pending, queued, and processed states.
+- **Input Folder** browses the current ComfyUI `input/` directory recursively and adds existing images to the queue without uploading, copying, renaming, or serializing the folder listing into the workflow.
 
-This node is for **sequential in-graph image queueing**.
+Selected local folders can be opened as additional, removable tabs. Every tab uses the responsive, thumbnail-first gallery and remembers its own search, filter, sort, selection, keyboard focus, thumbnail size, and scroll position while the node is open.
 
-The main use case is dropping in a set of images, keeping the queue visible directly on the node, and consuming them **one prompt execution at a time** without relying on an external folder iterator workflow.
+## Browsing local folders as tabs
 
-Existing batch image loaders generally solve a different problem. Many are oriented around folder iteration, one-shot batch loading, or less explicit queue state. Image Conveyor is meant to give you a **visible in-graph queue**, **clear item state**, **manual intervention when needed**, and **predictable sequential consumption across queued prompt runs**.
+**Add folders** opens local folders as browser tabs without importing their images. You can also drag one or more folders onto the tab strip. Nested directories appear as folder cards; clicking one opens that directory in another tab.
 
+Folder tabs compress automatically as the strip fills. Inactive removable tabs keep their close button while there is enough room; it disappears below the safe-width cutoff so a compressed tab remains easy to select. The active removable tab always keeps its close button. **Conveyor** and **Input Folder** cannot be closed.
 
-## Canvas-wide drop capture
+The tab strip and main gallery are separate drop targets:
 
-Enable **Catch canvas drops** on a conveyor node to let it receive external image and folder drops made anywhere inside the graph canvas, not only drops made directly over the node.
+- dropping folders on the tab strip opens them for browsing;
+- dropping the same folders elsewhere on the node keeps the established behavior and imports their supported images into the Conveyor recursively.
 
-Routing is intentionally conservative:
+The directory picker requests multiple folders and accepts every top-level folder returned by the browser. Some Chromium/platform picker combinations allow only one directory per dialog; use **Add folders** again or multi-folder drag/drop in that case.
 
-1. Dropping directly on the conveyor widget still uses the normal in-node drop path.
-2. If exactly one conveyor with **Catch canvas drops** enabled is selected, canvas-level drops go to that conveyor.
-3. If the pointer is over a conveyor with **Catch canvas drops** enabled, that conveyor receives the drop.
-4. If exactly one conveyor in the graph has **Catch canvas drops** enabled, it receives the drop.
-5. If multiple conveyors have it enabled and no single target can be inferred, the drop is left to ComfyUI's normal canvas drop handling. Select the target conveyor first.
+Local folder access is runtime-only. The folder contents and tabs are not serialized into the workflow and must be selected again after reloading the page. Closing the last tab belonging to a selected folder releases its browser file references and cached preview URLs. Adding a local image or selection to the Conveyor sends those files through the normal input upload and exact-deduplication pipeline.
 
-The interceptor only consumes external image/folder drops after a conveyor target has been resolved. JSON/workflow drops are left to ComfyUI.
+## Adding images
 
-## Queue / state behavior
+Images can be added through:
 
-Each item has a status:
+- the **Add images** picker;
+- image or folder drag/drop directly onto the node;
+- recursive folder drag/drop with relative folders preserved;
+- image paste while the node is focused or hovered;
+- optional canvas-wide drop capture;
+- **Add** / **Add selected** from the Input Folder tab;
+- **Add** / **Add selected** from a local folder tab.
+
+Picker, drop, paste, canvas-capture, and local-folder-tab additions import external files into ComfyUI input storage. Individual files are stored directly in the input root; dropped or selected folders preserve their own input-relative directory structure. The Input Folder path creates a queue reference to a file that already exists there.
+
+## Exact duplicate resolution
+
+External imports are resolved by exact file contents using SHA-256:
+
+- byte-identical files reuse one existing physical file even when their incoming names or source folders differ;
+- files with the same size and different bytes remain separate;
+- re-encoded or merely similar images remain separate;
+- existing duplicates are reused without creating another file;
+- repeated queue entries may intentionally reference the same physical input file.
+
+Canonical selection is deterministic: an identical intended target is preferred, followed by an ordinary input path and then a legacy path under `input/image_conveyor/`, with stable relative-path ordering inside each category. New imports no longer create the `image_conveyor` subfolder. Existing unique files there remain valid and are not moved automatically.
+
+The resolver keeps a persistent SQLite cache under ComfyUI's user cache directory. Input listing records path, size, and modification time without decoding or hashing image contents. Each import batch performs one fresh metadata reconciliation, then each incoming file is streamed and hashed once; only same-size existing candidates whose cached digest is missing or stale are hashed. Simultaneous identical imports are serialized by digest so they produce one physical file.
+
+**Clean exact duplicates** is available under **Queue options and bulk tools**. It previews byte-identical redundant files under the legacy `input/image_conveyor/` folder, shows the retained path and reclaimable size, and requires confirmation before deletion. Queued Conveyor paths are protected, open-node references are changed to the retained file before deletion, and the server hashes both sides again immediately before each deletion. Files changed since the preview are skipped; unique files and duplicates outside the legacy folder remain untouched; empty legacy directories are pruned. Run cleanup with no generation active. A saved workflow that is not open can still contain a deleted legacy path; the confirmation calls out that limitation explicitly.
+
+## Gallery and large-list navigation
+
+The main browser provides:
+
+- responsive columns and Small / Medium / Large thumbnails;
+- filename/path search;
+- pending, queued, and processed Conveyor filters;
+- recursive folder filtering in Input Folder;
+- clickable nested-directory cards in local folder tabs;
+- name/date sorting;
+- direct click selection, Ctrl/Cmd toggling, Shift range selection, and contextual bulk actions;
+- anchored drag-box selection from the gallery background or the gaps between cards, with edge auto-scroll;
+- a larger full-resolution preview on double-click or Enter;
+- arrow-key navigation, Home, End, PageUp, PageDown, Space selection, and Escape to close preview;
+- **Jump to next pending**;
+- drag reorder in unfiltered manual Conveyor order.
+
+Search and filters change the browser presentation only. Applying a Conveyor sort retains the established behavior of changing the actual queue order.
+
+## Performance behavior
+
+- The gallery is virtualized by logical rows. Its live card count tracks the viewport plus a small overscan, rather than the total collection size.
+- Only visible and near-visible cards request cached, bounded WebP thumbnails. Full-resolution images load only for explicit preview.
+- Local folder tabs create browser object URLs lazily for visible cards, cap the URL cache, and defer new decodes during high-speed scrolling.
+- Input Folder enumeration and the one-per-import-batch reconciliation use lightweight `os.scandir()` metadata in a worker thread and a short-lived snapshot cache.
+- Opening and navigating a local folder tab performs no upload, content hashing, or server-side filesystem write.
+- Tab changes, scrolling, searching, filtering, focus, and thumbnail-size changes do not serialize `state_json`.
+- Input Folder and local-folder browsing datasets are runtime-only and never enlarge workflow JSON.
+- Queue mutations still commit the compatible version-1 queue schema.
+
+The backend exposes input-only routes for recursive listing, exact upload resolution, managed duplicate cleanup, and thumbnails. Relative paths are containment-checked against ComfyUI's actual input directory; traversal, absolute paths, and symlink escapes are rejected.
+
+## Queue behavior
+
+Each Conveyor item has one of three states:
 
 - `pending`
 - `queued`
 - `processed`
 
-This makes it easy to distinguish between items that are still waiting, items already reserved by queued prompt runs, and items that are done.
+Queued prompt runs reserve pending items in order. Successful execution marks the selected item processed. If a prompt fails before the node executes, its item may remain queued; **Clear queued** releases those reservations.
 
-If a prompt reserves an image but fails before the loader node executes, that item can remain `queued`. There is a **Clear queued** action to release those reservations.
+Available queue controls include:
 
-## Frontend integration
+- mark selected pending or processed;
+- delete selected queue entries with the button or the standard `Delete` key (`Entf` on German keyboards);
+- clear queued reservations;
+- remove processed entries;
+- apply queue sorting;
+- enable **Auto queue all pending**;
+- enable **Don't consume**;
+- enable **Catch canvas drops**;
+- preview and clean exact duplicates from the legacy managed input folder.
 
-This package is **VueNodes-compatible** with the ComfyUI frontend.
+Deleting a Conveyor card removes the queue entry. The Input Folder tab is a non-destructive source picker and does not delete files.
 
-Implementation detail:
+## Canvas-wide drop capture
 
-- it uses the frontend's supported **custom widget + DOMWidget** path
-- in VueNodes mode, the frontend renders that widget through its Vue-side `WidgetDOM` bridge
+Enable **Catch canvas drops** to route external image/folder drops from the graph canvas to a conveyor:
 
-So this is not a compiled custom `.vue` SFC shipped by the extension, and not a brittle ad-hoc canvas-only hack. It is wired into the supported frontend rendering path.
+1. A drop directly on a Conveyor widget uses that node.
+2. If exactly one enabled Conveyor is selected, it receives the canvas drop.
+3. If the pointer is over an enabled Conveyor, that node receives it.
+4. If exactly one Conveyor in the graph has capture enabled, it receives the drop.
+5. With multiple ambiguous enabled nodes, ComfyUI's normal canvas handling remains active. Select the intended Conveyor first.
 
-## Features
-
-- click to add images, or drag/drop images and folders
-- thumbnail list directly in-node
-- per-item status: `pending`, `queued`, `processed`
-- per-item quick actions: pending, done, delete
-- bulk actions:
-  - select all / clear selection
-  - set selected pending
-  - set selected processed
-  - delete selected
-  - clear queued
-  - remove processed
-- manual drag-and-drop reorder
-- sorting:
-  - manual order
-  - name ascending / descending
-  - newest / oldest
-  - status
-- optional **Auto queue all pending** toggle in the node UI
-- optional **Catch canvas drops** toggle for sending canvas-level external image/folder drops into the conveyor
+JSON and workflow drops are left to ComfyUI.
 
 ## Outputs
 
@@ -96,23 +135,35 @@ The node exposes:
 - `remaining_pending`
 - `source_path`
 
-So it can be used both as a simple sequential loader and as part of queue-driven workflows that need metadata and queue state.
+`path` is the annotated ComfyUI input path actually loaded. `source_path` is an optional best-effort source hint. Absolute native paths are reduced to filename-only before persistence so exported workflows do not leak arbitrary local paths.
 
-`path` is the ComfyUI-side annotated input path that the node actually loads.
-`source_path` is an optional best-effort hint for the original dropped path when the runtime exposes one
-(for example a folder-relative path during directory drops, or a native path in runtimes that explicitly provide it).
-Absolute native paths are intentionally redacted to filename-only before persistence to avoid leaking local directory details in exported workflows.
+## Compatibility
+
+The node keeps the existing `ImageConveyor` class, the legacy `SequentialBatchImageLoader` alias, outputs, queue item shape, version-1 state normalization, and prompt reservation/execution delta behavior. Existing workflows load without recreating the node.
+
+The frontend uses ComfyUI's custom widget + DOMWidget integration and remains VueNodes-compatible.
 
 ## Installation
 
-### Option 1: ComfyUI-Manager
+### ComfyUI-Manager
 
-Install **ComfyUI Image Conveyor** through **ComfyUI-Manager**, then restart ComfyUI.
+Install **ComfyUI Image Conveyor** through ComfyUI-Manager, then restart ComfyUI.
 
-### Option 2: Manual install
-
-Clone this repository into `ComfyUI/custom_nodes/`:
+### Manual
 
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/xmarre/ComfyUI-Image-Conveyor.git
+```
+
+Restart ComfyUI after installation or update.
+
+## Development checks
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+node --test tests/test_gallery_math.mjs
+node --check web/image_conveyor.js
+```
+
+The Python suite covers duplicate resolution, stale metadata, canonical selection, managed duplicate cleanup and revalidation, concurrent uploads, index recovery, recursive listing, thumbnails, path containment, and queue compatibility. The JavaScript tests verify responsive gallery geometry, drag lifecycle behavior, fixed and removable tab state, directory-picker grouping, high-speed card reuse, and bounded virtualization for a 10,000-item collection.

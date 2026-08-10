@@ -1,6 +1,27 @@
 import { app } from '../../scripts/app.js'
 import { api } from '../../scripts/api.js'
 import '../../scripts/domWidget.js'
+import {
+  CARD_FOOTER_HEIGHT,
+  calculateGalleryDropIntent,
+  calculateMarqueeGridIndexes,
+  calculateGalleryMetrics,
+  calculateReorderDestinationIndex,
+  calculateVisibleCardRange,
+  clientPointToScrollContent,
+  chooseViewAfterClose,
+  dispatchKeyboundCommandFallback,
+  groupDirectoryPickerFiles,
+  isDragLeavingDocument,
+  isGalleryViewportMeasurable,
+  isHighVelocityScroll,
+  isConveyorGalleryShortcut,
+  planCardSlotReuse,
+  planViewScrollSwitch,
+  prepareManagedDuplicateCleanup,
+  restoreGraphCanvasFocus,
+  isConveyorDeleteShortcut
+} from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -10,7 +31,6 @@ const QUEUE_WIDGET = 'queue_item_json'
 const CUSTOM_WIDGET_INPUT = 'batch_loader_ui'
 const CUSTOM_WIDGET_TYPE = 'BATCH_IMAGE_LOADER_UI'
 const DOM_WIDGET_NAME = 'batch_loader_ui'
-const DEFAULT_SUBFOLDER = 'image_conveyor'
 const STYLE_ID = 'comfy-batch-image-loader-style'
 const STATE_VERSION = 1
 const IMAGE_EXTENSIONS = new Set([
@@ -27,10 +47,109 @@ const IMAGE_EXTENSIONS = new Set([
 const MIN_WIDGET_HEIGHT = 540
 const MIN_NODE_WIDTH = 520
 const MIN_NODE_HEIGHT = 760
-const ROW_HEIGHT = 66
-const ROW_GAP = 6
-const ROW_STRIDE = ROW_HEIGHT + ROW_GAP
-const LIST_OVERSCAN = 6
+const CARD_GAP = 10
+const GALLERY_OVERSCAN_ROWS = 2
+const FAST_SCROLL_SETTLE_MS = 80
+const MARQUEE_DRAG_THRESHOLD = 4
+const MARQUEE_AUTOSCROLL_EDGE = 36
+const MARQUEE_AUTOSCROLL_MAX = 18
+const LOCAL_OBJECT_URL_LIMIT = 512
+const CARD_SIZES = {
+  small: { minWidth: 124, thumbnail: 160 },
+  medium: { minWidth: 172, thumbnail: 256 },
+  large: { minWidth: 224, thumbnail: 384 }
+}
+let keyboardOwnerNode = null
+const keyboardNodes = new Set()
+
+function claimGalleryKeyboardOwnership(node) {
+  if (keyboardOwnerNode && keyboardOwnerNode !== node) {
+    const previous = keyboardOwnerNode.__bil
+    if (previous) previous.keyboardActive = false
+  }
+  keyboardOwnerNode = node
+  if (node.__bil) node.__bil.keyboardActive = true
+}
+
+function releaseGalleryKeyboardOwnership(node) {
+  if (node.__bil) node.__bil.keyboardActive = false
+  if (keyboardOwnerNode === node) keyboardOwnerNode = null
+}
+
+function eventOrigin(event) {
+  return event.composedPath?.()[0] ?? event.target
+}
+
+function isNeutralKeyboardTarget(target) {
+  return target === document || target === document.body || target === document.documentElement
+}
+
+function conveyorForKeyboardTarget(target) {
+  if (!(target instanceof Node)) return null
+  for (const node of keyboardNodes) {
+    if (node.__bil?.root?.contains(target)) return node
+  }
+  return null
+}
+
+const keyboardCoordinator = {
+  attached: false,
+
+  registerNode(node) {
+    keyboardNodes.add(node)
+    if (this.attached) return
+    document.addEventListener('keydown', this.handleGalleryKeyDown, true)
+    window.addEventListener('keydown', this.handleComfyFallbackKeyDown)
+    this.attached = true
+  },
+
+  unregisterNode(node) {
+    keyboardNodes.delete(node)
+    releaseGalleryKeyboardOwnership(node)
+    if (keyboardNodes.size || !this.attached) return
+    document.removeEventListener('keydown', this.handleGalleryKeyDown, true)
+    window.removeEventListener('keydown', this.handleComfyFallbackKeyDown)
+    this.attached = false
+  },
+
+  handleGalleryKeyDown(event) {
+    if (event.defaultPrevented || event.isComposing || !keyboardNodes.size) return
+    const target = eventOrigin(event)
+    const canvas = app.canvas?.canvas
+    const neutralTarget = isNeutralKeyboardTarget(target)
+    const targetNode = target === canvas || neutralTarget
+      ? null
+      : conveyorForKeyboardTarget(target)
+    const owner = keyboardOwnerNode?.__bil ? keyboardOwnerNode : null
+    const ownerOwnsTarget = owner && (
+      target === canvas ||
+      targetNode === owner ||
+      neutralTarget
+    )
+    if (ownerOwnsTarget && isConveyorGalleryShortcut(event)) handleGalleryKeyDown(owner, event)
+  },
+
+  handleComfyFallbackKeyDown(event) {
+    if (event.defaultPrevented || event.isComposing || !keyboardNodes.size) return
+    dispatchKeyboundCommandFallback(event, app.extensionManager?.command, {
+      modalOpen: hasVisibleModal(),
+      onError: (error) => console.error('Image Conveyor: ComfyUI shortcut command failed.', error)
+    })
+  }
+}
+
+function hasVisibleModal() {
+  const candidates = document.querySelectorAll(
+    'dialog[open], [aria-modal="true"], .p-dialog-mask, .comfy-modal'
+  )
+  for (const element of candidates) {
+    if (element.hidden || element.getAttribute?.('aria-hidden') === 'true') continue
+    const style = globalThis.getComputedStyle?.(element)
+    if (style?.display === 'none' || style?.visibility === 'hidden') continue
+    return true
+  }
+  return false
+}
 
 function structuredCloneCompat(value) {
   if (typeof structuredClone === 'function') return structuredClone(value)
@@ -193,10 +312,6 @@ function itemStatusRank(status) {
   }
 }
 
-function getSelectedIds(uiState) {
-  return new Set(uiState.selected_ids)
-}
-
 function setWidgetValue(widget, value) {
   widget.value = value
   widget.callback?.(value)
@@ -224,7 +339,11 @@ function getWidgets(node) {
  * @param {object} node - The ComfyUI node containing the hidden `state` and `ui_state` widgets.
  * @returns {{state: object, uiState: object}} An object with `state` (normalized state shape) and `uiState` (normalized UI shape). `uiState.selected_ids` will contain only IDs present in `state.items`, and `uiState.source_paths` will only include entries whose keys match `state.items` IDs.
  */
-function getCurrentState(node) {
+function getCurrentState(node, { fromWidgets = false } = {}) {
+  const cached = node.__bil
+  if (!fromWidgets && cached?.state && cached?.uiState) {
+    return { state: cached.state, uiState: cached.uiState }
+  }
   const { stateWidget, uiStateWidget } = getWidgets(node)
   const state = parseState(stateWidget?.value ?? '')
   const uiState = parseUiState(uiStateWidget?.value ?? '')
@@ -254,19 +373,28 @@ function getRenderableState(node) {
   return snapshot
 }
 
-function updateState(node, state, uiState, { rerender = true } = {}) {
+function updateState(
+  node,
+  state,
+  uiState,
+  { rerender = true, commitState = true, commitUi = true } = {}
+) {
   const { stateWidget, uiStateWidget } = getWidgets(node)
   if (!stateWidget || !uiStateWidget) return
-  setWidgetValue(stateWidget, serializeState(state))
-  setWidgetValue(uiStateWidget, serializeUiState(uiState))
+  if (commitState) setWidgetValue(stateWidget, serializeState(state))
+  if (commitUi) setWidgetValue(uiStateWidget, serializeUiState(uiState))
+  if (commitState && node.__bil) {
+    node.__bil.queueRevision = (node.__bil.queueRevision || 0) + 1
+    node.__bil.annotatedCountsRevision = -1
+  }
   cacheRenderableState(node, state, uiState)
-  markNodeDirty(node)
+  if (commitState) markNodeDirty(node)
   if (rerender) scheduleRenderNode(node)
 }
 
 function scheduleRenderNode(node, { viewportOnly = false, forceVisibleRows = false } = {}) {
   const ctx = node.__bil
-  if (!ctx) return
+  if (!ctx || ctx.removed) return
   if (forceVisibleRows) ctx.renderedRangeKey = ''
   ctx.renderViewportOnly = ctx.renderFrame
     ? Boolean(ctx.renderViewportOnly && viewportOnly)
@@ -277,9 +405,9 @@ function scheduleRenderNode(node, { viewportOnly = false, forceVisibleRows = fal
     ctx.renderFrame = 0
     ctx.renderViewportOnly = false
     if (renderViewportOnly) {
-      renderVisibleRows(node)
+      renderVisibleCards(node)
     } else {
-      renderNode(node)
+      renderGalleryNode(node)
     }
   })
 }
@@ -490,7 +618,8 @@ function setCanvasDropTargetActive(node, active) {
   if (!ctx) return
   ctx.root.classList.toggle('bil-dragover', active)
   ctx.dropzone.classList.toggle('bil-dragover', active)
-  if (!active) clearRowDragTargets(ctx)
+  if (!active) ctx.tabs?.classList.remove('bil-folder-drop-ready', 'bil-folder-drop-hover')
+  if (!active && ctx.cardPool) clearCardDragTargets(ctx)
 }
 
 const canvasDropCoordinator = {
@@ -500,6 +629,8 @@ const canvasDropCoordinator = {
   dropHandler: null,
   dragLeaveHandler: null,
   dragEndHandler: null,
+  windowBlurHandler: null,
+  dragExitTimer: null,
   activeNode: null,
   warnedAboutMultipleNodes: false,
 
@@ -525,11 +656,16 @@ const canvasDropCoordinator = {
       void this.handleDrop(event)
     }
     this.dragLeaveHandler = (event) => this.handleDragLeave(event)
-    this.dragEndHandler = () => this.setActiveNode(null)
+    this.dragEndHandler = () => {
+      this.cancelPendingDragExit()
+      this.clearAllDragTargets()
+    }
+    this.windowBlurHandler = this.dragEndHandler
     document.addEventListener('dragover', this.dragOverHandler, true)
     document.addEventListener('drop', this.dropHandler, true)
     document.addEventListener('dragleave', this.dragLeaveHandler, true)
     document.addEventListener('dragend', this.dragEndHandler, true)
+    window.addEventListener('blur', this.windowBlurHandler)
   },
 
   detach() {
@@ -538,12 +674,36 @@ const canvasDropCoordinator = {
     document.removeEventListener('drop', this.dropHandler, true)
     document.removeEventListener('dragleave', this.dragLeaveHandler, true)
     document.removeEventListener('dragend', this.dragEndHandler, true)
+    window.removeEventListener('blur', this.windowBlurHandler)
     this.listenerAttached = false
     this.dragOverHandler = null
     this.dropHandler = null
     this.dragLeaveHandler = null
     this.dragEndHandler = null
+    this.windowBlurHandler = null
+    this.cancelPendingDragExit()
+    this.clearAllDragTargets()
+  },
+
+  cancelPendingDragExit() {
+    if (this.dragExitTimer == null) return
+    clearTimeout(this.dragExitTimer)
+    this.dragExitTimer = null
+  },
+
+  clearAllDragTargets() {
     this.setActiveNode(null)
+    for (const node of this.nodes) {
+      node?.__bil?.clearExternalDragState?.()
+    }
+  },
+
+  scheduleDragExitClear() {
+    this.cancelPendingDragExit()
+    this.dragExitTimer = setTimeout(() => {
+      this.dragExitTimer = null
+      this.clearAllDragTargets()
+    }, 0)
   },
 
   getEligibleNodes() {
@@ -601,7 +761,11 @@ const canvasDropCoordinator = {
   },
 
   handleDragOver(event) {
-    if (event.defaultPrevented && !isGraphCanvasDropTarget(event.target)) return
+    this.cancelPendingDragExit()
+    if (event.defaultPrevented && !isGraphCanvasDropTarget(event.target)) {
+      this.setActiveNode(null)
+      return
+    }
     const node = this.resolveDropNode(event)
     if (!node) {
       this.setActiveNode(null)
@@ -616,37 +780,42 @@ const canvasDropCoordinator = {
   },
 
   async handleDrop(event) {
-    if (event.defaultPrevented && !isGraphCanvasDropTarget(event.target)) return
+    this.cancelPendingDragExit()
+    if (event.defaultPrevented && !isGraphCanvasDropTarget(event.target)) {
+      this.clearAllDragTargets()
+      return
+    }
     const node = this.resolveDropNode(event)
     if (!node) {
-      this.setActiveNode(null)
+      this.clearAllDragTargets()
       return
     }
     if (!hasExternalFileDrag(event)) {
-      this.setActiveNode(null)
+      this.clearAllDragTargets()
       return
     }
 
     finalizeExternalFileDrag(event)
-    this.setActiveNode(null)
+    this.clearAllDragTargets()
+    node.__bil?.restoreCanvasShortcutFocus?.()
 
     const files = await getDroppedImageFiles(event)
     if (!files.length) return
-    await uploadViaNode(node, files)
+    try {
+      await uploadViaNode(node, files)
+    } catch (error) {
+      console.error('Image Conveyor: drop import failed.', error)
+      const ctx = node.__bil
+      if (ctx && !ctx.removed) {
+        ctx.browser.input.error = error?.message || 'Import failed'
+        scheduleRenderNode(node)
+      }
+    }
   },
 
   handleDragLeave(event) {
-    if (event.target === document || event.target === document.documentElement) {
-      this.setActiveNode(null)
-    }
+    if (isDragLeavingDocument(event, document.documentElement)) this.scheduleDragExitClear()
   }
-}
-
-function applySelectionToggle(uiState, itemId, checked) {
-  const selected = getSelectedIds(uiState)
-  if (checked) selected.add(itemId)
-  else selected.delete(itemId)
-  uiState.selected_ids = Array.from(selected)
 }
 
 function moveItems(state, draggedId, targetId) {
@@ -656,6 +825,17 @@ function moveItems(state, draggedId, targetId) {
   if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return false
   const [moved] = state.items.splice(fromIndex, 1)
   state.items.splice(toIndex, 0, moved)
+  return true
+}
+
+function moveItemToInsertionIndex(state, draggedId, insertionIndex) {
+  if (!draggedId || !Array.isArray(state?.items)) return false
+  const fromIndex = state.items.findIndex((item) => item.id === draggedId)
+  if (fromIndex < 0) return false
+  const destination = calculateReorderDestinationIndex(state.items.length, fromIndex, insertionIndex)
+  if (destination < 0) return false
+  const [moved] = state.items.splice(fromIndex, 1)
+  state.items.splice(destination, 0, moved)
   return true
 }
 
@@ -782,13 +962,12 @@ function getItemDisplayPath(item, uiState = null) {
 }
 
 /**
- * Build the upload subfolder path used for image uploads.
- * @param {string} relativeSubfolder - A relative subfolder path (may be empty or contain redundant segments); treated as relative to the base upload folder.
- * @returns {string} The resulting upload subfolder path; if `relativeSubfolder` is empty or normalizes to empty, returns the base upload folder.
+ * Build the input-relative upload folder while preserving a dropped directory's structure.
+ * @param {string} relativeSubfolder - A relative subfolder path (may be empty or contain redundant segments).
+ * @returns {string} The normalized input-relative subfolder, or an empty string for the input root.
  */
 function buildUploadSubfolder(relativeSubfolder = '') {
-  const normalized = normalizeRelativeSubfolder(relativeSubfolder)
-  return normalized ? `${DEFAULT_SUBFOLDER}/${normalized}` : DEFAULT_SUBFOLDER
+  return normalizeRelativeSubfolder(relativeSubfolder)
 }
 
 function normalizeUploadFiles(files) {
@@ -843,6 +1022,12 @@ function hasExternalFileDrag(event) {
 
   const files = Array.from(transfer.files ?? [])
   return files.some((file) => isProbablyImageFile(file))
+}
+
+function hasExternalDirectoryDrag(event) {
+  return Array.from(event?.dataTransfer?.items ?? [])
+    .filter((item) => item?.kind === 'file')
+    .some((item) => getTransferItemEntry(item)?.isDirectory)
 }
 
 function hasPotentialExternalFileDrag(event) {
@@ -969,6 +1154,64 @@ async function getDroppedImageFiles(event) {
   return normalizeUploadFiles(fallbackFiles)
 }
 
+async function collectFolderSourceFromEntry(entry) {
+  if (!entry?.isDirectory || typeof entry.createReader !== 'function') return null
+  const source = {
+    id: makeId(),
+    name: String(entry.name || 'Folder').trim() || 'Folder',
+    files: [],
+    directories: new Set([''])
+  }
+
+  const walk = async (directory, parentPath) => {
+    const reader = directory.createReader()
+    const children = await readDirectoryEntries(reader)
+    children.sort(compareFileSystemEntryNames)
+    for (const child of children) {
+      const childPath = normalizeRelativeSubfolder(
+        parentPath ? `${parentPath}/${child.name}` : child.name
+      )
+      if (child.isDirectory) {
+        source.directories.add(childPath)
+        await walk(child, childPath)
+        continue
+      }
+      if (!child.isFile) continue
+      const file = await new Promise((resolve, reject) => child.file(resolve, reject))
+      if (isProbablyImageFile(file)) source.files.push({ file, relativePath: childPath })
+    }
+  }
+
+  await walk(entry, '')
+  return source
+}
+
+async function getDroppedFolderSources(event) {
+  const items = Array.from(event?.dataTransfer?.items ?? []).filter((item) => item?.kind === 'file')
+  const directoryEntries = items
+    .map((item) => getTransferItemEntry(item))
+    .filter((entry) => entry?.isDirectory)
+  const sources = []
+  for (const entry of directoryEntries) {
+    try {
+      const source = await collectFolderSourceFromEntry(entry)
+      if (source) sources.push(source)
+    } catch (error) {
+      console.error(`Image Conveyor: failed to read folder '${entry?.name || 'unknown'}'.`, error)
+    }
+  }
+  return sources
+}
+
+function makePickerFolderSources(files) {
+  return groupDirectoryPickerFiles(files, isProbablyImageFile).map((group) => ({
+    id: makeId(),
+    name: group.name,
+    files: group.files,
+    directories: new Set(group.directories)
+  }))
+}
+
 function consumeExternalFileDrag(event) {
   if (!hasExternalFileDrag(event)) return false
   finalizeExternalFileDrag(event)
@@ -1024,7 +1267,44 @@ function isModifiedPlainTextPaste(event) {
   return event.shiftKey && (event.ctrlKey || event.metaKey)
 }
 
-function filePreviewUrl(item) {
+function pruneLocalObjectUrls(ctx) {
+  if (ctx.localObjectUrls.size <= LOCAL_OBJECT_URL_LIMIT) return
+  const inUse = new Set(ctx.cardPool.map((slot) => slot.previewUrl).filter(Boolean))
+  const lightboxUrl = ctx.lightbox?.image?.getAttribute?.('src')
+  if (lightboxUrl) inUse.add(lightboxUrl)
+  for (const [file, entry] of ctx.localObjectUrls) {
+    if (ctx.localObjectUrls.size <= LOCAL_OBJECT_URL_LIMIT) break
+    if (inUse.has(entry.url)) continue
+    URL.revokeObjectURL(entry.url)
+    ctx.localObjectUrls.delete(file)
+  }
+}
+
+function localObjectUrl(ctx, item) {
+  const file = item?.localFile
+  if (!(file instanceof File)) return ''
+  const existing = ctx.localObjectUrls.get(file)
+  if (existing) {
+    ctx.localObjectUrls.delete(file)
+    ctx.localObjectUrls.set(file, existing)
+    return existing.url
+  }
+  const url = URL.createObjectURL(file)
+  ctx.localObjectUrls.set(file, { url, sourceId: item.sourceId })
+  pruneLocalObjectUrls(ctx)
+  return url
+}
+
+function releaseLocalSourceUrls(ctx, sourceId) {
+  for (const [file, entry] of ctx.localObjectUrls) {
+    if (entry.sourceId !== sourceId) continue
+    URL.revokeObjectURL(entry.url)
+    ctx.localObjectUrls.delete(file)
+  }
+}
+
+function filePreviewUrl(item, ctx = null) {
+  if (item?.localFile && ctx) return localObjectUrl(ctx, item)
   const params = new URLSearchParams()
   params.set(
     'filename',
@@ -1037,6 +1317,57 @@ function filePreviewUrl(item) {
     String(item.last_processed_at || item.last_queued_at || item.added_at || 0)
   )
   return api.apiURL(`/view?${params.toString()}`)
+}
+
+function getInputRelativePath(item) {
+  if (String(item?.type ?? 'input') !== 'input') return ''
+  const annotated = stripAnnotatedStorageTypeSuffix(item?.annotated)
+  const explicit = String(item?.relative_path ?? '').trim()
+  return normalizeSourcePath(explicit || annotated).replace(/^\/+/, '')
+}
+
+function thumbnailUrl(item, density = 'medium') {
+  const relativePath = getInputRelativePath(item)
+  if (!relativePath) return filePreviewUrl(item)
+  const params = new URLSearchParams()
+  params.set('relative_path', relativePath)
+  params.set('size', String(CARD_SIZES[density]?.thumbnail ?? CARD_SIZES.medium.thumbnail))
+  if (item.source_version || item.mtime_ns) params.set('v', String(item.source_version || item.mtime_ns))
+  return api.apiURL(`/image-conveyor/thumbnail?${params.toString()}`)
+}
+
+function cachedThumbnailUrl(ctx, item, density) {
+  if (item?.localFile) return localObjectUrl(ctx, item)
+  if (!item?.source_version) return thumbnailUrl(item, density)
+  let urls = ctx.thumbnailUrlCache.get(item)
+  if (!urls) {
+    urls = new Map()
+    ctx.thumbnailUrlCache.set(item, urls)
+  }
+  const cached = urls.get(density)
+  if (cached?.sourceVersion === item.source_version) return cached.url
+  const url = thumbnailUrl(item, density)
+  urls.set(density, { sourceVersion: item.source_version, url })
+  return url
+}
+
+function makeItemFromInputFile(entry) {
+  const relativePath = normalizeSourcePath(entry?.relative_path).replace(/^\/+/, '')
+  const filename = String(entry?.filename ?? '').trim()
+  if (!relativePath || !filename) return null
+  const subfolder = String(entry?.subfolder ?? '').trim()
+  return {
+    id: makeId(),
+    annotated: `${relativePath} [input]`,
+    filename,
+    subfolder,
+    source_path: relativePath,
+    type: 'input',
+    status: 'pending',
+    added_at: Date.now(),
+    last_queued_at: 0,
+    last_processed_at: 0
+  }
 }
 
 function makeItemFromUploadResponse(data) {
@@ -1063,35 +1394,214 @@ function makeItemFromUploadResponse(data) {
 
 async function uploadFiles(files) {
   const uploaded = []
-  for (const entry of normalizeUploadFiles(files)) {
+  const errors = []
+  const entries = normalizeUploadFiles(files)
+  let snapshotRefreshed = false
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]
     const { file, relativeSubfolder } = entry
-    const body = new FormData()
-    body.append('image', file)
-    body.append('type', 'input')
-    body.append('subfolder', buildUploadSubfolder(relativeSubfolder))
-    const response = await api.fetchApi('/upload/image', {
-      method: 'POST',
-      body
-    })
-    if (!response.ok) {
-      throw new Error(
-        `Failed to upload '${file.name}': ${response.status} ${response.statusText}`
-      )
+    try {
+      const body = new FormData()
+      body.append('image', file)
+      body.append('type', 'input')
+      body.append('subfolder', buildUploadSubfolder(relativeSubfolder))
+      if (!snapshotRefreshed) body.append('refresh_snapshot', 'true')
+      const response = await api.fetchApi('/image-conveyor/resolve-upload', {
+        method: 'POST',
+        body
+      })
+      if (!response.ok) {
+        let detail = response.statusText
+        try {
+          const errorPayload = await response.json()
+          detail = errorPayload?.error || detail
+        } catch {
+          // Keep the HTTP status text when the server did not return JSON.
+        }
+        throw new Error(`Failed to import '${file.name}': ${response.status} ${detail}`)
+      }
+      const payload = await response.json()
+      if (
+        !payload ||
+        typeof payload !== 'object' ||
+        Array.isArray(payload) ||
+        typeof payload.name !== 'string' ||
+        !payload.name.trim()
+      ) {
+        throw new Error(`Invalid upload response for '${file.name}'.`)
+      }
+      payload.source_path = getSourcePathHint(entry)
+      uploaded.push(payload)
+      snapshotRefreshed = true
+    } catch (error) {
+      errors.push({ file, error: error instanceof Error ? error : new Error(String(error)) })
     }
-    const payload = await response.json()
-    if (
-      !payload ||
-      typeof payload !== 'object' ||
-      Array.isArray(payload) ||
-      typeof payload.name !== 'string' ||
-      !payload.name.trim()
-    ) {
-      throw new Error(`Invalid upload response for '${file.name}'.`)
-    }
-    payload.source_path = getSourcePathHint(entry)
-    uploaded.push(payload)
   }
-  return uploaded
+  return { uploaded, errors }
+}
+
+function formatByteCount(value) {
+  const bytes = Math.max(0, Number(value) || 0)
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KiB', 'MiB', 'GiB', 'TiB']
+  let amount = bytes
+  let unit = -1
+  do {
+    amount /= 1024
+    unit += 1
+  } while (amount >= 1024 && unit < units.length - 1)
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${units[unit]}`
+}
+
+async function readJsonResponse(response, fallbackMessage) {
+  let payload = null
+  try {
+    payload = await response.json()
+  } catch {
+    // The fallback below includes the HTTP status when the response is not JSON.
+  }
+  if (!response.ok) {
+    throw new Error(payload?.error || `${fallbackMessage} (${response.status} ${response.statusText})`)
+  }
+  return payload
+}
+
+function rewriteLiveInputReferences(replacements) {
+  const byDeletedPath = new Map(
+    replacements
+      .filter((entry) => entry?.relative_path && entry?.keep_path)
+      .map((entry) => [normalizeSourcePath(entry.relative_path), normalizeSourcePath(entry.keep_path)])
+  )
+  if (!byDeletedPath.size) return 0
+
+  let rewritten = 0
+  for (const node of autoQueueCoordinator.nodes) {
+    const ctx = node?.__bil
+    if (!ctx || ctx.removed) continue
+    const { state, uiState } = getRenderableState(node)
+    let changed = false
+    for (const item of state.items) {
+      if (item.type !== 'input') continue
+      const oldPath = normalizeSourcePath(stripAnnotatedStorageTypeSuffix(item.annotated))
+      const keepPath = byDeletedPath.get(oldPath)
+      if (!keepPath) continue
+      const separator = keepPath.lastIndexOf('/')
+      item.annotated = `${keepPath} [input]`
+      item.filename = separator >= 0 ? keepPath.slice(separator + 1) : keepPath
+      item.subfolder = separator >= 0 ? keepPath.slice(0, separator) : ''
+      if (normalizeSourcePath(item.source_path) === oldPath) item.source_path = keepPath
+      if (normalizeSourcePath(uiState.source_paths[item.id]) === oldPath) uiState.source_paths[item.id] = keepPath
+      rewritten += 1
+      changed = true
+    }
+    if (changed) updateState(node, state, uiState)
+  }
+  return rewritten
+}
+
+function getQueuedLegacyInputPaths() {
+  const paths = new Set()
+  for (const node of autoQueueCoordinator.nodes) {
+    const ctx = node?.__bil
+    if (!ctx || ctx.removed) continue
+    const { state } = getRenderableState(node)
+    for (const item of state.items) {
+      if (item.type !== 'input' || item.status !== 'queued') continue
+      const path = normalizeSourcePath(stripAnnotatedStorageTypeSuffix(item.annotated))
+      if (path === 'image_conveyor' || path.startsWith('image_conveyor/')) paths.add(path)
+    }
+  }
+  return paths
+}
+
+async function cleanManagedDuplicates(node) {
+  const ctx = node.__bil
+  if (!ctx || ctx.duplicateCleanupBusy) return
+  ctx.duplicateCleanupBusy = true
+  const button = ctx.cleanDuplicatesBtn
+  const previousLabel = button.textContent
+  button.disabled = true
+  button.textContent = 'Scanning duplicates…'
+  try {
+    const scanResponse = await api.fetchApi('/image-conveyor/managed-duplicates/scan', { method: 'POST' })
+    const report = await readJsonResponse(scanResponse, 'Duplicate scan failed')
+    if (node.__bil !== ctx || ctx.removed) return
+    const cleanup = prepareManagedDuplicateCleanup(report?.groups, getQueuedLegacyInputPaths())
+    const { groups, duplicateCount, reclaimableBytes, protectedCount: queuedCount } = cleanup
+    if (!duplicateCount || !groups.length) {
+      window.alert(queuedCount
+        ? 'The managed duplicates are currently reserved by queued Conveyor items. Run cleanup after those prompts finish or are released.'
+        : 'No byte-identical redundant files were found under input/image_conveyor.')
+      return
+    }
+
+    const mappings = groups.flatMap((group) => (
+      (Array.isArray(group.duplicates) ? group.duplicates : []).map((duplicate) => (
+        `${duplicate.relative_path}  →  ${group.keep_path}`
+      ))
+    ))
+    const previewLimit = 8
+    const preview = mappings.slice(0, previewLimit).join('\n')
+    const omitted = mappings.length > previewLimit ? `\n…and ${mappings.length - previewLimit} more` : ''
+    const confirmed = window.confirm(
+      `Found ${duplicateCount} byte-identical managed duplicate${duplicateCount === 1 ? '' : 's'} ` +
+      `(${formatByteCount(reclaimableBytes)}).` +
+      (queuedCount ? ` ${queuedCount} queued file${queuedCount === 1 ? ' is' : 's are'} protected and will be left in place.` : '') +
+      `\n\n${preview}${omitted}\n\n` +
+      'Delete the image_conveyor copies and keep the listed input files? ' +
+      'Open Conveyor nodes will be relinked before deletion. Start cleanup when no generation is running. ' +
+      'Saved workflows that are not currently open can still reference a deleted legacy path.'
+    )
+    if (!confirmed) return
+
+    const protectedPaths = getQueuedLegacyInputPaths()
+    const plannedReplacements = groups.flatMap((group) => group.duplicates
+      .filter((duplicate) => !protectedPaths.has(normalizeSourcePath(duplicate.relative_path)))
+      .map((duplicate) => ({
+        relative_path: duplicate.relative_path,
+        keep_path: group.keep_path
+      })))
+    const preRewritten = rewriteLiveInputReferences(plannedReplacements)
+    button.textContent = 'Deleting duplicates…'
+    const deleteResponse = await api.fetchApi('/image-conveyor/managed-duplicates/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groups, protected_paths: Array.from(protectedPaths) })
+    })
+    const result = await readJsonResponse(deleteResponse, 'Duplicate cleanup failed')
+    const deleted = Array.isArray(result?.deleted) ? result.deleted : []
+    const skipped = Array.isArray(result?.skipped) ? result.skipped : []
+    const reservationSkipReason = 'The duplicate is reserved by a queued Conveyor item.'
+    const reservationSkips = skipped.filter((entry) => entry?.reason === reservationSkipReason).length
+    const changedSkips = skipped.length - reservationSkips
+    const rewrittenAfterDelete = rewriteLiveInputReferences(deleted)
+    const rewritten = preRewritten + rewrittenAfterDelete
+    await Promise.all(
+      Array.from(autoQueueCoordinator.nodes)
+        .filter((candidate) => candidate?.__bil && !candidate.__bil.removed)
+        .map((candidate) => refreshInputFiles(candidate, { force: true }))
+    )
+    const summary = [
+      `Deleted ${deleted.length} exact duplicate${deleted.length === 1 ? '' : 's'} ` +
+      `and reclaimed ${formatByteCount(result?.reclaimed_bytes)}.`,
+      rewritten ? `Updated ${rewritten} open Conveyor reference${rewritten === 1 ? '' : 's'}.` : '',
+      reservationSkips ? `${reservationSkips} newly queued file${reservationSkips === 1 ? ' was' : 's were'} protected.` : '',
+      changedSkips ? `${changedSkips} file${changedSkips === 1 ? ' was' : 's were'} skipped because the filesystem changed after the preview.` : ''
+    ].filter(Boolean).join('\n')
+    if (node.__bil === ctx && !ctx.removed) window.alert(summary)
+  } catch (error) {
+    if (node.__bil === ctx && !ctx.removed) {
+      ctx.browser.input.error = error?.message || 'Duplicate cleanup failed'
+      scheduleRenderNode(node)
+      window.alert(ctx.browser.input.error)
+    }
+  } finally {
+    if (node.__bil === ctx && !ctx.removed) {
+      ctx.duplicateCleanupBusy = false
+      button.disabled = false
+      button.textContent = previousLabel
+    }
+  }
 }
 
 function ensureStyles() {
@@ -1103,194 +1613,93 @@ function ensureStyles() {
     .bil-root {
       --comfy-widget-min-height: ${MIN_WIDGET_HEIGHT}px;
       --comfy-widget-height: 100%;
-      --bil-row-height: ${ROW_HEIGHT}px;
-      --bil-row-gap: ${ROW_GAP}px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      height: 100%;
-      min-height: ${MIN_WIDGET_HEIGHT}px;
-      overflow: hidden;
-      color: var(--input-text, #ddd);
-      font: 12px/1.35 system-ui, sans-serif;
-      box-sizing: border-box;
-      padding: 2px 0;
+      display: flex; flex-direction: column; gap: 8px; height: 100%;
+      min-height: ${MIN_WIDGET_HEIGHT}px; overflow: hidden; box-sizing: border-box;
+      padding: 2px 0; color: var(--input-text, #ddd); font: 12px/1.35 system-ui, sans-serif;
     }
-    .bil-root.bil-dragover {
-      outline: 1px dashed rgba(120,180,255,0.9);
-      outline-offset: -2px;
-      border-radius: 10px;
-      background: rgba(120,180,255,0.06);
+    .bil-root.bil-dragover { outline: 2px dashed #73aef5; outline-offset: -3px; border-radius: 10px; background: rgba(90,155,235,.08); }
+    .bil-header, .bil-browserbar, .bil-summary, .bil-contextbar, .bil-settings-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .bil-header { justify-content: space-between; }
+    .bil-tabs { display: flex; flex: 1 1 0; gap: 3px; min-width: 0; overflow-x: auto; overflow-y: hidden; padding: 2px; border-radius: 8px; scrollbar-width: none; }
+    .bil-tabs::-webkit-scrollbar { display: none; }
+    .bil-tabs.bil-folder-drop-ready { outline: 1px dashed rgba(115,175,250,.75); outline-offset: -2px; }
+    .bil-tabs.bil-folder-drop-hover { outline: 2px solid #73aef5; background: rgba(90,155,235,.16); }
+    .bil-tabs > .bil-tab, .bil-tab-shell { flex: 1 1 150px; min-width: 24px; max-width: 210px; }
+    .bil-tab-shell { position: relative; display: flex; overflow: hidden; container: bil-tab / inline-size; }
+    .bil-tab-shell.bil-tab-active { min-width: 54px; }
+    .bil-tab-shell > .bil-tab { width: 100%; min-width: 0; padding-right: 25px; }
+    .bil-tab-label { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bil-tab-close { position: absolute; top: 50%; right: 5px; width: 18px; height: 18px; transform: translateY(-50%); padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; font: 16px/17px system-ui, sans-serif; cursor: pointer; }
+    .bil-tab-close:hover { background: rgba(255,255,255,.16); }
+    .bil-tab-close[hidden] { display: none; }
+    @container bil-tab (max-width: 74px) {
+      .bil-tab-shell:not(.bil-tab-active) > .bil-tab { padding-right: 8px; }
+      .bil-tab-shell:not(.bil-tab-active) > .bil-tab-close { display: none; }
     }
-    .bil-toolbar, .bil-subtoolbar, .bil-summary {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      align-items: center;
+    .bil-tab, .bil-btn, .bil-select, .bil-input, .bil-icon-btn {
+      border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.055);
+      color: inherit; border-radius: 7px; padding: 5px 8px; font: inherit; box-sizing: border-box;
     }
-    .bil-toggle {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 8px;
-      border: 1px solid rgba(255,255,255,0.18);
-      border-radius: 6px;
-      background: rgba(255,255,255,0.06);
-      user-select: none;
+    .bil-tab { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bil-tab, .bil-btn, .bil-icon-btn { cursor: pointer; }
+    .bil-tabs > .bil-tab[aria-selected="true"] { min-width: 54px; }
+    .bil-tab[aria-selected="true"] { background: rgba(105,165,240,.20); border-color: rgba(115,175,250,.65); }
+    .bil-btn:disabled, .bil-icon-btn:disabled { opacity: .4; cursor: not-allowed; }
+    .bil-add-btn { font-weight: 650; white-space: nowrap; }
+    .bil-browserbar { display: grid; grid-template-columns: minmax(110px,1fr) auto auto auto; }
+    .bil-input { min-width: 0; width: 100%; }
+    .bil-select { min-width: 0; max-width: 132px; }
+    .bil-summary { justify-content: space-between; color: color-mix(in srgb, currentColor 78%, transparent); white-space: nowrap; overflow: hidden; }
+    .bil-summary > * { overflow: hidden; text-overflow: ellipsis; }
+    .bil-contextbar { min-height: 29px; padding: 4px 6px; border-radius: 7px; background: rgba(105,165,240,.11); }
+    .bil-contextbar[hidden] { display: none; }
+    .bil-context-label { margin-right: auto; font-weight: 650; }
+    .bil-settings { border: 1px solid rgba(255,255,255,.10); border-radius: 7px; }
+    .bil-settings > summary { cursor: pointer; padding: 5px 7px; user-select: none; opacity: .82; }
+    .bil-settings-row { flex-wrap: wrap; padding: 0 7px 7px; }
+    .bil-toggle { display: inline-flex; align-items: center; gap: 5px; user-select: none; white-space: nowrap; }
+    .bil-toggle input { margin: 0; }
+    .bil-list { position: relative; min-height: 0; overflow: auto; flex: 1 1 0; overscroll-behavior: contain; outline: none; }
+    .bil-list-inner, .bil-list-window { position: relative; min-height: 100%; }
+    .bil-selection-marquee { position: absolute; z-index: 4; pointer-events: none; box-sizing: border-box; border: 1px solid rgba(125,185,255,.95); background: rgba(80,145,225,.18); box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); }
+    .bil-selection-marquee[hidden] { display: none; }
+    .bil-drop-indicator { position: absolute; z-index: 5; pointer-events: none; border-radius: 999px; background: #7db9ff; box-shadow: 0 0 0 1px rgba(15,35,58,.75), 0 0 10px rgba(100,175,255,.85); }
+    .bil-drop-indicator[hidden] { display: none; }
+    .bil-empty { min-height: 100%; display: flex; align-items: center; justify-content: center; box-sizing: border-box; padding: 20px; text-align: center; border: 1px dashed rgba(255,255,255,.14); border-radius: 10px; opacity: .7; }
+    .bil-card {
+      position: absolute; display: flex; flex-direction: column; overflow: hidden; box-sizing: border-box;
+      border: 1px solid rgba(255,255,255,.11); border-radius: 10px; background: rgba(0,0,0,.18);
+      contain: layout paint style; transition: border-color 80ms ease, background 80ms ease;
     }
-    .bil-toggle input {
-      margin: 0;
-    }
-    .bil-dropzone {
-      border: 1px dashed rgba(255,255,255,0.25);
-      border-radius: 8px;
-      padding: 10px;
-      text-align: center;
-      background: rgba(255,255,255,0.04);
-      cursor: pointer;
-      user-select: none;
-    }
-    .bil-dropzone.bil-dragover {
-      border-color: rgba(120,180,255,0.9);
-      background: rgba(120,180,255,0.12);
-    }
-    .bil-btn, .bil-select {
-      border: 1px solid rgba(255,255,255,0.18);
-      background: rgba(255,255,255,0.06);
-      color: inherit;
-      border-radius: 6px;
-      padding: 4px 8px;
-      font: inherit;
-    }
-    .bil-btn { cursor: pointer; }
-    .bil-btn:disabled {
-      opacity: 0.45;
-      cursor: not-allowed;
-    }
-    .bil-summary {
-      justify-content: space-between;
-      gap: 8px;
-      opacity: 0.9;
-    }
-    .bil-list {
-      position: relative;
-      min-height: 0;
-      overflow: auto;
-      padding-right: 2px;
-      flex: 1 1 0;
-    }
-    .bil-list-inner {
-      position: relative;
-      min-height: 100%;
-    }
-    .bil-list-window {
-      position: relative;
-      min-height: 100%;
-    }
-    .bil-empty {
-      min-height: 100%;
-      box-sizing: border-box;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 14px 10px;
-      text-align: center;
-      border: 1px dashed rgba(255,255,255,0.12);
-      border-radius: 8px;
-      opacity: 0.7;
-      pointer-events: none;
-    }
-    .bil-row {
-      position: absolute;
-      left: 0;
-      right: 0;
-      display: grid;
-      grid-template-columns: 24px 52px minmax(0,1fr) auto auto;
-      gap: 8px;
-      align-items: center;
-      height: var(--bil-row-height);
-      padding: 6px;
-      box-sizing: border-box;
-      border: 1px solid rgba(255,255,255,0.10);
-      border-radius: 8px;
-      background: rgba(0,0,0,0.16);
-    }
-    .bil-row.bil-selected {
-      border-color: rgba(120,180,255,0.85);
-      background: rgba(120,180,255,0.10);
-    }
-    .bil-row.bil-drag-target {
-      outline: 1px dashed rgba(120,180,255,0.95);
-      outline-offset: -2px;
-    }
-    .bil-thumb {
-      width: 52px;
-      height: 52px;
-      object-fit: contain;
-      border-radius: 6px;
-      background: rgba(255,255,255,0.06);
-    }
-    .bil-meta {
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-    .bil-name,
-    .bil-path {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .bil-name { font-weight: 600; }
-    .bil-path {
-      opacity: 0.72;
-      font-size: 11px;
-    }
-    .bil-right {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      align-items: flex-end;
-      min-width: 82px;
-    }
-    .bil-badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 72px;
-      padding: 2px 6px;
-      border-radius: 999px;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.02em;
-      background: rgba(255,255,255,0.08);
-    }
-    .bil-badge-pending { background: rgba(160,160,160,0.18); }
-    .bil-badge-queued { background: rgba(255,190,70,0.22); }
-    .bil-badge-processed { background: rgba(80,190,110,0.24); }
-    .bil-index {
-      opacity: 0.72;
-      font-variant-numeric: tabular-nums;
-    }
-    .bil-status-text { opacity: 0.8; }
-    .bil-row-actions {
-      display: flex;
-      gap: 4px;
-      align-items: center;
-      justify-content: flex-end;
-      flex-wrap: wrap;
-      min-width: 108px;
-    }
-    .bil-mini-btn {
-      border: 1px solid rgba(255,255,255,0.16);
-      background: rgba(255,255,255,0.04);
-      color: inherit;
-      border-radius: 6px;
-      padding: 2px 6px;
-      font: inherit;
-      cursor: pointer;
-    }
+    .bil-card.bil-selected { border-color: rgba(110,175,255,.95); box-shadow: inset 0 0 0 1px rgba(110,175,255,.34); background: rgba(80,145,225,.11); }
+    .bil-card.bil-focused { outline: 2px solid rgba(150,200,255,.95); outline-offset: -3px; }
+    .bil-card.bil-drag-target { outline: 2px dashed rgba(120,185,255,.95); outline-offset: -4px; }
+    .bil-media { position: relative; flex: 1 1 auto; min-height: 0; background: transparent; cursor: pointer; }
+    .bil-thumb { width: 100%; height: 100%; display: block; object-fit: contain; background: transparent; opacity: 0; }
+    .bil-thumb.bil-thumb-ready { opacity: 1; }
+    .bil-thumb-error { opacity: .32; filter: grayscale(1); outline: 1px dashed rgba(255,110,110,.78); outline-offset: -2px; }
+    .bil-card-overlay { position: absolute; inset: 6px 6px auto 6px; display: flex; align-items: flex-start; justify-content: flex-end; gap: 4px; pointer-events: none; }
+    .bil-badge { padding: 2px 6px; border-radius: 999px; font-size: 10px; text-transform: uppercase; letter-spacing: .025em; background: rgba(20,20,20,.82); }
+    .bil-badge-pending { color: #e2e2e2; } .bil-badge-queued { color: #ffd276; } .bil-badge-processed { color: #8bea9e; }
+    .bil-count-badge { color: #cce4ff; text-transform: none; }
+    .bil-folder-card .bil-media { display: flex; align-items: center; justify-content: center; }
+    .bil-folder-icon { position: relative; width: 48%; height: 34%; border-radius: 7px; background: linear-gradient(145deg, #78b8f8, #4d86c7); box-shadow: 0 10px 24px rgba(0,0,0,.22); }
+    .bil-folder-icon::before { content: ''; position: absolute; left: 8%; top: -28%; width: 42%; height: 36%; border-radius: 6px 6px 0 0; background: #78b8f8; }
+    .bil-card-footer { flex: 0 0 ${CARD_FOOTER_HEIGHT}px; display: flex; flex-direction: column; justify-content: center; gap: 4px; padding: 5px 7px 6px; min-width: 0; }
+    .bil-card-title-row, .bil-card-actions { display: flex; align-items: center; gap: 4px; min-width: 0; }
+    .bil-name { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 620; }
+    .bil-index { flex: 0 0 auto; opacity: .65; font-variant-numeric: tabular-nums; }
+    .bil-path { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .62; font-size: 10px; }
+    .bil-card-actions { justify-content: flex-end; }
+    .bil-mini-btn { border: 0; background: transparent; color: inherit; border-radius: 5px; padding: 2px 5px; font: inherit; cursor: pointer; opacity: .78; }
+    .bil-mini-btn:hover { background: rgba(255,255,255,.10); opacity: 1; }
+    .bil-position { margin-left: auto; opacity: .65; font-variant-numeric: tabular-nums; }
+    .bil-lightbox { position: fixed; inset: 0; z-index: 100000; display: flex; align-items: center; justify-content: center; padding: 36px; background: rgba(0,0,0,.86); }
+    .bil-lightbox[hidden] { display: none; }
+    .bil-lightbox img { max-width: 94vw; max-height: 90vh; object-fit: contain; box-shadow: 0 18px 60px rgba(0,0,0,.45); }
+    .bil-lightbox-label { position: absolute; left: 24px; bottom: 18px; right: 70px; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bil-lightbox-close { position: absolute; top: 18px; right: 20px; font-size: 24px; color: white; background: rgba(255,255,255,.12); border: 0; border-radius: 8px; width: 38px; height: 38px; cursor: pointer; }
+    @media (max-width: 600px) { .bil-browserbar { grid-template-columns: minmax(100px,1fr) auto auto; } .bil-browserbar .bil-size-select { display: none; } }
   `
   document.head.appendChild(style)
 }
@@ -1347,879 +1756,1802 @@ function chainNodeCallback(node, key, handler) {
   }
 }
 
-function getVisibleRowRange(list, totalItems) {
-  if (!totalItems) return { start: 0, end: 0, offset: 0, height: 0 }
-
-  const measuredViewportHeight = Math.max(0, list.clientHeight || 0)
-  const viewportHeight = Math.max(measuredViewportHeight, ROW_STRIDE)
-  const maxScrollTop = Math.max(0, totalItems * ROW_STRIDE - ROW_GAP - measuredViewportHeight)
-  const rawScrollTop = Math.max(list.scrollTop || 0, 0)
-  const scrollTop = Math.min(rawScrollTop, maxScrollTop)
-  if (scrollTop !== rawScrollTop) {
-    list.scrollTop = scrollTop
-  }
-  const visibleCount = Math.max(1, Math.ceil(viewportHeight / ROW_STRIDE))
-  const rawStart = Math.max(0, Math.floor(scrollTop / ROW_STRIDE) - LIST_OVERSCAN)
-  const maxStart = Math.max(0, totalItems - (visibleCount + LIST_OVERSCAN * 2))
-  const start = Math.min(rawStart, maxStart)
-  const end = Math.min(totalItems, start + visibleCount + LIST_OVERSCAN * 2)
-  const height = Math.max(0, totalItems * ROW_STRIDE - ROW_GAP)
+function createBrowserState() {
   return {
-    start,
-    end,
-    offset: start * ROW_STRIDE,
-    height
+    activeView: 'conveyor',
+    tabOrder: ['conveyor', 'input'],
+    folderSources: new Map(),
+    folderViews: new Map(),
+    conveyor: {
+      query: '', filter: 'all', sort: 'manual', size: 'medium', scrollTop: 0,
+      focusedId: null, lastSelectedId: null, selected: new Set()
+    },
+    input: {
+      query: '', folder: 'all', sort: 'name_asc', size: 'medium', scrollTop: 0,
+      focusedId: null, lastSelectedId: null, files: [], selected: new Set(),
+      loaded: false, loading: false, error: '', snapshotVersion: 0
+    }
   }
 }
 
-/**
- * Create a reusable virtualized row slot for an image item, providing its DOM structure and wiring event handlers for drag/drop, selection, preview, and per-item actions.
- * @param {Object} node - The node instance the slot will operate against (used to read/update widget state).
- * @param {Object} ctx - Rendering/context object containing shared state and helpers (e.g., `draggedId`, drag-target utilities).
- * @returns {{row: HTMLElement, itemId: string|null, previewUrl: string, checkbox: HTMLInputElement, thumb: HTMLImageElement, name: HTMLElement, path: HTMLElement, badge: HTMLElement, indexText: HTMLElement, pendingBtn: HTMLButtonElement, processedBtn: HTMLButtonElement, deleteBtn: HTMLButtonElement}} A slot object containing the root row element, the currently bound item id and preview URL, and references to child controls used by the renderer.
- */
-function createRowSlot(node, ctx) {
-  const row = document.createElement('div')
-  row.className = 'bil-row'
-  row.draggable = true
-  row.style.display = 'none'
+function browserForView(ctx, view) {
+  return ctx.browser[view] ?? ctx.browser.folderViews.get(view)
+}
 
-  const slot = {
-    row,
-    itemId: null,
-    previewUrl: ''
+function activeBrowser(ctx) {
+  return browserForView(ctx, ctx.browser.activeView)
+}
+
+function suspendGalleryViewport(ctx) {
+  if (!ctx) return
+  if (
+    !ctx.galleryViewportSuspended &&
+    ctx.pendingScrollRestore?.view !== ctx.browser.activeView &&
+    isGalleryViewportMeasurable(ctx.list.clientWidth, ctx.list.clientHeight)
+  ) {
+    activeBrowser(ctx).scrollTop = ctx.list.scrollTop
+  }
+  if (!ctx.galleryViewportSuspended) ctx.galleryViewportEpoch += 1
+  ctx.galleryViewportSuspended = true
+  ctx.renderedRangeKey = ''
+}
+
+function isFolderView(ctx, view = ctx.browser.activeView) {
+  return ctx.browser.folderViews.has(view)
+}
+
+function isLibraryView(ctx, view = ctx.browser.activeView) {
+  return view === 'input' || isFolderView(ctx, view)
+}
+
+function getViewItemId(ctx, item, view = ctx.browser.activeView) {
+  return isLibraryView(ctx, view) ? item.key ?? item.relative_path : item.id
+}
+
+function relativeParent(path) {
+  const normalized = normalizeRelativeSubfolder(path)
+  const separator = normalized.lastIndexOf('/')
+  return separator < 0 ? '' : normalized.slice(0, separator)
+}
+
+function relativeName(path) {
+  const normalized = normalizeRelativeSubfolder(path)
+  const separator = normalized.lastIndexOf('/')
+  return separator < 0 ? normalized : normalized.slice(separator + 1)
+}
+
+function createFolderBrowserState(source, folderPath = '') {
+  const currentPath = normalizeRelativeSubfolder(folderPath)
+  const entries = []
+  for (const directory of source.directories) {
+    if (!directory || relativeParent(directory) !== currentPath) continue
+    const fullPath = `${source.name}/${directory}`
+    entries.push({
+      kind: 'folder',
+      key: `folder:${source.id}:${directory}`,
+      sourceId: source.id,
+      folderPath: directory,
+      filename: relativeName(directory),
+      relative_path: fullPath,
+      subfolder: source.name
+    })
+  }
+  for (const entry of source.files) {
+    const relativePath = normalizeRelativeSubfolder(entry.relativePath)
+    if (!relativePath || relativeParent(relativePath) !== currentPath) continue
+    const fullPath = `${source.name}/${relativePath}`
+    entries.push({
+      kind: 'local-image',
+      key: `local:${source.id}:${relativePath}`,
+      sourceId: source.id,
+      filename: relativeName(relativePath),
+      relative_path: fullPath,
+      subfolder: relativeParent(fullPath),
+      relativeSubfolder: relativeParent(fullPath),
+      type: 'local',
+      size: Number(entry.file?.size || 0),
+      mtime_ns: Number(entry.file?.lastModified || 0),
+      source_version: `${Number(entry.file?.size || 0)}-${Number(entry.file?.lastModified || 0)}`,
+      localFile: entry.file
+    })
+  }
+  return {
+    sourceId: source.id,
+    folderPath: currentPath,
+    query: '', sort: 'name_asc', size: 'medium', scrollTop: 0,
+    focusedId: null, lastSelectedId: null, entries, selected: new Set(),
+    loading: false, error: ''
+  }
+}
+
+function compareNatural(left, right) {
+  return String(left ?? '').localeCompare(String(right ?? ''), undefined, {
+    numeric: true,
+    sensitivity: 'base'
+  })
+}
+
+function getViewItems(node) {
+  const ctx = node.__bil
+  const browser = activeBrowser(ctx)
+  if (isLibraryView(ctx)) {
+    const query = browser.query.trim().toLocaleLowerCase()
+    const sourceItems = ctx.browser.activeView === 'input' ? browser.files : browser.entries
+    const items = sourceItems.filter((entry) => {
+      if (ctx.browser.activeView === 'input' && browser.folder !== 'all') {
+        const folder = String(entry.subfolder || '')
+        if (folder !== browser.folder && !folder.startsWith(`${browser.folder}/`)) return false
+      }
+      return !query || `${entry.filename} ${entry.relative_path}`.toLocaleLowerCase().includes(query)
+    })
+    const folderFirst = (left, right) => Number(right.kind === 'folder') - Number(left.kind === 'folder')
+    switch (browser.sort) {
+      case 'name_desc': items.sort((a, b) => folderFirst(a, b) || compareNatural(b.relative_path, a.relative_path)); break
+      case 'newest': items.sort((a, b) => folderFirst(a, b) || (b.mtime_ns || 0) - (a.mtime_ns || 0) || compareNatural(a.relative_path, b.relative_path)); break
+      case 'oldest': items.sort((a, b) => folderFirst(a, b) || (a.mtime_ns || 0) - (b.mtime_ns || 0) || compareNatural(a.relative_path, b.relative_path)); break
+      default: items.sort((a, b) => folderFirst(a, b) || compareNatural(a.relative_path, b.relative_path)); break
+    }
+    return items
   }
 
-  const clearTargets = (exceptRow = null) => clearRowDragTargets(ctx, exceptRow)
+  const { state, uiState } = getRenderableState(node)
+  const query = browser.query.trim().toLocaleLowerCase()
+  return state.items.filter((item) => {
+    if (browser.filter !== 'all' && item.status !== browser.filter) return false
+    if (!query) return true
+    return `${item.filename} ${getItemDisplayPath(item, uiState)}`.toLocaleLowerCase().includes(query)
+  })
+}
 
-  row.addEventListener('dragstart', () => {
-    if (!slot.itemId) return
-    ctx.draggedId = slot.itemId
-    clearTargets()
-  })
-  row.addEventListener('dragend', () => {
-    ctx.draggedId = null
-    clearTargets()
-  })
-  row.addEventListener('dragover', (event) => {
-    if (!slot.itemId || !ctx.draggedId) return
-    event.preventDefault()
-    clearTargets(row)
-    row.classList.add('bil-drag-target')
-  })
-  row.addEventListener('dragleave', () => {
-    row.classList.remove('bil-drag-target')
-  })
-  row.addEventListener('drop', (event) => {
-    if (!slot.itemId || !ctx.draggedId) return
-    event.preventDefault()
-    clearTargets()
-    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-    if (moveItems(liveState, ctx.draggedId, slot.itemId)) {
-      updateState(node, liveState, liveUiState)
+function getGalleryMetrics(ctx) {
+  const browser = activeBrowser(ctx)
+  const definition = CARD_SIZES[browser.size] ?? CARD_SIZES.medium
+  const width = Math.max(1, Math.floor(ctx.list.clientWidth || ctx.widgetWidth || MIN_NODE_WIDTH))
+  return calculateGalleryMetrics(width, definition.minWidth, CARD_GAP)
+}
+
+function getVisibleCardRange(ctx, totalItems, metrics, scrollTop = ctx.list.scrollTop) {
+  return calculateVisibleCardRange(
+    totalItems,
+    metrics.columns,
+    metrics.rowStride,
+    CARD_GAP,
+    scrollTop,
+    ctx.list.clientHeight,
+    GALLERY_OVERSCAN_ROWS
+  )
+}
+
+function canReorderConveyor(ctx) {
+  const browser = ctx.browser.conveyor
+  return ctx.browser.activeView === 'conveyor' && browser.filter === 'all' && !browser.query.trim()
+}
+
+function getViewSelectedIds(node) {
+  const ctx = node.__bil
+  return activeBrowser(ctx).selected
+}
+
+function renderSelectionContext(node) {
+  const ctx = node.__bil
+  if (!ctx) return
+  const inputView = isLibraryView(ctx)
+  const selected = getViewSelectedIds(node)
+  ctx.contextBar.hidden = selected.size === 0
+  ctx.contextLabel.textContent = `${selected.size} selected`
+  ctx.setPendingBtn.hidden = inputView
+  ctx.setProcessedBtn.hidden = inputView
+  ctx.deleteSelectedBtn.hidden = inputView
+  ctx.contextAddBtn.hidden = !inputView
+}
+
+function deleteSelectedConveyorItems(node) {
+  const ctx = node.__bil
+  if (!ctx || ctx.browser.activeView !== 'conveyor') return false
+  const selected = ctx.browser.conveyor.selected
+  if (!selected.size) return false
+  const { state, uiState } = getRenderableState(node)
+  const kept = state.items.filter((item) => !selected.has(item.id))
+  if (kept.length === state.items.length) return false
+  state.items = kept
+  uiState.selected_ids = []
+  uiState.source_paths = Object.fromEntries(
+    Object.entries(uiState.source_paths).filter(([id]) => !selected.has(id))
+  )
+  selected.clear()
+  updateState(node, state, uiState)
+  return true
+}
+
+function setItemSelected(node, itemId, checked, event = null) {
+  const ctx = node.__bil
+  const browser = activeBrowser(ctx)
+  const items = ctx.visibleItems || []
+  const itemIdentifier = (item) => getViewItemId(ctx, item)
+  const currentItem = items.find((item) => itemIdentifier(item) === itemId)
+  if (currentItem?.kind === 'folder') return
+  const selected = browser.selected
+  if (event?.shiftKey && browser.lastSelectedId) {
+    const anchor = items.findIndex((item) => itemIdentifier(item) === browser.lastSelectedId)
+    const current = items.findIndex((item) => itemIdentifier(item) === itemId)
+    if (anchor >= 0 && current >= 0) {
+      for (let index = Math.min(anchor, current); index <= Math.max(anchor, current); index += 1) {
+        if (items[index].kind !== 'folder') selected.add(itemIdentifier(items[index]))
+      }
     }
-    ctx.draggedId = null
-  })
+  } else if (checked) selected.add(itemId)
+  else selected.delete(itemId)
+  browser.lastSelectedId = itemId
+  renderSelectionContext(node)
+  scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+}
 
-  const checkbox = document.createElement('input')
-  checkbox.type = 'checkbox'
-  checkbox.addEventListener('change', () => {
+function selectItemFromClick(node, itemId, event) {
+  const ctx = node.__bil
+  if (!ctx) return
+  const browser = activeBrowser(ctx)
+  browser.focusedId = itemId
+  if (event.shiftKey) {
+    setItemSelected(node, itemId, true, event)
+    return
+  }
+  if (event.ctrlKey || event.metaKey) {
+    setItemSelected(node, itemId, !browser.selected.has(itemId), event)
+    return
+  }
+  browser.selected = new Set([itemId])
+  browser.lastSelectedId = itemId
+  renderSelectionContext(node)
+  scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+}
+
+function setsEqual(left, right) {
+  if (left.size !== right.size) return false
+  for (const value of left) if (!right.has(value)) return false
+  return true
+}
+
+function marqueeContentPoint(ctx, clientX, clientY) {
+  const rect = ctx.list.getBoundingClientRect()
+  return clientPointToScrollContent(
+    clientX,
+    clientY,
+    rect,
+    ctx.list.clientWidth,
+    ctx.list.clientHeight,
+    ctx.list.scrollLeft,
+    ctx.list.scrollTop,
+    ctx.list.offsetWidth,
+    ctx.list.offsetHeight
+  )
+}
+
+function marqueeAutoscrollVelocity(list, clientY) {
+  const rect = list.getBoundingClientRect()
+  const topDistance = clientY - rect.top
+  if (topDistance < MARQUEE_AUTOSCROLL_EDGE) {
+    return -MARQUEE_AUTOSCROLL_MAX * Math.min(1, (MARQUEE_AUTOSCROLL_EDGE - topDistance) / MARQUEE_AUTOSCROLL_EDGE)
+  }
+  const bottomDistance = rect.bottom - clientY
+  if (bottomDistance < MARQUEE_AUTOSCROLL_EDGE) {
+    return MARQUEE_AUTOSCROLL_MAX * Math.min(1, (MARQUEE_AUTOSCROLL_EDGE - bottomDistance) / MARQUEE_AUTOSCROLL_EDGE)
+  }
+  return 0
+}
+
+function renderMarqueeSelection(node, selection) {
+  const ctx = node.__bil
+  if (!ctx || ctx.marqueeSelection !== selection || ctx.browser.activeView !== selection.view) return
+  const current = marqueeContentPoint(ctx, selection.clientX, selection.clientY)
+  const distance = Math.hypot(selection.clientX - selection.anchorClientX, selection.clientY - selection.anchorClientY)
+  if (!selection.active && distance < MARQUEE_DRAG_THRESHOLD) return
+  selection.active = true
+
+  const bounds = {
+    left: Math.min(selection.anchor.x, current.x),
+    right: Math.max(selection.anchor.x, current.x),
+    top: Math.min(selection.anchor.y, current.y),
+    bottom: Math.max(selection.anchor.y, current.y)
+  }
+  const items = ctx.visibleItems || []
+  const metrics = getGalleryMetrics(ctx)
+  const hitIds = []
+  for (const index of calculateMarqueeGridIndexes(items.length, metrics, bounds)) {
+    const item = items[index]
+    if (!item || item.kind === 'folder') continue
+    hitIds.push(getViewItemId(ctx, item))
+  }
+
+  const next = selection.toggle || selection.additive
+    ? new Set(selection.baseline)
+    : new Set()
+  for (const id of hitIds) {
+    if (selection.toggle && selection.baseline.has(id)) next.delete(id)
+    else next.add(id)
+  }
+  const browser = activeBrowser(ctx)
+  if (!setsEqual(browser.selected, next)) {
+    browser.selected = next
+    renderSelectionContext(node)
+    scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+  }
+  selection.lastHitId = hitIds.at(-1) ?? null
+  Object.assign(ctx.selectionMarquee.style, {
+    left: `${bounds.left}px`,
+    top: `${bounds.top}px`,
+    width: `${Math.max(1, bounds.right - bounds.left)}px`,
+    height: `${Math.max(1, bounds.bottom - bounds.top)}px`
+  })
+  ctx.selectionMarquee.hidden = false
+}
+
+function scheduleMarqueeSelectionFrame(node) {
+  const ctx = node.__bil
+  const selection = ctx?.marqueeSelection
+  if (!selection || selection.frame) return
+  selection.frame = requestAnimationFrame(() => {
+    selection.frame = 0
+    if (ctx.removed || ctx.marqueeSelection !== selection) return
+    const velocity = marqueeAutoscrollVelocity(ctx.list, selection.clientY)
+    const previousTop = ctx.list.scrollTop
+    if (velocity) ctx.list.scrollTop += velocity
+    renderMarqueeSelection(node, selection)
+    if (velocity && ctx.list.scrollTop !== previousTop) scheduleMarqueeSelectionFrame(node)
+  })
+}
+
+function finishMarqueeSelection(node, event, cancelled = false) {
+  const ctx = node.__bil
+  const selection = ctx?.marqueeSelection
+  if (!selection || (event?.pointerId != null && event.pointerId !== selection.pointerId)) return
+  if (selection.frame) cancelAnimationFrame(selection.frame)
+  selection.frame = 0
+  if (!cancelled && event) {
+    selection.clientX = event.clientX
+    selection.clientY = event.clientY
+    renderMarqueeSelection(node, selection)
+  }
+  const browser = browserForView(ctx, selection.view)
+  if (cancelled && browser) {
+    browser.selected = new Set(selection.baseline)
+    renderSelectionContext(node)
+    scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+  } else if (!selection.active && !selection.toggle && !selection.additive && browser) {
+    browser.selected.clear()
+    renderSelectionContext(node)
+    scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+  } else if (selection.lastHitId && browser) {
+    browser.focusedId = selection.lastHitId
+    browser.lastSelectedId = selection.lastHitId
+  }
+  ctx.selectionMarquee.hidden = true
+  ctx.marqueeSelection = null
+  try {
+    ctx.list.releasePointerCapture?.(selection.pointerId)
+  } catch {
+    // The pointer may already have been released by the browser.
+  }
+}
+
+function cancelMarqueeSelection(node, restoreBaseline = true) {
+  finishMarqueeSelection(node, null, restoreBaseline)
+}
+
+function beginMarqueeSelection(node, event) {
+  const ctx = node.__bil
+  if (!ctx || event.button !== 0 || event.isPrimary === false || ctx.marqueeSelection) return false
+  if (event.target instanceof Element && event.target.closest('.bil-card')) return false
+  const rect = ctx.list.getBoundingClientRect()
+  if (event.clientX < rect.left || event.clientY < rect.top || event.clientX > rect.right || event.clientY > rect.bottom) return false
+  const browser = activeBrowser(ctx)
+  ctx.marqueeSelection = {
+    pointerId: event.pointerId,
+    view: ctx.browser.activeView,
+    anchor: marqueeContentPoint(ctx, event.clientX, event.clientY),
+    anchorClientX: event.clientX,
+    anchorClientY: event.clientY,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    baseline: new Set(browser.selected),
+    toggle: Boolean(event.ctrlKey || event.metaKey),
+    additive: Boolean(event.shiftKey),
+    active: false,
+    lastHitId: null,
+    frame: 0
+  }
+  ctx.list.setPointerCapture?.(event.pointerId)
+  event.preventDefault()
+  return true
+}
+
+function createLightbox(node) {
+  const lightbox = document.createElement('div')
+  lightbox.className = 'bil-lightbox'
+  lightbox.hidden = true
+  lightbox.setAttribute('role', 'dialog')
+  lightbox.setAttribute('aria-modal', 'true')
+  lightbox.tabIndex = -1
+  const image = document.createElement('img')
+  const label = document.createElement('div')
+  label.className = 'bil-lightbox-label'
+  const close = document.createElement('button')
+  close.className = 'bil-lightbox-close'
+  close.type = 'button'
+  close.textContent = '×'
+  close.setAttribute('aria-label', 'Close preview')
+  lightbox.append(image, label, close)
+  const hide = () => {
+    lightbox.hidden = true
+    image.removeAttribute('src')
+    delete lightbox.dataset.sourceId
+    restoreGraphCanvasFocus(lightbox, app.canvas?.canvas)
+  }
+  close.addEventListener('click', hide)
+  lightbox.addEventListener('click', (event) => { if (event.target === lightbox) hide() })
+  lightbox.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    consumeGalleryKeyboardEvent(event)
+    hide()
+  })
+  document.body.appendChild(lightbox)
+  return { root: lightbox, image, label, close, hide }
+}
+
+function openPreview(node, item) {
+  const ctx = node.__bil
+  if (!ctx?.lightbox || !item || item.kind === 'folder') return
+  const label = item.filename || item.relative_path || getItemDisplayPath(item)
+  ctx.lightbox.image.src = filePreviewUrl(item, ctx)
+  ctx.lightbox.image.alt = label
+  ctx.lightbox.label.textContent = label
+  if (item.sourceId) ctx.lightbox.root.dataset.sourceId = item.sourceId
+  ctx.lightbox.root.hidden = false
+  ctx.lightbox.close.focus({ preventScroll: true })
+}
+
+function clearCardDragTargets(ctx, except = null) {
+  for (const slot of ctx.cardPool) {
+    if (slot.card !== except) slot.card.classList.remove('bil-drag-target')
+  }
+}
+
+function clearInternalDragTarget(ctx) {
+  if (!ctx) return
+  clearCardDragTargets(ctx)
+  ctx.dragIntent = null
+  if (ctx.dropIndicator) ctx.dropIndicator.hidden = true
+}
+
+function renderInternalDragTarget(ctx, intent) {
+  clearCardDragTargets(ctx)
+  ctx.dropIndicator.hidden = true
+  if (!intent) return
+  if (intent.type === 'card') {
+    const target = ctx.cardPool.find((slot) => slot.itemIndex === intent.targetIndex)
+    target?.card.classList.add('bil-drag-target')
+    return
+  }
+  const indicator = ctx.dropIndicator
+  indicator.hidden = false
+  if (intent.orientation === 'horizontal') {
+    Object.assign(indicator.style, {
+      left: `${intent.left}px`,
+      top: `${intent.top - 2}px`,
+      width: `${ctx.lastMetrics?.width || ctx.list.clientWidth}px`,
+      height: '4px'
+    })
+    return
+  }
+  Object.assign(indicator.style, {
+    left: `${intent.left - 2}px`,
+    top: `${intent.top}px`,
+    width: '4px',
+    height: `${intent.height}px`
+  })
+}
+
+function internalDragIntentAt(ctx, clientX, clientY) {
+  if (!ctx.draggedId || !canReorderConveyor(ctx)) return null
+  const point = marqueeContentPoint(ctx, clientX, clientY)
+  return calculateGalleryDropIntent(
+    ctx.visibleItems?.length || 0,
+    getGalleryMetrics(ctx),
+    point.x,
+    point.y
+  )
+}
+
+function folderViewId(sourceId, folderPath = '') {
+  return `folder:${sourceId}:${normalizeRelativeSubfolder(folderPath)}`
+}
+
+function folderTabLabel(source, folderPath) {
+  return folderPath ? relativeName(folderPath) : source.name
+}
+
+function createFolderTabElement(node, viewId, source, folderPath) {
+  const ctx = node.__bil
+  const shell = document.createElement('div')
+  shell.className = 'bil-tab-shell'
+  const tab = document.createElement('button')
+  tab.className = 'bil-tab'
+  tab.type = 'button'
+  tab.id = `${ctx.tabSetId}-${viewId.replace(/[^a-zA-Z0-9_-]/g, '-')}`
+  tab.setAttribute('role', 'tab')
+  tab.setAttribute('aria-controls', ctx.list.id)
+  const label = document.createElement('span')
+  label.className = 'bil-tab-label'
+  label.textContent = folderTabLabel(source, folderPath)
+  const fullPath = folderPath ? `${source.name}/${folderPath}` : source.name
+  tab.title = fullPath
+  tab.appendChild(label)
+  const close = document.createElement('button')
+  close.className = 'bil-tab-close'
+  close.type = 'button'
+  close.textContent = '×'
+  close.hidden = false
+  close.setAttribute('aria-label', `Close ${fullPath} tab`)
+  tab.addEventListener('click', () => switchBrowserView(node, viewId))
+  close.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    closeFolderView(node, viewId)
+    restoreGraphCanvasFocus(close, app.canvas?.canvas)
+  })
+  shell.append(tab, close)
+  ctx.tabs.appendChild(shell)
+  ctx.folderTabElements.set(viewId, { shell, tab, close, label })
+}
+
+function openFolderView(node, sourceId, folderPath = '') {
+  const ctx = node.__bil
+  const source = ctx?.browser.folderSources.get(sourceId)
+  if (!ctx || !source) return
+  const normalizedPath = normalizeRelativeSubfolder(folderPath)
+  if (normalizedPath && !source.directories.has(normalizedPath)) return
+  const viewId = folderViewId(sourceId, normalizedPath)
+  if (!ctx.browser.folderViews.has(viewId)) {
+    ctx.browser.folderViews.set(viewId, createFolderBrowserState(source, normalizedPath))
+    ctx.browser.tabOrder.push(viewId)
+    createFolderTabElement(node, viewId, source, normalizedPath)
+  }
+  switchBrowserView(node, viewId)
+}
+
+function addFolderSources(node, sources) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return 0
+  let added = 0
+  for (const source of Array.from(sources ?? [])) {
+    if (!source?.id || !source?.name || !(source.directories instanceof Set) || !Array.isArray(source.files)) continue
+    source.files.sort((left, right) => compareNatural(left.relativePath, right.relativePath))
+    ctx.browser.folderSources.set(source.id, source)
+    openFolderView(node, source.id, '')
+    added += 1
+  }
+  return added
+}
+
+function closeFolderView(node, viewId) {
+  const ctx = node.__bil
+  const view = ctx?.browser.folderViews.get(viewId)
+  if (!ctx || !view) return
+  const nextView = chooseViewAfterClose(
+    ctx.browser.tabOrder,
+    ctx.browser.activeView,
+    viewId,
+    'input'
+  )
+  const wasActive = ctx.browser.activeView === viewId
+  if (wasActive) {
+    switchBrowserView(node, nextView)
+    hideUnusedCards(ctx)
+  }
+  ctx.browser.folderViews.delete(viewId)
+  ctx.browser.tabOrder = ctx.browser.tabOrder.filter((entry) => entry !== viewId)
+  ctx.folderTabElements.get(viewId)?.shell.remove()
+  ctx.folderTabElements.delete(viewId)
+  const sourceStillOpen = Array.from(ctx.browser.folderViews.values())
+    .some((candidate) => candidate.sourceId === view.sourceId)
+  if (!sourceStillOpen) {
+    if (ctx.lightbox?.root?.dataset?.sourceId === view.sourceId) ctx.lightbox.hide()
+    releaseLocalSourceUrls(ctx, view.sourceId)
+    ctx.browser.folderSources.delete(view.sourceId)
+  }
+  scheduleRenderNode(node, { forceVisibleRows: true })
+}
+
+function renderTabs(ctx) {
+  const activeView = ctx.browser.activeView
+  const inputSelected = activeView === 'input'
+  const conveyorSelected = activeView === 'conveyor'
+  ctx.conveyorTab.setAttribute('aria-selected', String(conveyorSelected))
+  ctx.inputTab.setAttribute('aria-selected', String(inputSelected))
+  for (const [viewId, elements] of ctx.folderTabElements) {
+    const selected = viewId === activeView
+    elements.tab.setAttribute('aria-selected', String(selected))
+    elements.shell.classList.toggle('bil-tab-active', selected)
+    elements.close.hidden = false
+  }
+  const activeTab = activeView === 'conveyor'
+    ? ctx.conveyorTab
+    : activeView === 'input'
+      ? ctx.inputTab
+      : ctx.folderTabElements.get(activeView)?.tab
+  if (activeTab) {
+    ctx.list.setAttribute('aria-labelledby', activeTab.id)
+    const activeElement = activeTab.parentElement?.classList.contains('bil-tab-shell')
+      ? activeTab.parentElement
+      : activeTab
+    const tabsRect = ctx.tabs.getBoundingClientRect()
+    const activeRect = activeElement.getBoundingClientRect()
+    if (activeRect.left < tabsRect.left) ctx.tabs.scrollLeft -= tabsRect.left - activeRect.left
+    else if (activeRect.right > tabsRect.right) ctx.tabs.scrollLeft += activeRect.right - tabsRect.right
+  }
+}
+
+function createCardSlot(node, ctx) {
+  const card = document.createElement('div')
+  card.className = 'bil-card'
+  card.setAttribute('role', 'option')
+  card.style.display = 'none'
+  const slot = {
+    card,
+    itemId: null,
+    item: null,
+    itemIndex: -1,
+    inputView: null,
+    itemKind: '',
+    label: '',
+    displayPath: '',
+    subfolder: '',
+    previewUrl: '',
+    bindToken: 0,
+    layoutKey: '',
+    badgeKey: '',
+    selected: null,
+    focused: null,
+    draggable: false
+  }
+
+  card.addEventListener('dragstart', (event) => {
+    if (!slot.draggable || !slot.itemId) { event.preventDefault(); return }
+    ctx.draggedId = slot.itemId
+    event.dataTransfer?.setData('text/plain', slot.itemId)
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+    clearInternalDragTarget(ctx)
+  })
+  card.addEventListener('dragend', () => { ctx.draggedId = null; clearInternalDragTarget(ctx) })
+
+  const media = document.createElement('div')
+  media.className = 'bil-media'
+  media.addEventListener('click', (event) => {
     if (!slot.itemId) return
-    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-    applySelectionToggle(liveUiState, slot.itemId, checkbox.checked)
-    updateState(node, liveState, liveUiState)
+    if (slot.item?.kind === 'folder') {
+      openFolderView(node, slot.item.sourceId, slot.item.folderPath)
+      return
+    }
+    selectItemFromClick(node, slot.itemId, event)
   })
-  slot.checkbox = checkbox
-
+  media.addEventListener('dblclick', () => openPreview(node, slot.item))
   const thumb = document.createElement('img')
   thumb.className = 'bil-thumb'
+  thumb.loading = 'lazy'
   thumb.decoding = 'async'
   thumb.draggable = false
-  slot.thumb = thumb
+  const folderIcon = document.createElement('div')
+  folderIcon.className = 'bil-folder-icon'
+  folderIcon.hidden = true
+  const overlay = document.createElement('div')
+  overlay.className = 'bil-card-overlay'
+  const badge = document.createElement('span')
+  badge.className = 'bil-badge'
+  overlay.append(badge)
+  media.append(thumb, folderIcon, overlay)
 
-  const meta = document.createElement('div')
-  meta.className = 'bil-meta'
-
+  const footer = document.createElement('div')
+  footer.className = 'bil-card-footer'
+  const titleRow = document.createElement('div')
+  titleRow.className = 'bil-card-title-row'
   const name = document.createElement('div')
   name.className = 'bil-name'
-  slot.name = name
-
-  const path = document.createElement('div')
-  path.className = 'bil-path'
-  slot.path = path
-
-  meta.append(name, path)
-
-  const right = document.createElement('div')
-  right.className = 'bil-right'
-
-  const badge = document.createElement('div')
-  badge.className = 'bil-badge'
-  slot.badge = badge
-
   const indexText = document.createElement('div')
   indexText.className = 'bil-index'
-  slot.indexText = indexText
-
-  right.append(badge, indexText)
-
+  titleRow.append(name, indexText)
   const actions = document.createElement('div')
-  actions.className = 'bil-row-actions'
-
+  actions.className = 'bil-card-actions'
+  const path = document.createElement('div')
+  path.className = 'bil-path'
   const pendingBtn = document.createElement('button')
-  pendingBtn.className = 'bil-mini-btn'
-  pendingBtn.type = 'button'
-  pendingBtn.textContent = 'Pending'
-  pendingBtn.addEventListener('click', () => {
-    if (!slot.itemId) return
-    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-    const liveItem = liveState.items.find((entry) => entry.id === slot.itemId)
-    if (!liveItem) return
-    liveItem.status = 'pending'
-    updateState(node, liveState, liveUiState)
-  })
-  slot.pendingBtn = pendingBtn
-
+  pendingBtn.className = 'bil-mini-btn'; pendingBtn.type = 'button'; pendingBtn.textContent = '↶'
   const processedBtn = document.createElement('button')
-  processedBtn.className = 'bil-mini-btn'
-  processedBtn.type = 'button'
-  processedBtn.textContent = 'Done'
-  processedBtn.addEventListener('click', () => {
-    if (!slot.itemId) return
-    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-    const liveItem = liveState.items.find((entry) => entry.id === slot.itemId)
-    if (!liveItem) return
-    liveItem.status = 'processed'
-    liveItem.last_processed_at = Date.now()
-    updateState(node, liveState, liveUiState)
-  })
-  slot.processedBtn = processedBtn
-
+  processedBtn.className = 'bil-mini-btn'; processedBtn.type = 'button'; processedBtn.textContent = '✓'
   const deleteBtn = document.createElement('button')
-  deleteBtn.className = 'bil-mini-btn'
-  deleteBtn.type = 'button'
-  deleteBtn.textContent = 'Delete'
-  deleteBtn.addEventListener('click', () => {
-    if (!slot.itemId) return
-    const { state: liveState, uiState: liveUiState } = getCurrentState(node)
-    liveState.items = liveState.items.filter((entry) => entry.id !== slot.itemId)
-    liveUiState.selected_ids = liveUiState.selected_ids.filter(
-      (id) => id !== slot.itemId
-    )
-    delete liveUiState.source_paths[slot.itemId]
-    updateState(node, liveState, liveUiState)
-  })
-  slot.deleteBtn = deleteBtn
+  deleteBtn.className = 'bil-mini-btn'; deleteBtn.type = 'button'; deleteBtn.textContent = '×'
+  const addBtn = document.createElement('button')
+  addBtn.className = 'bil-mini-btn'; addBtn.type = 'button'; addBtn.textContent = '+ Add'
 
-  actions.append(pendingBtn, processedBtn, deleteBtn)
-  row.append(checkbox, thumb, meta, right, actions)
+  pendingBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node)
+    const item = state.items.find((entry) => entry.id === slot.itemId)
+    if (item) { item.status = 'pending'; updateState(node, state, uiState) }
+  })
+  processedBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node)
+    const item = state.items.find((entry) => entry.id === slot.itemId)
+    if (item) { item.status = 'processed'; item.last_processed_at = Date.now(); updateState(node, state, uiState) }
+  })
+  deleteBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node)
+    state.items = state.items.filter((entry) => entry.id !== slot.itemId)
+    ctx.browser.conveyor.selected.delete(slot.itemId)
+    uiState.selected_ids = uiState.selected_ids.filter((id) => id !== slot.itemId)
+    delete uiState.source_paths[slot.itemId]
+    updateState(node, state, uiState)
+  })
+  addBtn.addEventListener('click', () => {
+    if (!slot.item) return
+    if (slot.item.kind === 'folder') openFolderView(node, slot.item.sourceId, slot.item.folderPath)
+    else void addLibraryEntries(node, [slot.item])
+  })
+  actions.append(path, pendingBtn, processedBtn, deleteBtn, addBtn)
+  footer.append(titleRow, actions)
+  card.append(media, footer)
+  Object.assign(slot, { media, thumb, folderIcon, badge, name, indexText, path, pendingBtn, processedBtn, deleteBtn, addBtn })
   return slot
 }
 
-function clearRowDragTargets(ctx, exceptRow = null) {
-  for (const slot of ctx.rowPool) {
-    if (slot.row !== exceptRow) {
-      slot.row.classList.remove('bil-drag-target')
+function ensureCardPool(node, needed) {
+  const ctx = node.__bil
+  while (ctx.cardPool.length < needed) {
+    const slot = createCardSlot(node, ctx)
+    ctx.cardPool.push(slot)
+    ctx.listWindow.appendChild(slot.card)
+  }
+}
+
+function resetCardThumbnail(slot) {
+  slot.bindToken += 1
+  slot.previewUrl = ''
+  slot.thumbnailIdentity = ''
+  slot.thumb.onload = null
+  slot.thumb.onerror = null
+  slot.thumb.classList.remove('bil-thumb-ready', 'bil-thumb-error')
+  slot.thumb.removeAttribute('src')
+}
+
+function bindCardThumbnail(slot, url) {
+  const token = ++slot.bindToken
+  slot.previewUrl = url
+  slot.thumb.onload = () => {
+    if (token !== slot.bindToken || slot.previewUrl !== url) return
+    slot.thumb.classList.remove('bil-thumb-error')
+    slot.thumb.classList.add('bil-thumb-ready')
+  }
+  slot.thumb.onerror = () => {
+    if (token !== slot.bindToken || slot.previewUrl !== url) return
+    slot.thumb.classList.remove('bil-thumb-ready')
+    slot.thumb.classList.add('bil-thumb-error')
+  }
+  slot.thumb.src = url
+}
+
+function hideUnusedCards(ctx, start = 0) {
+  for (let index = start; index < ctx.cardPool.length; index += 1) {
+    const slot = ctx.cardPool[index]
+    slot.itemId = null; slot.item = null; slot.itemIndex = -1; slot.inputView = null; slot.itemKind = ''
+    slot.layoutKey = ''; slot.badgeKey = ''; slot.selected = null; slot.focused = null
+    slot.card.style.display = 'none'
+    slot.card.classList.remove('bil-selected', 'bil-focused', 'bil-drag-target', 'bil-folder-card')
+    slot.folderIcon.hidden = true
+    resetCardThumbnail(slot)
+  }
+}
+
+function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotatedCounts, uiState, allowThumbnailLoad) {
+  const ctx = node.__bil
+  const inputView = isLibraryView(ctx)
+  const folderItem = item.kind === 'folder'
+  const localItem = item.kind === 'local-image'
+  const itemId = getViewItemId(ctx, item)
+  const displayPath = inputView ? item.relative_path : getItemDisplayPath(item, uiState)
+  const label = item.filename || item.relative_path || displayPath
+  const browser = activeBrowser(ctx)
+  const thumbnailIdentity = folderItem
+    ? `folder:${itemId}`
+    : `${itemId}:${item.source_version || item.mtime_ns || ''}:${browser.size}`
+  if (slot.thumbnailIdentity !== thumbnailIdentity && (slot.previewUrl || slot.thumbnailIdentity)) resetCardThumbnail(slot)
+  slot.thumbnailIdentity = thumbnailIdentity
+
+  const subfolder = inputView ? (item.subfolder || (localItem ? 'Selected folder' : 'input root')) : ''
+  const staticContentChanged = slot.itemIndex !== itemIndex ||
+    slot.inputView !== inputView ||
+    slot.itemKind !== item.kind ||
+    slot.label !== label ||
+    slot.displayPath !== displayPath ||
+    slot.subfolder !== subfolder
+  slot.itemId = itemId; slot.item = item
+  slot.itemIndex = itemIndex; slot.inputView = inputView; slot.itemKind = item.kind || ''
+  slot.label = label; slot.displayPath = displayPath; slot.subfolder = subfolder
+  if (slot.card.style.display !== 'flex') slot.card.style.display = 'flex'
+  const layoutKey = `${itemIndex}:${metrics.columns}:${metrics.cardWidth}:${metrics.cardHeight}`
+  if (slot.layoutKey !== layoutKey) {
+    const row = Math.floor(itemIndex / metrics.columns)
+    const column = itemIndex % metrics.columns
+    const left = column * (metrics.cardWidth + CARD_GAP)
+    const top = row * metrics.rowStride
+    slot.card.style.width = `${metrics.cardWidth}px`
+    slot.card.style.height = `${metrics.cardHeight}px`
+    slot.card.style.transform = `translate3d(${left}px, ${top}px, 0)`
+    slot.layoutKey = layoutKey
+  }
+  const isSelected = selected.has(itemId)
+  if (slot.selected !== isSelected) {
+    slot.selected = isSelected
+    slot.card.classList.toggle('bil-selected', isSelected)
+    slot.card.setAttribute('aria-selected', String(isSelected))
+  }
+  const isFocused = browser.focusedId === itemId
+  if (slot.focused !== isFocused) {
+    slot.focused = isFocused
+    slot.card.classList.toggle('bil-focused', isFocused)
+  }
+  if (staticContentChanged) {
+    slot.card.title = displayPath
+    slot.name.textContent = label
+    slot.indexText.textContent = `#${itemIndex + 1}`
+    slot.path.textContent = inputView ? subfolder : displayPath
+    slot.path.title = slot.path.textContent
+    slot.thumb.alt = label
+  }
+  slot.card.classList.toggle('bil-folder-card', folderItem)
+  slot.folderIcon.hidden = !folderItem
+  slot.thumb.hidden = folderItem
+  const draggable = !inputView && canReorderConveyor(ctx)
+  if (slot.draggable !== draggable) {
+    slot.draggable = draggable
+    slot.card.draggable = draggable
+  }
+  if (slot.pendingBtn.hidden !== inputView) slot.pendingBtn.hidden = inputView
+  if (slot.processedBtn.hidden !== inputView) slot.processedBtn.hidden = inputView
+  if (slot.deleteBtn.hidden !== inputView) slot.deleteBtn.hidden = inputView
+  if (slot.addBtn.hidden === inputView) slot.addBtn.hidden = !inputView
+  if (inputView) slot.addBtn.textContent = folderItem ? 'Open' : '+ Add'
+  if (inputView) {
+    const count = localItem || folderItem ? 0 : annotatedCounts.get(item.relative_path) || 0
+    const badgeKey = folderItem ? 'folder' : localItem ? 'local' : `input:${count}`
+    if (slot.badgeKey !== badgeKey) {
+      slot.badge.className = 'bil-badge bil-count-badge'
+      slot.badge.textContent = folderItem ? 'Folder' : localItem ? 'Local' : count ? `In conveyor ×${count}` : 'Input'
+      slot.badgeKey = badgeKey
+    }
+  } else {
+    const badgeKey = `conveyor:${item.status}`
+    if (slot.badgeKey !== badgeKey) {
+      slot.badge.className = `bil-badge bil-badge-${item.status}`
+      slot.badge.textContent = item.status
+      slot.badgeKey = badgeKey
     }
   }
+  if (!folderItem && allowThumbnailLoad && !slot.previewUrl) {
+    const url = cachedThumbnailUrl(ctx, item, browser.size)
+    if (url) bindCardThumbnail(slot, url)
+  }
 }
 
-function ensureRowPool(node, needed) {
+function renderVisibleCards(node) {
   const ctx = node.__bil
   if (!ctx) return
-  while (ctx.rowPool.length < needed) {
-    const slot = createRowSlot(node, ctx)
-    ctx.rowPool.push(slot)
-    ctx.listWindow.appendChild(slot.row)
+  const items = ctx.visibleItems || []
+  if (!items.length) {
+    if (ctx.listInner.style.height !== 'auto') ctx.listInner.style.height = 'auto'
+    if (ctx.listWindow.style.height !== 'auto') ctx.listWindow.style.height = 'auto'
+    activeBrowser(ctx).scrollTop = 0
+    if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) ctx.pendingScrollRestore = null
+    if (ctx.list.scrollTop) ctx.list.scrollTop = 0
+    hideUnusedCards(ctx); ctx.renderedRangeKey = ''; return
   }
-}
-
-/**
- * Hide and clear all row slots in the pool from `startIndex` onward.
- *
- * Clears each slot's displayed data (itemId, previewUrl, dataset) and removes
- * selection/drag CSS classes, then sets the slot DOM row to display: none.
- *
- * @param {{rowPool: Array}} ctx - Context object containing `rowPool`, an array of slot objects.
- * Each slot is expected to have `itemId`, `previewUrl`, `row` (DOM element), and `row.dataset`.
- * @param {number} [startIndex=0] - Inclusive index in `rowPool` from which slots should be hidden.
- */
-function hideUnusedRowSlots(ctx, startIndex = 0) {
-  for (let index = startIndex; index < ctx.rowPool.length; index += 1) {
-    const slot = ctx.rowPool[index]
-    slot.itemId = null
-    slot.previewUrl = ''
-    slot.row.style.display = 'none'
-    slot.row.classList.remove('bil-selected', 'bil-drag-target')
-    delete slot.row.dataset.itemId
-  }
-}
-
-/**
- * Populate a pooled row slot's DOM with data for a specific item and selection state.
- *
- * Updates the slot's attributes, text, badge, thumbnail, ARIA labels, and positioning so the
- * row reflects the provided item's current data and the UI state's display path.
- *
- * @param {object} slot - Reusable row slot containing DOM elements (row, checkbox, thumb, name, path, badge, buttons, etc.).
- * @param {object} item - Normalized item object (must include `id`, `filename`, `status`, and other display fields).
- * @param {number} index - Zero-based index of the item within the rendered list.
- * @param {Set<string>} selected - Set of selected item IDs.
- * @param {object} uiState - UI state object used to derive runtime display paths (e.g., `source_paths`).
- */
-function updateRowSlot(slot, item, index, selected, uiState) {
-  const itemLabel = item.filename || getItemDisplayPath(item, uiState)
-  const previewUrl = filePreviewUrl(item)
-
-  slot.itemId = item.id
-  slot.row.style.display = 'grid'
-  slot.row.style.top = `${index * ROW_STRIDE}px`
-  slot.row.dataset.itemId = item.id
-  slot.row.classList.remove('bil-drag-target')
-  slot.row.classList.toggle('bil-selected', selected.has(item.id))
-
-  slot.checkbox.checked = selected.has(item.id)
-  slot.checkbox.setAttribute('aria-label', `Select ${itemLabel}`)
-
-  slot.thumb.alt = itemLabel
-  if (slot.previewUrl !== previewUrl) {
-    slot.thumb.src = previewUrl
-    slot.previewUrl = previewUrl
-  }
-
-  slot.name.textContent = itemLabel
-  slot.path.textContent = getItemDisplayPath(item, uiState)
-
-  slot.badge.className = `bil-badge bil-badge-${item.status}`
-  slot.badge.textContent = item.status
-
-  slot.indexText.textContent = `#${index + 1}`
-
-  slot.pendingBtn.setAttribute('aria-label', `Mark ${itemLabel} as pending`)
-  slot.processedBtn.setAttribute('aria-label', `Mark ${itemLabel} as done`)
-  slot.deleteBtn.setAttribute('aria-label', `Delete ${itemLabel}`)
-}
-
-/**
- * Update the widget's virtualized list to render only the rows currently visible in the viewport.
- *
- * Reads the cached renderable state for the given node, computes the visible row range, ensures a pool
- * of row slots exists, populates those slots with item data and UI state, hides unused slots, and
- * adjusts container sizing. If there are no items the function clears the list layout and hides slots.
- *
- * @param {Object} node - The node that owns the batch image loader widget (expected to have a `__bil` render context).
- */
-function renderVisibleRows(node) {
-  const ctx = node.__bil
-  if (!ctx) return
-
-  const { state, uiState } = getRenderableState(node)
-  const selected = getSelectedIds(uiState)
-
-  if (!state.items.length) {
-    ctx.listInner.style.height = 'auto'
-    ctx.listInner.style.minHeight = ''
-    ctx.listWindow.style.height = 'auto'
-    ctx.listWindow.style.minHeight = ''
-    hideUnusedRowSlots(ctx, 0)
-    ctx.renderedRangeKey = ''
+  if (!isGalleryViewportMeasurable(ctx.list.clientWidth, ctx.list.clientHeight)) {
+    suspendGalleryViewport(ctx)
     return
   }
-
-  const { start, end, height } = getVisibleRowRange(ctx.list, state.items.length)
-  const viewportHeight = Math.round(ctx.list.clientHeight || 0)
-  const rangeKey = `${ctx.renderVersion}:${state.items.length}:${viewportHeight}:${start}:${end}`
-  if (ctx.renderedRangeKey === rangeKey) return
-
-  const needed = end - start
-  ctx.listInner.style.minHeight = ''
-  ctx.listWindow.style.minHeight = ''
-  ctx.listInner.style.height = `${height}px`
-  ctx.listWindow.style.height = `${height}px`
-  ensureRowPool(node, needed)
-
+  const view = ctx.browser.activeView
+  if (ctx.galleryViewportSuspended) {
+    ctx.galleryViewportSuspended = false
+    if (ctx.pendingScrollRestore?.view !== view) {
+      ctx.pendingScrollRestore = { view, scrollTop: activeBrowser(ctx).scrollTop }
+    }
+  }
+  const metrics = getGalleryMetrics(ctx)
+  ctx.lastMetrics = metrics
+  const pendingRestore = ctx.pendingScrollRestore?.view === view
+    ? ctx.pendingScrollRestore
+    : null
+  const range = getVisibleCardRange(
+    ctx,
+    items.length,
+    metrics,
+    pendingRestore?.scrollTop ?? ctx.list.scrollTop
+  )
+  const selected = getViewSelectedIds(node)
+  const { state, uiState } = getRenderableState(node)
+  let annotatedCounts = new Map()
+  if (view === 'input') {
+    if (ctx.annotatedCountsRevision !== ctx.queueRevision) {
+      ctx.annotatedCounts = new Map()
+      for (const item of state.items) {
+        const path = getInputRelativePath(item)
+        if (path) ctx.annotatedCounts.set(path, (ctx.annotatedCounts.get(path) || 0) + 1)
+      }
+      ctx.annotatedCountsRevision = ctx.queueRevision
+    }
+    annotatedCounts = ctx.annotatedCounts
+  }
+  const totalHeight = `${range.totalHeight}px`
+  if (ctx.listInner.style.height !== totalHeight) ctx.listInner.style.height = totalHeight
+  if (ctx.listWindow.style.height !== totalHeight) ctx.listWindow.style.height = totalHeight
+  if (pendingRestore) {
+    activeBrowser(ctx).scrollTop = range.scrollTop
+    ctx.list.scrollTop = range.scrollTop
+    ctx.scrollSampleTop = range.scrollTop
+    ctx.scrollSampleAt = globalThis.performance?.now?.() ?? Date.now()
+    ctx.pendingScrollRestore = null
+  } else if (range.scrollTop !== ctx.list.scrollTop) {
+    ctx.list.scrollTop = range.scrollTop
+    activeBrowser(ctx).scrollTop = range.scrollTop
+  }
+  const key = `${ctx.renderVersion}:${ctx.inputVersion}:${view}:${items.length}:${metrics.width}:${metrics.columns}:${metrics.cardHeight}:${range.start}:${range.end}`
+  if (ctx.renderedRangeKey === key) return
+  const needed = range.end - range.start
+  ensureCardPool(node, needed)
+  const nextItemIds = items.slice(range.start, range.end).map((item) => getViewItemId(ctx, item, view))
+  const assignments = planCardSlotReuse(ctx.cardPool.map((slot) => slot.itemId), nextItemIds)
+  const assigned = new Set(assignments)
+  ctx.cardPool = [
+    ...assignments.map((index) => ctx.cardPool[index]),
+    ...ctx.cardPool.filter((_, index) => !assigned.has(index))
+  ]
   for (let offset = 0; offset < needed; offset += 1) {
-    updateRowSlot(
-      ctx.rowPool[offset],
-      state.items[start + offset],
-      start + offset,
+    updateCardSlot(
+      node,
+      ctx.cardPool[offset],
+      items[range.start + offset],
+      range.start + offset,
+      metrics,
       selected,
-      uiState
+      annotatedCounts,
+      uiState,
+      !ctx.deferThumbnailLoads
     )
   }
-  hideUnusedRowSlots(ctx, needed)
-  ctx.renderedRangeKey = rangeKey
+  hideUnusedCards(ctx, needed)
+  if (ctx.dragIntent) renderInternalDragTarget(ctx, ctx.dragIntent)
+  ctx.renderedRangeKey = key
 }
 
-/**
- * Update the widget DOM to reflect the node's current state and UI state.
- *
- * Reads the node's parsed state and uiState, caches the render snapshot, and updates the summary text, next-item text, empty-list UI, row virtualization (visible rows), and action-button enabled/disabled states to match the current items, selection, and auto-queue flag.
- *
- * @param {Object} node - The ComfyUI node instance that contains the widget context (node.__bil) to render into.
- */
-function renderNode(node) {
+function updateFolderOptions(ctx) {
+  const select = ctx.folderSelect
+  const previous = ctx.browser.input.folder
+  const folders = new Set()
+  for (const entry of ctx.browser.input.files) {
+    const folder = String(entry.subfolder || '')
+    if (!folder) continue
+    const segments = folder.split('/')
+    for (let index = 1; index <= segments.length; index += 1) folders.add(segments.slice(0, index).join('/'))
+  }
+  select.replaceChildren()
+  const all = document.createElement('option'); all.value = 'all'; all.textContent = 'All folders'; select.appendChild(all)
+  for (const folder of Array.from(folders).sort(compareNatural)) {
+    const option = document.createElement('option'); option.value = folder; option.textContent = folder; select.appendChild(option)
+  }
+  ctx.browser.input.folder = folders.has(previous) ? previous : 'all'
+  select.value = ctx.browser.input.folder
+}
+
+function renderGalleryNode(node) {
   const ctx = node.__bil
   if (!ctx) return
-
   const snapshot = getCurrentState(node)
   cacheRenderableState(node, snapshot.state, snapshot.uiState)
   const { state, uiState } = snapshot
-  const selected = getSelectedIds(uiState)
+  const validQueueIds = new Set(state.items.map((item) => item.id))
+  ctx.browser.conveyor.selected = new Set(
+    Array.from(ctx.browser.conveyor.selected).filter((id) => validQueueIds.has(id))
+  )
+  ctx.visibleItems = getViewItems(node)
+  const inputRootView = ctx.browser.activeView === 'input'
+  const inputView = isLibraryView(ctx)
+  const folderView = isFolderView(ctx)
+  const browser = activeBrowser(ctx)
+  const pending = countItemsByStatus(state, 'pending')
+  const queued = countItemsByStatus(state, 'queued')
+  const processed = countItemsByStatus(state, 'processed')
+  const next = state.dont_consume ? findNextLoadItem(state) : findFirstByStatus(state, ['pending', 'queued'])
 
-  const pendingCount = countItemsByStatus(state, 'pending')
-  const queuedCount = countItemsByStatus(state, 'queued')
-  const processedCount = countItemsByStatus(state, 'processed')
-  const nextItem = state.dont_consume
-    ? findNextLoadItem(state)
-    : findFirstByStatus(state, ['pending', 'queued'])
+  ctx.conveyorTab.textContent = `Conveyor ${state.items.length}`
+  ctx.inputTab.textContent = `Input Folder ${ctx.browser.input.files.length}`
+  renderTabs(ctx)
+  if (document.activeElement !== ctx.searchInput) ctx.searchInput.value = browser.query
+  ctx.sizeSelect.value = browser.size
+  ctx.conveyorFilter.hidden = inputView
+  ctx.folderSelect.hidden = !inputRootView
+  ctx.conveyorSort.hidden = inputView
+  ctx.inputSort.hidden = !inputView
+  ctx.applySortBtn.hidden = inputView
+  ctx.refreshBtn.hidden = !inputRootView
+  ctx.addSelectedInputBtn.hidden = !inputView
+  ctx.conveyorFilter.value = ctx.browser.conveyor.filter
+  if (inputRootView) ctx.folderSelect.value = ctx.browser.input.folder
+  ctx.conveyorSort.value = ctx.browser.conveyor.sort
+  if (inputView) ctx.inputSort.value = browser.sort
+  const source = folderView ? ctx.browser.folderSources.get(browser.sourceId) : null
+  const folderLabel = folderView
+    ? (browser.folderPath ? `${source?.name || 'Folder'}/${browser.folderPath}` : source?.name || 'Folder')
+    : ''
+  ctx.summary.textContent = inputRootView
+    ? `${ctx.visibleItems.length} shown · ${ctx.browser.input.files.length} images${ctx.browser.input.loading ? ' · refreshing…' : ''}${ctx.browser.input.error ? ` · ${ctx.browser.input.error}` : ''}`
+    : folderView
+      ? `${folderLabel} · ${ctx.visibleItems.length} item${ctx.visibleItems.length === 1 ? '' : 's'}${browser.error ? ` · ${browser.error}` : ''}`
+      : `${state.items.length} total · ${pending} pending · ${queued} queued · ${processed} processed`
+  const focusedIndex = browser.focusedId
+    ? ctx.visibleItems.findIndex((item) => getViewItemId(ctx, item) === browser.focusedId)
+    : -1
+  const position = focusedIndex >= 0 ? `${focusedIndex + 1} of ${ctx.visibleItems.length}` : ''
+  ctx.nextText.textContent = inputView
+    ? position
+    : `${next ? `Next: ${next.filename || getItemDisplayPath(next, uiState)}${state.dont_consume ? ' · not consuming' : ''}` : 'Next: none'}${position ? ` · ${position}` : ''}`
+  renderSelectionContext(node)
+  ctx.autoQueueCheckbox.checked = Boolean(state.auto_queue)
+  ctx.dontConsumeCheckbox.checked = Boolean(state.dont_consume)
+  ctx.canvasDropCheckbox.checked = Boolean(state.catch_canvas_drops)
 
-  ctx.summary.textContent = `Total ${state.items.length} · Pending ${pendingCount} · Queued ${queuedCount} · Processed ${processedCount}`
-  if (ctx.autoQueueCheckbox) {
-    ctx.autoQueueCheckbox.checked = Boolean(state.auto_queue)
-  }
-  if (ctx.dontConsumeCheckbox) {
-    ctx.dontConsumeCheckbox.checked = Boolean(state.dont_consume)
-  }
-  if (ctx.canvasDropCheckbox) {
-    ctx.canvasDropCheckbox.checked = Boolean(state.catch_canvas_drops)
-  }
-  ctx.nextText.textContent = nextItem
-    ? `Next: ${nextItem.filename || getItemDisplayPath(nextItem, uiState)}${state.dont_consume ? ' · not consuming' : ''}`
-    : 'Next: none'
-
-  if (!state.items.length) {
-    ctx.listInner.style.height = 'auto'
-    ctx.listInner.style.minHeight = ''
-    ctx.listWindow.style.height = 'auto'
-    ctx.listWindow.style.minHeight = ''
-    hideUnusedRowSlots(ctx, 0)
-    ctx.renderedRangeKey = ''
-    if (!ctx.empty) {
-      ctx.empty = document.createElement('div')
-      ctx.empty.className = 'bil-empty'
-      ctx.empty.textContent = 'Drop images or folders here, or click the drop area to add images.'
-    }
-    ctx.empty.hidden = false
-    if (ctx.empty.parentElement !== ctx.listWindow) {
-      ctx.listWindow.appendChild(ctx.empty)
-    }
+  if (!ctx.visibleItems.length) {
+    hideUnusedCards(ctx); ctx.renderedRangeKey = ''
+    ctx.listInner.style.height = 'auto'; ctx.listWindow.style.height = 'auto'
+    browser.scrollTop = 0
+    if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) ctx.pendingScrollRestore = null
+    if (ctx.list.scrollTop) ctx.list.scrollTop = 0
+    if (!ctx.empty) { ctx.empty = document.createElement('div'); ctx.empty.className = 'bil-empty' }
+    ctx.empty.textContent = inputRootView
+      ? (ctx.browser.input.loading ? 'Loading the ComfyUI input folder…' : 'No images match this input-folder view.')
+      : folderView
+        ? 'No images or subfolders match this folder view.'
+      : 'Drop images or folders here, click Add images, or browse the Input Folder tab.'
+    if (ctx.empty.parentElement !== ctx.listWindow) ctx.listWindow.appendChild(ctx.empty)
   } else {
-    ctx.listInner.style.minHeight = ''
-    ctx.listWindow.style.minHeight = ''
     ctx.empty?.remove()
-    renderVisibleRows(node)
+    renderVisibleCards(node)
   }
-
-  ctx.setPendingBtn.disabled = selected.size === 0
-  ctx.setProcessedBtn.disabled = selected.size === 0
-  ctx.deleteSelectedBtn.disabled = selected.size === 0
 }
 
-/**
- * Build the DOM for the image-conveyor widget, attach interactive controls and event handlers, and store internal references on the node.
- *
- * Creates the widget's root element, ensures required stylesheet is present, wires file/drop handling, selection/sorting/status controls,
- * virtualization scroll handling, and assigns runtime state/refs to `node.__bil`.
- *
- * @param {object} node - The ComfyUI node object that will host the widget; `node.__bil` will be populated with DOM references and runtime state.
- * @returns {HTMLElement} The root DOM element for the widget.
- */
-function buildDom(node) {
-  ensureStyles()
+async function refreshInputFiles(node, { force = false } = {}) {
+  const ctx = node.__bil
+  if (!ctx) return
+  ctx.inputRequestId += 1
+  const requestId = ctx.inputRequestId
+  ctx.inputAbortController?.abort()
+  const controller = new AbortController()
+  ctx.inputAbortController = controller
+  ctx.browser.input.loading = true
+  ctx.browser.input.error = ''
+  scheduleRenderNode(node)
+  try {
+    const suffix = force ? '?refresh=1' : ''
+    const response = await api.fetchApi(`/image-conveyor/input-files${suffix}`, { signal: controller.signal })
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
+    const payload = await response.json()
+    if (requestId !== ctx.inputRequestId || node.__bil !== ctx || ctx.removed) return
+    const files = Array.isArray(payload?.files) ? payload.files.filter((entry) => entry?.relative_path && entry?.filename) : []
+    ctx.browser.input.files = files
+    ctx.browser.input.loaded = true
+    ctx.browser.input.snapshotVersion = Number(payload?.snapshot_version || 0)
+    const availablePaths = new Set(files.map((entry) => entry.relative_path))
+    ctx.browser.input.selected = new Set(Array.from(ctx.browser.input.selected).filter((path) => availablePaths.has(path)))
+    ctx.inputVersion += 1
+    updateFolderOptions(ctx)
+  } catch (error) {
+    if (error?.name !== 'AbortError' && requestId === ctx.inputRequestId) {
+      ctx.browser.input.error = 'Refresh failed'
+      console.error('Image Conveyor: failed to load the input folder.', error)
+    }
+  } finally {
+    if (requestId === ctx.inputRequestId && node.__bil === ctx && !ctx.removed) {
+      ctx.browser.input.loading = false
+      scheduleRenderNode(node)
+    }
+  }
+}
 
+function addInputEntries(node, entries) {
+  if (!entries.length) return
+  const { state, uiState } = getRenderableState(node)
+  for (const entry of entries) {
+    const item = makeItemFromInputFile(entry)
+    if (!item) continue
+    state.items.push(item)
+    uiState.source_paths[item.id] = entry.relative_path
+  }
+  updateState(node, state, uiState)
+}
+
+async function addLibraryEntries(node, entries) {
+  const localEntries = entries.filter((entry) => entry?.kind === 'local-image' && entry.localFile)
+  const inputEntries = entries.filter((entry) => entry?.kind !== 'folder' && entry?.kind !== 'local-image')
+  if (inputEntries.length) addInputEntries(node, inputEntries)
+  if (localEntries.length) {
+    const uploadEntries = localEntries.map((entry) => ({
+      file: entry.localFile,
+      relativeSubfolder: entry.relativeSubfolder
+    }))
+    const feedbackView = node.__bil?.browser.activeView
+    try {
+      await uploadViaNode(node, uploadEntries, { feedbackView })
+    } catch (error) {
+      const ctx = node.__bil
+      const browser = ctx ? browserForView(ctx, feedbackView) : null
+      if (browser) {
+        browser.error = error?.message || 'Import failed'
+        scheduleRenderNode(node)
+      }
+      console.error('Image Conveyor: folder-tab import failed.', error)
+    }
+  }
+}
+
+async function addSelectedLibraryEntries(node) {
+  const ctx = node.__bil
+  if (!ctx || !isLibraryView(ctx)) return
+  const browser = activeBrowser(ctx)
+  const selected = browser.selected
+  const entries = (ctx.browser.activeView === 'input' ? browser.files : browser.entries)
+    .filter((entry) => entry.kind !== 'folder' && selected.has(getViewItemId(ctx, entry)))
+  await addLibraryEntries(node, entries)
+}
+
+function switchBrowserView(node, view) {
+  const ctx = node.__bil
+  if (!ctx || ctx.browser.activeView === view) return
+  const destination = ctx.browser[view] ?? ctx.browser.folderViews.get(view)
+  if (!destination) return
+  cancelMarqueeSelection(node)
+  const savedScrollTops = Object.fromEntries(ctx.browser.tabOrder.map((viewId) => {
+    const browser = ctx.browser[viewId] ?? ctx.browser.folderViews.get(viewId)
+    return [viewId, browser?.scrollTop || 0]
+  }))
+  const plan = planViewScrollSwitch(
+    ctx.browser.activeView,
+    view,
+    isGalleryViewportMeasurable(ctx.list.clientWidth, ctx.list.clientHeight)
+      ? ctx.list.scrollTop
+      : activeBrowser(ctx).scrollTop,
+    savedScrollTops,
+    ctx.pendingScrollRestore?.view ?? null
+  )
+  for (const [viewId, scrollTop] of Object.entries(plan.positions)) {
+    const browser = ctx.browser[viewId] ?? ctx.browser.folderViews.get(viewId)
+    if (browser) browser.scrollTop = scrollTop
+  }
+  ctx.browser.activeView = view
+  ctx.pendingScrollRestore = plan.restore
+  ctx.renderedRangeKey = ''
+  scheduleRenderNode(node, { forceVisibleRows: true })
+  if (view === 'input' && !ctx.browser.input.loaded && !ctx.browser.input.loading) void refreshInputFiles(node)
+}
+
+function scrollItemIntoView(node, index) {
+  const ctx = node.__bil
+  const metrics = getGalleryMetrics(ctx)
+  const row = Math.floor(index / metrics.columns)
+  const top = row * metrics.rowStride
+  const bottom = top + metrics.cardHeight
+  if (top < ctx.list.scrollTop) ctx.list.scrollTop = top
+  else if (bottom > ctx.list.scrollTop + ctx.list.clientHeight) ctx.list.scrollTop = bottom - ctx.list.clientHeight
+}
+
+function isInteractiveWidgetControl(target) {
+  return target instanceof Element && Boolean(
+    target.closest('button, input, textarea, select, a[href], [contenteditable="true"]')
+  )
+}
+
+function shouldRetainWidgetFocus(target) {
+  const control = target instanceof Element
+    ? target.closest('input, textarea, select, [contenteditable="true"]')
+    : null
+  if (!control) return false
+  if (control instanceof HTMLInputElement) {
+    return !['button', 'checkbox', 'color', 'file', 'radio', 'range', 'reset', 'submit'].includes(control.type)
+  }
+  return control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement || control.isContentEditable
+}
+
+function consumeGalleryKeyboardEvent(event) {
+  event.preventDefault()
+  event.stopPropagation()
+  event.stopImmediatePropagation?.()
+}
+
+function handleGalleryKeyDown(node, event) {
+  const ctx = node.__bil
+  if (!ctx || isInteractiveWidgetControl(event.target)) return false
+  if (isConveyorDeleteShortcut(event) && deleteSelectedConveyorItems(node)) {
+    consumeGalleryKeyboardEvent(event)
+    return true
+  }
+  if (event.key === 'Escape' && !ctx.lightbox.root.hidden) {
+    consumeGalleryKeyboardEvent(event)
+    ctx.lightbox.hide()
+    return true
+  }
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false
+  const items = ctx.visibleItems || []
+  if (!items.length) return false
+  const browser = activeBrowser(ctx)
+  const itemId = (item) => getViewItemId(ctx, item)
+  let index = items.findIndex((item) => itemId(item) === browser.focusedId)
+  if (index < 0) index = 0
+  const metrics = getGalleryMetrics(ctx)
+  const page = Math.max(metrics.columns, Math.floor(ctx.list.clientHeight / metrics.rowStride) * metrics.columns)
+  let next = index
+  switch (event.key) {
+    case 'ArrowLeft': next -= 1; break
+    case 'ArrowRight': next += 1; break
+    case 'ArrowUp': next -= metrics.columns; break
+    case 'ArrowDown': next += metrics.columns; break
+    case 'Home': next = 0; break
+    case 'End': next = items.length - 1; break
+    case 'PageUp': next -= page; break
+    case 'PageDown': next += page; break
+    case 'Enter':
+      consumeGalleryKeyboardEvent(event)
+      if (items[index].kind === 'folder') openFolderView(node, items[index].sourceId, items[index].folderPath)
+      else openPreview(node, items[index])
+      return true
+    case ' ': {
+      consumeGalleryKeyboardEvent(event)
+      if (items[index].kind === 'folder') return true
+      const id = itemId(items[index]); const selected = getViewSelectedIds(node)
+      setItemSelected(node, id, !selected.has(id), event); return true
+    }
+    default: return false
+  }
+  consumeGalleryKeyboardEvent(event)
+  next = Math.max(0, Math.min(items.length - 1, next))
+  browser.focusedId = itemId(items[next])
+  scrollItemIntoView(node, next)
+  scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+  return true
+}
+
+function buildGalleryDom(node) {
+  ensureStyles()
   const root = document.createElement('div')
   root.className = 'bil-root'
-  root.tabIndex = -1
-
-  const dropzone = document.createElement('div')
-  dropzone.className = 'bil-dropzone'
-  dropzone.textContent = 'Click to add images, or drop images/folders'
+  root.setAttribute('aria-label', 'Image Conveyor browser')
 
   const fileInput = document.createElement('input')
   fileInput.type = 'file'
   fileInput.accept = 'image/*,.png,.jpg,.jpeg,.webp,.bmp,.gif,.tif,.tiff,.avif'
   fileInput.multiple = true
-  fileInput.style.display = 'none'
+  fileInput.hidden = true
+  const folderInput = document.createElement('input')
+  folderInput.type = 'file'
+  folderInput.multiple = true
+  folderInput.hidden = true
+  folderInput.setAttribute('webkitdirectory', '')
+  folderInput.setAttribute('directory', '')
 
-  const toolbar = document.createElement('div')
-  toolbar.className = 'bil-toolbar'
+  const header = document.createElement('div')
+  header.className = 'bil-header'
+  const tabs = document.createElement('div')
+  tabs.className = 'bil-tabs'
+  tabs.setAttribute('role', 'tablist')
+  const conveyorTab = document.createElement('button')
+  conveyorTab.className = 'bil-tab'; conveyorTab.type = 'button'; conveyorTab.setAttribute('role', 'tab')
+  const inputTab = document.createElement('button')
+  inputTab.className = 'bil-tab'; inputTab.type = 'button'; inputTab.setAttribute('role', 'tab')
+  const tabSetId = makeId()
+  conveyorTab.id = `${tabSetId}-conveyor-tab`
+  inputTab.id = `${tabSetId}-input-tab`
+  conveyorTab.title = 'Conveyor'
+  inputTab.title = 'ComfyUI Input Folder'
+  tabs.append(conveyorTab, inputTab)
+  const addImagesBtn = document.createElement('button')
+  addImagesBtn.className = 'bil-btn bil-add-btn'; addImagesBtn.type = 'button'; addImagesBtn.textContent = '+ Add images'
+  const addFoldersBtn = document.createElement('button')
+  addFoldersBtn.className = 'bil-btn bil-add-btn'; addFoldersBtn.type = 'button'; addFoldersBtn.textContent = '+ Add folders'
+  addFoldersBtn.title = 'Browse folders as tabs without importing their images'
+  header.append(tabs)
 
-  const selectAllBtn = document.createElement('button')
-  selectAllBtn.className = 'bil-btn'
-  selectAllBtn.type = 'button'
-  selectAllBtn.textContent = 'Select all'
-
-  const selectNoneBtn = document.createElement('button')
-  selectNoneBtn.className = 'bil-btn'
-  selectNoneBtn.type = 'button'
-  selectNoneBtn.textContent = 'Clear selection'
-
-  const sortSelect = document.createElement('select')
-  sortSelect.className = 'bil-select'
-  ;[
-    ['manual', 'Manual order'],
-    ['name_asc', 'Sort name ↑'],
-    ['name_desc', 'Sort name ↓'],
-    ['added_newest', 'Sort newest'],
-    ['added_oldest', 'Sort oldest'],
-    ['status', 'Sort status']
-  ].forEach(([value, label]) => {
-    const option = document.createElement('option')
-    option.value = value
-    option.textContent = label
-    sortSelect.appendChild(option)
+  const browserbar = document.createElement('div')
+  browserbar.className = 'bil-browserbar'
+  const searchInput = document.createElement('input')
+  searchInput.className = 'bil-input'; searchInput.type = 'search'; searchInput.placeholder = 'Search images…'
+  const conveyorFilter = document.createElement('select')
+  conveyorFilter.className = 'bil-select'
+  ;[['all', 'All'], ['pending', 'Pending'], ['queued', 'Queued'], ['processed', 'Processed']].forEach(([value, label]) => {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; conveyorFilter.appendChild(option)
   })
+  const folderSelect = document.createElement('select')
+  folderSelect.className = 'bil-select'; folderSelect.hidden = true
+  const conveyorSort = document.createElement('select')
+  conveyorSort.className = 'bil-select'
+  ;[
+    ['manual', 'Manual order'], ['name_asc', 'Name ↑'], ['name_desc', 'Name ↓'],
+    ['added_newest', 'Newest'], ['added_oldest', 'Oldest'], ['status', 'Status']
+  ].forEach(([value, label]) => { const option = document.createElement('option'); option.value = value; option.textContent = label; conveyorSort.appendChild(option) })
+  const inputSort = document.createElement('select')
+  inputSort.className = 'bil-select'; inputSort.hidden = true
+  ;[['name_asc', 'Name ↑'], ['name_desc', 'Name ↓'], ['newest', 'Newest'], ['oldest', 'Oldest']].forEach(([value, label]) => {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; inputSort.appendChild(option)
+  })
+  const sizeSelect = document.createElement('select')
+  sizeSelect.className = 'bil-select bil-size-select'
+  ;[['small', 'Small'], ['medium', 'Medium'], ['large', 'Large']].forEach(([value, label]) => {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; sizeSelect.appendChild(option)
+  })
+  browserbar.append(searchInput, conveyorFilter, folderSelect, conveyorSort, inputSort, sizeSelect)
 
-  const sortBtn = document.createElement('button')
-  sortBtn.className = 'bil-btn'
-  sortBtn.type = 'button'
-  sortBtn.textContent = 'Apply sort'
+  const secondary = document.createElement('div')
+  secondary.className = 'bil-header'
+  const applySortBtn = document.createElement('button')
+  applySortBtn.className = 'bil-btn'; applySortBtn.type = 'button'; applySortBtn.textContent = 'Apply queue sort'
+  const refreshBtn = document.createElement('button')
+  refreshBtn.className = 'bil-btn'; refreshBtn.type = 'button'; refreshBtn.textContent = 'Refresh'; refreshBtn.hidden = true
+  const addSelectedInputBtn = document.createElement('button')
+  addSelectedInputBtn.className = 'bil-btn'; addSelectedInputBtn.type = 'button'; addSelectedInputBtn.textContent = 'Add selected'; addSelectedInputBtn.hidden = true
+  secondary.append(applySortBtn, addImagesBtn, addFoldersBtn, refreshBtn, addSelectedInputBtn)
 
-  const autoQueueLabel = document.createElement('label')
-  autoQueueLabel.className = 'bil-toggle'
-  const autoQueueCheckbox = document.createElement('input')
-  autoQueueCheckbox.type = 'checkbox'
-  autoQueueCheckbox.setAttribute('aria-label', 'Auto queue all pending images')
-  const autoQueueText = document.createElement('span')
-  autoQueueText.textContent = 'Auto queue all pending'
-  autoQueueLabel.append(autoQueueCheckbox, autoQueueText)
-
-  const dontConsumeLabel = document.createElement('label')
-  dontConsumeLabel.className = 'bil-toggle'
-  const dontConsumeCheckbox = document.createElement('input')
-  dontConsumeCheckbox.type = 'checkbox'
-  dontConsumeCheckbox.setAttribute('aria-label', 'Do not consume images')
-  const dontConsumeText = document.createElement('span')
-  dontConsumeText.textContent = "Don't consume"
-  dontConsumeLabel.append(dontConsumeCheckbox, dontConsumeText)
-
-  const canvasDropLabel = document.createElement('label')
-  canvasDropLabel.className = 'bil-toggle'
-  canvasDropLabel.title = 'When enabled, external image/folder drops anywhere on the graph canvas are added to this conveyor. If multiple conveyors enable it, select the target conveyor first.'
-  const canvasDropCheckbox = document.createElement('input')
-  canvasDropCheckbox.type = 'checkbox'
-  canvasDropCheckbox.setAttribute('aria-label', 'Catch image drops anywhere on the canvas')
-  const canvasDropText = document.createElement('span')
-  canvasDropText.textContent = 'Catch canvas drops'
-  canvasDropLabel.append(canvasDropCheckbox, canvasDropText)
-
-  toolbar.append(
-    selectAllBtn,
-    selectNoneBtn,
-    sortSelect,
-    sortBtn,
-    autoQueueLabel,
-    dontConsumeLabel,
-    canvasDropLabel
-  )
-
-  const subtoolbar = document.createElement('div')
-  subtoolbar.className = 'bil-subtoolbar'
-
-  const setPendingBtn = document.createElement('button')
-  setPendingBtn.className = 'bil-btn'
-  setPendingBtn.type = 'button'
-  setPendingBtn.textContent = 'Set pending'
-
-  const setProcessedBtn = document.createElement('button')
-  setProcessedBtn.className = 'bil-btn'
-  setProcessedBtn.type = 'button'
-  setProcessedBtn.textContent = 'Set processed'
-
-  const clearQueuedBtn = document.createElement('button')
-  clearQueuedBtn.className = 'bil-btn'
-  clearQueuedBtn.type = 'button'
-  clearQueuedBtn.textContent = 'Clear queued'
-
-  const clearProcessedBtn = document.createElement('button')
-  clearProcessedBtn.className = 'bil-btn'
-  clearProcessedBtn.type = 'button'
-  clearProcessedBtn.textContent = 'Remove processed'
-
-  const deleteSelectedBtn = document.createElement('button')
-  deleteSelectedBtn.className = 'bil-btn'
-  deleteSelectedBtn.type = 'button'
-  deleteSelectedBtn.textContent = 'Delete selected'
-
-  subtoolbar.append(
-    setPendingBtn,
-    setProcessedBtn,
-    clearQueuedBtn,
-    clearProcessedBtn,
-    deleteSelectedBtn
-  )
-
+  const summaryRow = document.createElement('div')
+  summaryRow.className = 'bil-summary'
   const summary = document.createElement('div')
-  summary.className = 'bil-summary'
-  const summaryText = document.createElement('div')
   const nextText = document.createElement('div')
-  nextText.className = 'bil-status-text'
-  summary.append(summaryText, nextText)
+  summaryRow.append(summary, nextText)
+
+  const contextBar = document.createElement('div')
+  contextBar.className = 'bil-contextbar'; contextBar.hidden = true
+  const contextLabel = document.createElement('span'); contextLabel.className = 'bil-context-label'
+  const setPendingBtn = document.createElement('button'); setPendingBtn.className = 'bil-btn'; setPendingBtn.type = 'button'; setPendingBtn.textContent = 'Pending'
+  const setProcessedBtn = document.createElement('button'); setProcessedBtn.className = 'bil-btn'; setProcessedBtn.type = 'button'; setProcessedBtn.textContent = 'Done'
+  const deleteSelectedBtn = document.createElement('button'); deleteSelectedBtn.className = 'bil-btn'; deleteSelectedBtn.type = 'button'; deleteSelectedBtn.textContent = 'Delete'
+  const contextAddBtn = document.createElement('button'); contextAddBtn.className = 'bil-btn'; contextAddBtn.type = 'button'; contextAddBtn.textContent = 'Add to Conveyor'
+  const clearSelectionBtn = document.createElement('button'); clearSelectionBtn.className = 'bil-btn'; clearSelectionBtn.type = 'button'; clearSelectionBtn.textContent = 'Clear'
+  contextBar.append(contextLabel, setPendingBtn, setProcessedBtn, deleteSelectedBtn, contextAddBtn, clearSelectionBtn)
+
+  const settings = document.createElement('details')
+  settings.className = 'bil-settings'
+  const settingsSummary = document.createElement('summary'); settingsSummary.textContent = 'Queue options and bulk tools'
+  const settingsRow = document.createElement('div'); settingsRow.className = 'bil-settings-row'
+  const makeToggle = (labelText, ariaLabel) => {
+    const label = document.createElement('label'); label.className = 'bil-toggle'
+    const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.setAttribute('aria-label', ariaLabel)
+    const text = document.createElement('span'); text.textContent = labelText
+    label.append(checkbox, text); return { label, checkbox }
+  }
+  const autoQueue = makeToggle('Auto queue all pending', 'Auto queue all pending images')
+  const dontConsume = makeToggle("Don't consume", 'Do not consume images')
+  const canvasDrop = makeToggle('Catch canvas drops', 'Catch image drops anywhere on the canvas')
+  const selectVisibleBtn = document.createElement('button'); selectVisibleBtn.className = 'bil-btn'; selectVisibleBtn.type = 'button'; selectVisibleBtn.textContent = 'Select all'
+  const clearQueuedBtn = document.createElement('button'); clearQueuedBtn.className = 'bil-btn'; clearQueuedBtn.type = 'button'; clearQueuedBtn.textContent = 'Clear queued'
+  const clearProcessedBtn = document.createElement('button'); clearProcessedBtn.className = 'bil-btn'; clearProcessedBtn.type = 'button'; clearProcessedBtn.textContent = 'Remove processed'
+  const jumpPendingBtn = document.createElement('button'); jumpPendingBtn.className = 'bil-btn'; jumpPendingBtn.type = 'button'; jumpPendingBtn.textContent = 'Jump to next pending'
+  const cleanDuplicatesBtn = document.createElement('button'); cleanDuplicatesBtn.className = 'bil-btn'; cleanDuplicatesBtn.type = 'button'; cleanDuplicatesBtn.textContent = 'Clean exact duplicates'
+  cleanDuplicatesBtn.title = 'Preview and remove byte-identical redundant files from the legacy input/image_conveyor folder'
+  settingsRow.append(autoQueue.label, dontConsume.label, canvasDrop.label, selectVisibleBtn, clearQueuedBtn, clearProcessedBtn, jumpPendingBtn, cleanDuplicatesBtn)
+  settings.append(settingsSummary, settingsRow)
 
   const list = document.createElement('div')
   list.className = 'bil-list'
-
-  const listInner = document.createElement('div')
-  listInner.className = 'bil-list-inner'
-
-  const listWindow = document.createElement('div')
-  listWindow.className = 'bil-list-window'
-
-  listInner.appendChild(listWindow)
-  list.appendChild(listInner)
-
-  root.append(fileInput, dropzone, toolbar, subtoolbar, summary, list)
+  list.id = `${tabSetId}-panel`
+  list.setAttribute('role', 'tabpanel')
+  list.setAttribute('aria-labelledby', conveyorTab.id)
+  conveyorTab.setAttribute('aria-controls', list.id)
+  inputTab.setAttribute('aria-controls', list.id)
+  const listInner = document.createElement('div'); listInner.className = 'bil-list-inner'
+  const listWindow = document.createElement('div'); listWindow.className = 'bil-list-window'
+  listWindow.setAttribute('role', 'listbox')
+  listWindow.setAttribute('aria-multiselectable', 'true')
+  const selectionMarquee = document.createElement('div')
+  selectionMarquee.className = 'bil-selection-marquee'; selectionMarquee.hidden = true
+  const dropIndicator = document.createElement('div')
+  dropIndicator.className = 'bil-drop-indicator'; dropIndicator.hidden = true
+  listInner.append(listWindow, selectionMarquee, dropIndicator); list.appendChild(listInner)
+  root.append(fileInput, folderInput, header, browserbar, secondary, summaryRow, contextBar, settings, list)
 
   node.__bil = {
-    root,
-    dropzone,
-    fileInput,
-    summary: summaryText,
-    nextText,
-    list,
-    listInner,
-    listWindow,
-    setPendingBtn,
-    setProcessedBtn,
-    deleteSelectedBtn,
-    autoQueueCheckbox,
-    dontConsumeCheckbox,
-    canvasDropCheckbox,
-    draggedId: null,
-    empty: null,
-    state: null,
-    uiState: null,
-    renderVersion: 0,
-    renderedRangeKey: '',
-    renderFrame: 0,
-    renderViewportOnly: false,
-    rowPool: [],
-    listResizeObserver: null,
-    widgetOuterHeight: 0,
-    widgetInnerHeight: 0,
-    widgetWidth: 0,
-    pointerInside: false,
-    middlePanPointerId: null,
-    documentPasteHandler: null,
-    documentMiddlePanMoveHandler: null,
-    documentMiddlePanEndHandler: null
+    root, tabs, tabSetId, dropzone: addImagesBtn, addImagesBtn, addFoldersBtn, fileInput, folderInput,
+    conveyorTab, inputTab, folderTabElements: new Map(),
+    searchInput, conveyorFilter, folderSelect, conveyorSort, inputSort, sizeSelect,
+    applySortBtn, refreshBtn, addSelectedInputBtn, summary, nextText, contextBar,
+    contextLabel, setPendingBtn, setProcessedBtn, deleteSelectedBtn, contextAddBtn,
+    cleanDuplicatesBtn,
+    autoQueueCheckbox: autoQueue.checkbox, dontConsumeCheckbox: dontConsume.checkbox,
+    canvasDropCheckbox: canvasDrop.checkbox, list, listInner, listWindow, selectionMarquee, dropIndicator,
+    browser: createBrowserState(), visibleItems: [], cardPool: [],
+    draggedId: null, dragIntent: null, empty: null, state: null, uiState: null, renderVersion: 0,
+    inputVersion: 0, renderedRangeKey: '', renderFrame: 0, renderViewportOnly: false,
+    pendingScrollRestore: null,
+    galleryViewportSuspended: false, galleryViewportEpoch: 0,
+    deferThumbnailLoads: false, scrollSettleTimer: 0,
+    scrollSampleTop: 0, scrollSampleAt: 0,
+    listResizeObserver: null, widgetOuterHeight: 0, widgetInnerHeight: 0, widgetWidth: 0,
+    pointerInside: false, middlePanPointerId: null, documentPasteHandler: null,
+    documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
+    documentMarqueeMoveHandler: null, documentMarqueeEndHandler: null,
+    documentFocusScopeHandler: null, windowFocusHandler: null,
+    filePickerPending: false, filePickerFocusTimer: 0, filePickerFocusFrame: 0,
+    inputAbortController: null, inputRequestId: 0,
+    searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
+    uploadDepth: 0, dropzoneLabel: '', duplicateCleanupBusy: false,
+    clearExternalDragState: null, restoreCanvasShortcutFocus: null, marqueeSelection: null,
+    keyboardActive: false,
+    queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map(),
+    thumbnailUrlCache: new WeakMap(), localObjectUrls: new Map(), activePickerInput: null
   }
   const ctx = node.__bil
+  ctx.lightbox = createLightbox(node)
+  updateFolderOptions(ctx)
 
-  list.addEventListener('scroll', () => scheduleRenderNode(node, { viewportOnly: true }), {
-    passive: true
+  const runUpload = (files) => {
+    void uploadViaNode(node, files).catch((error) => {
+      console.error('Image Conveyor: import failed.', error)
+      ctx.browser.input.error = error?.message || 'Import failed'
+      scheduleRenderNode(node)
+    })
+  }
+  const scheduleCanvasShortcutFocusRestore = (focusOwner = null) => {
+    if (ctx.removed) return
+    if (ctx.filePickerFocusFrame) cancelAnimationFrame(ctx.filePickerFocusFrame)
+    ctx.filePickerFocusFrame = requestAnimationFrame(() => {
+      ctx.filePickerFocusFrame = 0
+      if (ctx.removed) return
+      restoreGraphCanvasFocus(focusOwner, app.canvas?.canvas)
+    })
+  }
+  ctx.restoreCanvasShortcutFocus = (focusOwner = document.activeElement) => {
+    restoreGraphCanvasFocus(focusOwner, app.canvas?.canvas)
+  }
+  const restoreFocusAfterFilePicker = () => {
+    if (!ctx.filePickerPending || ctx.removed) return
+    const pickerInput = ctx.activePickerInput
+    ctx.filePickerPending = false
+    ctx.activePickerInput = null
+    clearTimeout(ctx.filePickerFocusTimer)
+    ctx.filePickerFocusTimer = 0
+    scheduleCanvasShortcutFocusRestore(pickerInput)
+  }
+  const schedulePickerFocusRestore = () => {
+    if (!ctx.filePickerPending || ctx.removed) return
+    clearTimeout(ctx.filePickerFocusTimer)
+    ctx.filePickerFocusTimer = setTimeout(restoreFocusAfterFilePicker, 0)
+  }
+  const openPicker = (pickerInput) => {
+    ctx.filePickerPending = true
+    ctx.activePickerInput = pickerInput
+    try {
+      pickerInput.click()
+    } catch (error) {
+      ctx.filePickerPending = false
+      ctx.activePickerInput = null
+      throw error
+    }
+  }
+  addImagesBtn.addEventListener('click', () => openPicker(fileInput))
+  addFoldersBtn.addEventListener('click', () => openPicker(folderInput))
+  fileInput.addEventListener('change', () => {
+    const files = fileInput.files
+    restoreFocusAfterFilePicker()
+    runUpload(files)
+    fileInput.value = ''
   })
+  fileInput.addEventListener('cancel', restoreFocusAfterFilePicker)
+  folderInput.addEventListener('change', () => {
+    const sources = makePickerFolderSources(folderInput.files)
+    restoreFocusAfterFilePicker()
+    folderInput.value = ''
+    if (!sources.length) {
+      window.alert('No browsable folder was selected. Choose a folder containing files, or drag folders onto the tab bar.')
+      return
+    }
+    addFolderSources(node, sources)
+  })
+  folderInput.addEventListener('cancel', restoreFocusAfterFilePicker)
+  ctx.windowFocusHandler = schedulePickerFocusRestore
+  window.addEventListener('focus', ctx.windowFocusHandler)
+  conveyorTab.addEventListener('click', () => switchBrowserView(node, 'conveyor'))
+  inputTab.addEventListener('click', () => switchBrowserView(node, 'input'))
+  refreshBtn.addEventListener('click', () => void refreshInputFiles(node, { force: true }))
+  addSelectedInputBtn.addEventListener('click', () => void addSelectedLibraryEntries(node))
+  contextAddBtn.addEventListener('click', () => void addSelectedLibraryEntries(node))
+  cleanDuplicatesBtn.addEventListener('click', () => void cleanManagedDuplicates(node))
+
+  searchInput.addEventListener('input', () => {
+    clearTimeout(ctx.searchTimer)
+    const targetView = ctx.browser.activeView
+    const query = searchInput.value
+    ctx.searchTimer = setTimeout(() => {
+      const targetBrowser = browserForView(ctx, targetView)
+      if (!targetBrowser) return
+      targetBrowser.query = query
+      targetBrowser.scrollTop = 0
+      if (ctx.browser.activeView === targetView) list.scrollTop = 0
+      scheduleRenderNode(node)
+    }, 70)
+  })
+  conveyorFilter.addEventListener('change', () => { ctx.browser.conveyor.filter = conveyorFilter.value; list.scrollTop = 0; scheduleRenderNode(node) })
+  folderSelect.addEventListener('change', () => { ctx.browser.input.folder = folderSelect.value; list.scrollTop = 0; scheduleRenderNode(node) })
+  inputSort.addEventListener('change', () => { if (isLibraryView(ctx)) activeBrowser(ctx).sort = inputSort.value; scheduleRenderNode(node) })
+  conveyorSort.addEventListener('change', () => { ctx.browser.conveyor.sort = conveyorSort.value })
+  sizeSelect.addEventListener('change', () => {
+    const items = ctx.visibleItems || []
+    const previous = getGalleryMetrics(ctx)
+    const anchorIndex = Math.min(items.length - 1, Math.max(0, Math.floor(list.scrollTop / previous.rowStride) * previous.columns))
+    const anchorId = items[anchorIndex] ? getViewItemId(ctx, items[anchorIndex]) : null
+    activeBrowser(ctx).size = sizeSelect.value
+    ctx.renderedRangeKey = ''
+    scheduleRenderNode(node, { forceVisibleRows: true })
+    requestAnimationFrame(() => {
+      if (!anchorId || !node.__bil) return
+      const newIndex = (ctx.visibleItems || []).findIndex((item) => getViewItemId(ctx, item) === anchorId)
+      if (newIndex >= 0) { const metrics = getGalleryMetrics(ctx); list.scrollTop = Math.floor(newIndex / metrics.columns) * metrics.rowStride }
+    })
+  })
+
+  applySortBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node)
+    switch (conveyorSort.value) {
+      case 'name_asc': state.items.sort((a, b) => compareNatural(getItemDisplayPath(a, uiState), getItemDisplayPath(b, uiState))); break
+      case 'name_desc': state.items.sort((a, b) => compareNatural(getItemDisplayPath(b, uiState), getItemDisplayPath(a, uiState))); break
+      case 'added_newest': state.items.sort((a, b) => (b.added_at || 0) - (a.added_at || 0)); break
+      case 'added_oldest': state.items.sort((a, b) => (a.added_at || 0) - (b.added_at || 0)); break
+      case 'status': state.items.sort((a, b) => itemStatusRank(a.status) - itemStatusRank(b.status) || (a.added_at || 0) - (b.added_at || 0)); break
+      default: break
+    }
+    ctx.browser.conveyor.sort = 'manual'; conveyorSort.value = 'manual'; updateState(node, state, uiState)
+  })
+
+  const mutateSelected = (status) => {
+    const { state, uiState } = getRenderableState(node); const selected = ctx.browser.conveyor.selected; const now = Date.now()
+    for (const item of state.items) if (selected.has(item.id)) { item.status = status; if (status === 'processed') item.last_processed_at = now }
+    updateState(node, state, uiState)
+  }
+  setPendingBtn.addEventListener('click', () => mutateSelected('pending'))
+  setProcessedBtn.addEventListener('click', () => mutateSelected('processed'))
+  deleteSelectedBtn.addEventListener('click', () => deleteSelectedConveyorItems(node))
+  clearSelectionBtn.addEventListener('click', () => {
+    if (isLibraryView(ctx)) {
+      activeBrowser(ctx).selected.clear(); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    } else {
+      ctx.browser.conveyor.selected.clear(); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    }
+  })
+  selectVisibleBtn.addEventListener('click', () => {
+    if (isLibraryView(ctx)) {
+      const browser = activeBrowser(ctx)
+      const entries = ctx.browser.activeView === 'input' ? browser.files : browser.entries
+      browser.selected = new Set(entries.filter((item) => item.kind !== 'folder').map((item) => getViewItemId(ctx, item)))
+      renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    } else {
+      const { state } = getRenderableState(node); ctx.browser.conveyor.selected = new Set(state.items.map((item) => item.id)); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+    }
+  })
+  autoQueue.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.auto_queue = autoQueue.checkbox.checked; updateState(node, state, uiState) })
+  dontConsume.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.dont_consume = dontConsume.checkbox.checked; updateState(node, state, uiState) })
+  canvasDrop.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.catch_canvas_drops = canvasDrop.checkbox.checked; updateState(node, state, uiState) })
+  clearQueuedBtn.addEventListener('click', () => { const { state, uiState } = getRenderableState(node); for (const item of state.items) if (item.status === 'queued') item.status = 'pending'; updateState(node, state, uiState) })
+  clearProcessedBtn.addEventListener('click', () => {
+    const { state, uiState } = getRenderableState(node); const kept = state.items.filter((item) => item.status !== 'processed'); const ids = new Set(kept.map((item) => item.id)); state.items = kept
+    uiState.selected_ids = uiState.selected_ids.filter((id) => ids.has(id)); uiState.source_paths = Object.fromEntries(Object.entries(uiState.source_paths).filter(([id]) => ids.has(id))); updateState(node, state, uiState)
+  })
+  jumpPendingBtn.addEventListener('click', () => {
+    if (ctx.browser.activeView !== 'conveyor') {
+      switchBrowserView(node, 'conveyor')
+    }
+    ctx.browser.conveyor.query = ''
+    ctx.browser.conveyor.filter = 'all'
+    ctx.visibleItems = getViewItems(node)
+    const index = ctx.visibleItems.findIndex((item) => item.status === 'pending')
+    if (index >= 0) {
+      ctx.browser.conveyor.focusedId = ctx.visibleItems[index].id
+      const metrics = getGalleryMetrics(ctx)
+      const scrollTop = Math.floor(index / metrics.columns) * metrics.rowStride
+      ctx.browser.conveyor.scrollTop = scrollTop
+      ctx.pendingScrollRestore = { view: 'conveyor', scrollTop }
+    }
+    scheduleRenderNode(node, { forceVisibleRows: true })
+  })
+
+  list.addEventListener('scroll', () => {
+    if (
+      ctx.galleryViewportSuspended ||
+      !isGalleryViewportMeasurable(list.clientWidth, list.clientHeight)
+    ) {
+      suspendGalleryViewport(ctx)
+      return
+    }
+    if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) return
+    const now = globalThis.performance?.now?.() ?? Date.now()
+    const previousAt = ctx.scrollSampleAt
+    const previousTop = ctx.scrollSampleTop
+    ctx.scrollSampleTop = list.scrollTop
+    ctx.scrollSampleAt = now
+    if (previousAt && (ctx.deferThumbnailLoads || isHighVelocityScroll(
+      list.scrollTop - previousTop,
+      now - previousAt,
+      ctx.lastMetrics?.rowStride
+    ))) {
+      ctx.deferThumbnailLoads = true
+      clearTimeout(ctx.scrollSettleTimer)
+      ctx.scrollSettleTimer = setTimeout(() => {
+        if (ctx.removed) return
+        ctx.deferThumbnailLoads = false
+        ctx.renderedRangeKey = ''
+        scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+      }, FAST_SCROLL_SETTLE_MS)
+    }
+    activeBrowser(ctx).scrollTop = list.scrollTop
+    scheduleRenderNode(node, { viewportOnly: true })
+  }, { passive: true })
+  ctx.documentFocusScopeHandler = (event) => {
+    if (!(event.target instanceof Node) || !root.contains(event.target)) releaseGalleryKeyboardOwnership(node)
+  }
+  document.addEventListener('pointerdown', ctx.documentFocusScopeHandler, true)
 
   if (typeof ResizeObserver === 'function') {
     ctx.listResizeObserver = new ResizeObserver(() => {
+      if (!isGalleryViewportMeasurable(list.clientWidth, list.clientHeight)) {
+        suspendGalleryViewport(ctx)
+        return
+      }
+      const resuming = ctx.galleryViewportSuspended
+      if (resuming && ctx.pendingScrollRestore?.view !== ctx.browser.activeView) {
+        ctx.pendingScrollRestore = {
+          view: ctx.browser.activeView,
+          scrollTop: activeBrowser(ctx).scrollTop
+        }
+      }
+      const previous = ctx.lastMetrics
+      const items = ctx.visibleItems || []
+      const anchorIndex = previous
+        ? Math.min(items.length - 1, Math.max(0, Math.floor(list.scrollTop / previous.rowStride) * previous.columns))
+        : -1
+      const anchorId = anchorIndex >= 0
+        ? getViewItemId(ctx, items[anchorIndex])
+        : null
+      ctx.renderedRangeKey = ''
       scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+      if (resuming) return
+      if (anchorId && previous && previous.width !== Math.floor(list.clientWidth || 0)) {
+        const view = ctx.browser.activeView
+        const viewportEpoch = ctx.galleryViewportEpoch
+        requestAnimationFrame(() => {
+          if (
+            ctx.removed ||
+            ctx.browser.activeView !== view ||
+            ctx.galleryViewportEpoch !== viewportEpoch ||
+            !isGalleryViewportMeasurable(list.clientWidth, list.clientHeight)
+          ) return
+          const index = (ctx.visibleItems || []).findIndex((item) => getViewItemId(ctx, item) === anchorId)
+          if (index >= 0) {
+            const metrics = getGalleryMetrics(ctx)
+            list.scrollTop = Math.floor(index / metrics.columns) * metrics.rowStride
+          }
+        })
+      }
     })
     ctx.listResizeObserver.observe(list)
   }
 
-  let externalDragDepth = 0
-  const setExternalDragActive = (active) => {
-    root.classList.toggle('bil-dragover', active)
-    dropzone.classList.toggle('bil-dragover', active)
-    if (!active) {
-      clearRowDragTargets(ctx)
-    }
-  }
-
-  const handleFiles = async (fileList) => {
-    const files = normalizeUploadFiles(fileList)
-    if (!files.length) return
-
-    dropzone.textContent = `Uploading ${files.length} image${files.length === 1 ? '' : 's'}…`
-    try {
-      const uploaded = await uploadFiles(files)
-      const { state, uiState } = getCurrentState(node)
-      for (const entry of uploaded) {
-        const item = makeItemFromUploadResponse(entry)
-        if (!item) continue
-        state.items.push(item)
-        const runtimeSourcePath = normalizeSourcePath(entry?.source_path)
-        if (runtimeSourcePath) uiState.source_paths[item.id] = runtimeSourcePath
-      }
-      updateState(node, state, uiState)
-    } finally {
-      dropzone.textContent = 'Click to add images, or drop images/folders'
-      fileInput.value = ''
-    }
-  }
-
-  dropzone.addEventListener('click', () => fileInput.click())
-  fileInput.addEventListener('change', () => handleFiles(fileInput.files))
-
-  root.addEventListener(
-    'pointerdown',
-    (event) => {
-      if (event.button === 1) {
-        if (!app.canvas) return
-        ctx.middlePanPointerId = event.pointerId
-        event.preventDefault()
-        app.canvas.processMouseDown(event)
-        return
-      }
-      root.focus({ preventScroll: true })
-    },
-    true
-  )
-
-  root.addEventListener('pointerenter', () => {
-    ctx.pointerInside = true
-  })
-
-  root.addEventListener('pointerleave', () => {
-    ctx.pointerInside = false
-  })
-
-  ctx.documentMiddlePanMoveHandler = (event) => {
-    if (!app.canvas) return
-    if (ctx.middlePanPointerId == null || event.pointerId !== ctx.middlePanPointerId) return
-
-    if ((event.buttons & 4) !== 4) {
-      app.canvas.processMouseUp(event)
-      ctx.middlePanPointerId = null
-      return
-    }
-
+  root.addEventListener('pointerenter', () => { ctx.pointerInside = true })
+  root.addEventListener('pointerleave', () => { ctx.pointerInside = false })
+  list.addEventListener('pointerdown', (event) => { beginMarqueeSelection(node, event) })
+  list.addEventListener('dragover', (event) => {
+    if (!ctx.draggedId) return
+    const intent = internalDragIntentAt(ctx, event.clientX, event.clientY)
+    if (!intent) { clearInternalDragTarget(ctx); return }
     event.preventDefault()
-    app.canvas.processMouseMove(event)
+    event.stopPropagation()
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+    ctx.dragIntent = intent
+    renderInternalDragTarget(ctx, intent)
+  })
+  list.addEventListener('dragleave', (event) => {
+    if (!ctx.draggedId) return
+    if (event.relatedTarget instanceof Node && list.contains(event.relatedTarget)) return
+    clearInternalDragTarget(ctx)
+  })
+  list.addEventListener('drop', (event) => {
+    if (!ctx.draggedId) return
+    const draggedId = ctx.draggedId
+    const intent = internalDragIntentAt(ctx, event.clientX, event.clientY) || ctx.dragIntent
+    event.preventDefault()
+    event.stopPropagation()
+    ctx.draggedId = null
+    clearInternalDragTarget(ctx)
+    if (!intent) return
+    const { state, uiState } = getRenderableState(node)
+    const changed = intent.type === 'card'
+      ? moveItems(state, draggedId, ctx.visibleItems?.[intent.targetIndex]?.id)
+      : moveItemToInsertionIndex(state, draggedId, intent.insertionIndex)
+    if (changed) updateState(node, state, uiState)
+  })
+  root.addEventListener('pointerdown', (event) => {
+    claimGalleryKeyboardOwnership(node)
+    if (event.button === 1) { if (!app.canvas) return; ctx.middlePanPointerId = event.pointerId; event.preventDefault(); app.canvas.processMouseDown(event); return }
+  }, true)
+  root.addEventListener('click', (event) => {
+    if (shouldRetainWidgetFocus(event.target)) return
+    restoreGraphCanvasFocus(document.activeElement, app.canvas?.canvas)
+  })
+  root.addEventListener('mousedown', (event) => { if (event.button === 1) event.preventDefault() }, true)
+  root.addEventListener('auxclick', (event) => { if (event.button === 1) event.preventDefault() }, true)
+  ctx.documentMiddlePanMoveHandler = (event) => {
+    if (!app.canvas || ctx.middlePanPointerId == null || event.pointerId !== ctx.middlePanPointerId) return
+    if ((event.buttons & 4) !== 4) { app.canvas.processMouseUp(event); ctx.middlePanPointerId = null; return }
+    event.preventDefault(); app.canvas.processMouseMove(event)
   }
-
   ctx.documentMiddlePanEndHandler = (event) => {
-    if (!app.canvas) return
-    if (ctx.middlePanPointerId == null || event.pointerId !== ctx.middlePanPointerId) return
-    app.canvas.processMouseUp(event)
-    ctx.middlePanPointerId = null
+    if (!app.canvas || ctx.middlePanPointerId == null || event.pointerId !== ctx.middlePanPointerId) return
+    app.canvas.processMouseUp(event); ctx.middlePanPointerId = null
   }
-
   document.addEventListener('pointermove', ctx.documentMiddlePanMoveHandler, true)
   document.addEventListener('pointerup', ctx.documentMiddlePanEndHandler, true)
   document.addEventListener('pointercancel', ctx.documentMiddlePanEndHandler, true)
-
-  root.addEventListener(
-    'mousedown',
-    (event) => {
-      if (event.button !== 1) return
-      event.preventDefault()
-    },
-    true
-  )
-
-  root.addEventListener(
-    'auxclick',
-    (event) => {
-      if (event.button === 1) {
-        event.preventDefault()
-      }
-    },
-    true
-  )
+  ctx.documentMarqueeMoveHandler = (event) => {
+    const selection = ctx.marqueeSelection
+    if (!selection || event.pointerId !== selection.pointerId) return
+    selection.clientX = event.clientX
+    selection.clientY = event.clientY
+    if (selection.active || Math.hypot(
+      event.clientX - selection.anchorClientX,
+      event.clientY - selection.anchorClientY
+    ) >= MARQUEE_DRAG_THRESHOLD) event.preventDefault()
+    scheduleMarqueeSelectionFrame(node)
+  }
+  ctx.documentMarqueeEndHandler = (event) => {
+    if (!ctx.marqueeSelection || event.pointerId !== ctx.marqueeSelection.pointerId) return
+    finishMarqueeSelection(node, event, event.type === 'pointercancel')
+  }
+  document.addEventListener('pointermove', ctx.documentMarqueeMoveHandler, true)
+  document.addEventListener('pointerup', ctx.documentMarqueeEndHandler, true)
+  document.addEventListener('pointercancel', ctx.documentMarqueeEndHandler, true)
 
   ctx.documentPasteHandler = (event) => {
-    if (event.defaultPrevented || isModifiedPlainTextPaste(event)) return
-    if (shouldIgnoreClipboardPasteTarget(event.target)) return
-
-    const shouldHandlePaste =
-      ctx.pointerInside ||
-      root === document.activeElement ||
-      root.contains(document.activeElement)
-
-    if (!shouldHandlePaste) return
-
-    const files = getClipboardImageFiles(event)
-    if (!files.length) return
-
-    event.preventDefault()
-    event.stopPropagation()
-    event.stopImmediatePropagation?.()
-    void handleFiles(files)
+    if (event.defaultPrevented || isModifiedPlainTextPaste(event) || shouldIgnoreClipboardPasteTarget(event.target)) return
+    if (!(ctx.pointerInside || ctx.keyboardActive || root.contains(document.activeElement))) return
+    const files = getClipboardImageFiles(event); if (!files.length) return
+    event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation?.(); runUpload(files)
   }
-
   document.addEventListener('paste', ctx.documentPasteHandler, true)
 
-  root.addEventListener(
-    'dragenter',
-    (event) => {
-      if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return
-      externalDragDepth += 1
-      setExternalDragActive(true)
-    },
-    true
-  )
-
-  root.addEventListener(
-    'dragover',
-    (event) => {
-      if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return
-      setExternalDragActive(true)
-    },
-    true
-  )
-
-  root.addEventListener(
-    'dragleave',
-    (event) => {
-      if (!(externalDragDepth > 0 || hasExternalFileDrag(event))) return
-      event.preventDefault()
-      event.stopPropagation()
-      event.stopImmediatePropagation?.()
-      externalDragDepth = Math.max(0, externalDragDepth - 1)
-      if (externalDragDepth === 0) {
-        setExternalDragActive(false)
-      }
-    },
-    true
-  )
-
-  root.addEventListener(
-    'drop',
-    async (event) => {
-      if (!consumeExternalFileDrag(event)) {
-        externalDragDepth = 0
-        setExternalDragActive(false)
-        return
-      }
-      const files = await getDroppedImageFiles(event)
-      externalDragDepth = 0
-      setExternalDragActive(false)
-      if (!files.length) return
-      await handleFiles(files)
-    },
-    true
-  )
-
-  root.addEventListener(
-    'dragend',
-    () => {
-      externalDragDepth = 0
-      setExternalDragActive(false)
-    },
-    true
-  )
-
-  selectAllBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    uiState.selected_ids = state.items.map((item) => item.id)
-    updateState(node, state, uiState)
-  })
-
-  selectNoneBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    uiState.selected_ids = []
-    updateState(node, state, uiState)
-  })
-
-  autoQueueCheckbox.addEventListener('change', () => {
-    const { state, uiState } = getCurrentState(node)
-    state.auto_queue = autoQueueCheckbox.checked
-    updateState(node, state, uiState)
-  })
-
-  dontConsumeCheckbox.addEventListener('change', () => {
-    const { state, uiState } = getCurrentState(node)
-    state.dont_consume = dontConsumeCheckbox.checked
-    updateState(node, state, uiState)
-  })
-
-  canvasDropCheckbox.addEventListener('change', () => {
-    const { state, uiState } = getCurrentState(node)
-    state.catch_canvas_drops = canvasDropCheckbox.checked
-    updateState(node, state, uiState)
-  })
-
-  sortBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    switch (sortSelect.value) {
-      case 'name_asc':
-        state.items.sort((a, b) =>
-          getItemDisplayPath(a, uiState).localeCompare(getItemDisplayPath(b, uiState), undefined, {
-            sensitivity: 'base'
-          })
-        )
-        break
-      case 'name_desc':
-        state.items.sort((a, b) =>
-          getItemDisplayPath(b, uiState).localeCompare(getItemDisplayPath(a, uiState), undefined, {
-            sensitivity: 'base'
-          })
-        )
-        break
-      case 'added_newest':
-        state.items.sort((a, b) => (b.added_at || 0) - (a.added_at || 0))
-        break
-      case 'added_oldest':
-        state.items.sort((a, b) => (a.added_at || 0) - (b.added_at || 0))
-        break
-      case 'status':
-        state.items.sort((a, b) => {
-          const rankDiff = itemStatusRank(a.status) - itemStatusRank(b.status)
-          if (rankDiff !== 0) return rankDiff
-          return (a.added_at || 0) - (b.added_at || 0)
-        })
-        break
-      default:
-        break
-    }
-    updateState(node, state, uiState)
-  })
-
-  setPendingBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    const selected = getSelectedIds(uiState)
-    state.items.forEach((item) => {
-      if (selected.has(item.id)) item.status = 'pending'
-    })
-    updateState(node, state, uiState)
-  })
-
-  setProcessedBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    const selected = getSelectedIds(uiState)
-    state.items.forEach((item) => {
-      if (selected.has(item.id)) {
-        item.status = 'processed'
-        item.last_processed_at = Date.now()
-      }
-    })
-    updateState(node, state, uiState)
-  })
-
-  clearQueuedBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    state.items.forEach((item) => {
-      if (item.status === 'queued') item.status = 'pending'
-    })
-    updateState(node, state, uiState)
-  })
-
-  clearProcessedBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    state.items = state.items.filter((item) => item.status !== 'processed')
-    uiState.selected_ids = uiState.selected_ids.filter((id) =>
-      state.items.some((item) => item.id === id)
-    )
-    uiState.source_paths = Object.fromEntries(
-      Object.entries(uiState.source_paths).filter(([itemId]) =>
-        state.items.some((item) => item.id === itemId)
-      )
-    )
-    updateState(node, state, uiState)
-  })
-
-  deleteSelectedBtn.addEventListener('click', () => {
-    const { state, uiState } = getCurrentState(node)
-    const selected = getSelectedIds(uiState)
-    state.items = state.items.filter((item) => !selected.has(item.id))
-    uiState.selected_ids = []
-    uiState.source_paths = Object.fromEntries(
-      Object.entries(uiState.source_paths).filter(([itemId]) => !selected.has(itemId))
-    )
-    updateState(node, state, uiState)
-  })
+  let externalDragDepth = 0
+  const isFolderTabDropTarget = (target) => target instanceof Node && tabs.contains(target)
+  const setDragActive = (active, folderReady = false, folderHover = false) => {
+    root.classList.toggle('bil-dragover', active)
+    tabs.classList.toggle('bil-folder-drop-ready', active && folderReady)
+    tabs.classList.toggle('bil-folder-drop-hover', active && folderReady && folderHover)
+    if (!active) clearCardDragTargets(ctx)
+  }
+  const clearExternalDragState = () => { externalDragDepth = 0; setDragActive(false) }
+  ctx.clearExternalDragState = clearExternalDragState
+  root.addEventListener('dragenter', (event) => { if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return; externalDragDepth += 1; const folderReady = hasExternalDirectoryDrag(event); setDragActive(true, folderReady, isFolderTabDropTarget(event.target)) }, true)
+  root.addEventListener('dragover', (event) => { if (!consumeExternalFileDrag(event) && !activatePotentialExternalFileDrag(event)) return; const folderReady = hasExternalDirectoryDrag(event); setDragActive(true, folderReady, isFolderTabDropTarget(event.target)) }, true)
+  root.addEventListener('dragleave', (event) => { if (!(externalDragDepth > 0 || hasExternalFileDrag(event))) return; event.preventDefault(); event.stopPropagation(); externalDragDepth = Math.max(0, externalDragDepth - 1); if (!externalDragDepth) setDragActive(false) }, true)
+  root.addEventListener('drop', async (event) => {
+    if (!hasExternalFileDrag(event)) { clearExternalDragState(); return }
+    const folderTarget = isFolderTabDropTarget(event.target)
+    finalizeExternalFileDrag(event)
+    const pending = folderTarget ? getDroppedFolderSources(event) : getDroppedImageFiles(event)
+    clearExternalDragState()
+    claimGalleryKeyboardOwnership(node)
+    ctx.restoreCanvasShortcutFocus?.()
+    const entries = await pending
+    if (folderTarget) {
+      if (entries.length) addFolderSources(node, entries)
+      else window.alert('Drop one or more folders onto the tab bar. Image files dropped there are not added to the Conveyor.')
+    } else if (entries.length) runUpload(entries)
+  }, true)
+  root.addEventListener('dragend', clearExternalDragState, true)
 
   return root
 }
@@ -2232,29 +3564,76 @@ function buildDom(node) {
  *
  * @param {object} node - The ComfyUI node instance that hosts the batch image loader widget.
  * @param {FileList|File[]|Array<{file: File, relativeSubfolder?: string}>} files - Files or normalized file entries to upload.
+ * @param {{feedbackView?: string}} [options] - Browser view that receives import errors.
  * @returns {boolean} `true` if one or more files were uploaded and applied to the node state, `false` if the node widget context is missing or no valid image files were provided.
  */
-async function uploadViaNode(node, files) {
+async function uploadViaNode(node, files, { feedbackView = 'input' } = {}) {
   const ctx = node.__bil
   if (!ctx) return false
   const validFiles = normalizeUploadFiles(files)
   if (!validFiles.length) return false
 
-  ctx.dropzone.textContent = `Uploading ${validFiles.length} image${validFiles.length === 1 ? '' : 's'}…`
+  ctx.uploadDepth += 1
+  if (ctx.uploadDepth === 1) ctx.dropzoneLabel = ctx.dropzone.textContent || '+ Add images'
+  ctx.dropzone.disabled = true
+  ctx.dropzone.textContent = `Importing ${validFiles.length}…`
   try {
-    const uploaded = await uploadFiles(validFiles)
-    const { state, uiState } = getCurrentState(node)
+    const { uploaded, errors } = await uploadFiles(validFiles)
+    if (node.__bil !== ctx || ctx.removed) return false
+    if (!uploaded.length && errors.length) {
+      throw new Error(errors.length === 1 ? errors[0].error.message : `${errors.length} images failed to import.`)
+    }
+    const { state, uiState } = getRenderableState(node)
+    const inputPosition = ctx.browser?.input?.loaded
+      ? new Map(ctx.browser.input.files.map((entry, index) => [entry.relative_path, index]))
+      : null
     for (const entry of uploaded) {
       const item = makeItemFromUploadResponse(entry)
       if (!item) continue
       state.items.push(item)
       const runtimeSourcePath = normalizeSourcePath(entry?.source_path)
       if (runtimeSourcePath) uiState.source_paths[item.id] = runtimeSourcePath
+      if (ctx.browser?.input?.loaded && entry.relative_path) {
+        const inputEntry = {
+          filename: entry.name,
+          subfolder: entry.subfolder || '',
+          relative_path: entry.relative_path,
+          type: 'input',
+          size: Number(entry.size || 0),
+          mtime_ns: Number(entry.mtime_ns || 0),
+          source_version: String(entry.source_version || '')
+        }
+        const existingIndex = inputPosition.get(inputEntry.relative_path) ?? -1
+        if (existingIndex >= 0) ctx.browser.input.files[existingIndex] = inputEntry
+        else {
+          inputPosition.set(inputEntry.relative_path, ctx.browser.input.files.length)
+          ctx.browser.input.files.push(inputEntry)
+        }
+      }
     }
-    updateState(node, state, uiState)
-    return true
+    if (ctx.browser?.input?.loaded && uploaded.length) {
+      ctx.inputVersion += 1
+      updateFolderOptions(ctx)
+    }
+    const feedbackBrowser = browserForView(ctx, feedbackView) ?? ctx.browser.input
+    if (uploaded.length && !errors.length) feedbackBrowser.error = ''
+    if (uploaded.length) updateState(node, state, uiState)
+    if (errors.length) {
+      const firstFailure = errors[0].error.message
+      feedbackBrowser.error = errors.length === 1
+        ? firstFailure
+        : `${errors.length} images failed to import. First error: ${firstFailure}`
+      console.error('Image Conveyor: some images failed to import.', ...errors.map(({ error }) => error))
+      scheduleRenderNode(node)
+    }
+    return uploaded.length > 0
   } finally {
-    ctx.dropzone.textContent = 'Click to add images, or drop images/folders'
+    ctx.uploadDepth = Math.max(0, ctx.uploadDepth - 1)
+    if (ctx.uploadDepth === 0) {
+      ctx.dropzone.disabled = false
+      ctx.dropzone.textContent = ctx.dropzoneLabel || '+ Add images'
+      ctx.dropzoneLabel = ''
+    }
   }
 }
 
@@ -2302,14 +3681,14 @@ function initializeNode(node, widget) {
   node.pasteFile = (file) => {
     const files = normalizeUploadFiles([file])
     if (!files.length) return false
-    void uploadViaNode(node, files)
+    void uploadViaNode(node, files).catch((error) => console.error('Image Conveyor: paste import failed.', error))
     return true
   }
 
   node.pasteFiles = (files) => {
     const validFiles = normalizeUploadFiles(files)
     if (!validFiles.length) return false
-    void uploadViaNode(node, validFiles)
+    void uploadViaNode(node, validFiles).catch((error) => console.error('Image Conveyor: paste import failed.', error))
     return true
   }
 
@@ -2324,7 +3703,13 @@ function initializeNode(node, widget) {
   })
 
   chainNodeCallback(node, 'onConfigure', function () {
-    const snapshot = getCurrentState(node)
+    const snapshot = getCurrentState(node, { fromWidgets: true })
+    const ctx = node.__bil
+    if (ctx) {
+      ctx.queueRevision += 1
+      ctx.annotatedCountsRevision = -1
+      ctx.browser.conveyor.selected = new Set(snapshot.uiState.selected_ids)
+    }
     const normalizedStateValue = serializeState(snapshot.state)
     if (stateWidget.value !== normalizedStateValue) {
       setWidgetValue(stateWidget, normalizedStateValue)
@@ -2342,8 +3727,11 @@ function initializeNode(node, widget) {
   chainNodeCallback(node, 'onRemoved', function () {
     autoQueueCoordinator.unregisterNode(node)
     canvasDropCoordinator.unregisterNode(node)
+    keyboardCoordinator.unregisterNode(node)
     const ctx = node.__bil
     if (!ctx) return
+    ctx.removed = true
+    ctx.inputRequestId += 1
     if (ctx.documentPasteHandler) {
       document.removeEventListener('paste', ctx.documentPasteHandler, true)
       ctx.documentPasteHandler = null
@@ -2357,16 +3745,58 @@ function initializeNode(node, widget) {
       document.removeEventListener('pointercancel', ctx.documentMiddlePanEndHandler, true)
       ctx.documentMiddlePanEndHandler = null
     }
+    if (ctx.documentMarqueeMoveHandler) {
+      document.removeEventListener('pointermove', ctx.documentMarqueeMoveHandler, true)
+      ctx.documentMarqueeMoveHandler = null
+    }
+    if (ctx.documentMarqueeEndHandler) {
+      document.removeEventListener('pointerup', ctx.documentMarqueeEndHandler, true)
+      document.removeEventListener('pointercancel', ctx.documentMarqueeEndHandler, true)
+      ctx.documentMarqueeEndHandler = null
+    }
     ctx.middlePanPointerId = null
+    cancelMarqueeSelection(node, false)
+    if (ctx.documentFocusScopeHandler) {
+      document.removeEventListener('pointerdown', ctx.documentFocusScopeHandler, true)
+      ctx.documentFocusScopeHandler = null
+    }
+    if (ctx.windowFocusHandler) {
+      window.removeEventListener('focus', ctx.windowFocusHandler)
+      ctx.windowFocusHandler = null
+    }
+    ctx.filePickerPending = false
+    ctx.activePickerInput = null
+    clearTimeout(ctx.filePickerFocusTimer)
+    ctx.filePickerFocusTimer = 0
+    if (ctx.filePickerFocusFrame) cancelAnimationFrame(ctx.filePickerFocusFrame)
+    ctx.filePickerFocusFrame = 0
+    ctx.restoreCanvasShortcutFocus = null
+    ctx.inputAbortController?.abort?.()
+    ctx.inputAbortController = null
+    clearTimeout(ctx.searchTimer)
+    clearTimeout(ctx.scrollSettleTimer)
+    ctx.scrollSettleTimer = 0
+    ctx.lightbox?.root?.remove?.()
     ctx.listResizeObserver?.disconnect?.()
     ctx.listResizeObserver = null
+    ctx.clearExternalDragState?.()
+    ctx.clearExternalDragState = null
+    for (const slot of ctx.cardPool) resetCardThumbnail(slot)
+    ctx.cardPool.length = 0
+    ctx.thumbnailUrlCache = new WeakMap()
+    for (const entry of ctx.localObjectUrls.values()) URL.revokeObjectURL(entry.url)
+    ctx.localObjectUrls.clear()
+    ctx.browser.folderViews.clear()
+    ctx.browser.folderSources.clear()
+    ctx.folderTabElements.clear()
     if (!ctx.renderFrame) return
     cancelAnimationFrame(ctx.renderFrame)
     ctx.renderFrame = 0
     ctx.renderViewportOnly = false
   })
 
-  const snapshot = getCurrentState(node)
+  const snapshot = getCurrentState(node, { fromWidgets: true })
+  node.__bil.browser.conveyor.selected = new Set(snapshot.uiState.selected_ids)
   const normalizedStateValue = serializeState(snapshot.state)
   if (stateWidget.value !== normalizedStateValue) {
     setWidgetValue(stateWidget, normalizedStateValue)
@@ -2374,6 +3804,7 @@ function initializeNode(node, widget) {
   }
   cacheRenderableState(node, snapshot.state, snapshot.uiState)
   queueMicrotask(() => scheduleRenderNode(node))
+  keyboardCoordinator.registerNode(node)
   return widget
 }
 
@@ -2405,10 +3836,11 @@ app.registerExtension({
           }
         }
 
-        const root = buildDom(node)
+        const root = buildGalleryDom(node)
         const widget = node.addDOMWidget(inputName, CUSTOM_WIDGET_TYPE, root, {
           getMinHeight: () => MIN_WIDGET_HEIGHT,
           getHeight: () => '100%',
+          onHide: () => suspendGalleryViewport(node.__bil),
           onDraw: (domWidget) => syncDomWidgetSize(node, domWidget),
           afterResize: (domWidgetNode) => syncDomWidgetSize(domWidgetNode, widget),
           serialize: false
