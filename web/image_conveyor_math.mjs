@@ -1,5 +1,12 @@
 export const CARD_FOOTER_HEIGHT = 58
 
+export function isGalleryViewportMeasurable(width, height) {
+  const numericWidth = Number(width)
+  const numericHeight = Number(height)
+  return Number.isFinite(numericWidth) && numericWidth > 0 &&
+    Number.isFinite(numericHeight) && numericHeight > 0
+}
+
 export function calculateGalleryMetrics(width, minimumCardWidth, gap = 10) {
   const safeWidth = Math.max(1, Math.floor(Number(width) || 1))
   const safeMinimum = Math.max(1, Math.floor(Number(minimumCardWidth) || 1))

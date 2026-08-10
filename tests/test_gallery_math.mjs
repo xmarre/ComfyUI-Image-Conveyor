@@ -9,6 +9,7 @@ import {
   findKeyboundCommand,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
+  isGalleryViewportMeasurable,
   isHighVelocityScroll,
   isConveyorDeleteShortcut,
   isConveyorGalleryShortcut,
@@ -27,6 +28,13 @@ test('responsive metrics add columns as width grows', () => {
   assert.ok(wide.columns > medium.columns)
   assert.ok(medium.mediaHeight / medium.cardHeight >= 0.68)
   assert.equal(medium.columnStride, medium.cardWidth + 10)
+})
+
+test('hidden gallery viewports are excluded from virtual layout', () => {
+  assert.equal(isGalleryViewportMeasurable(720, 700), true)
+  assert.equal(isGalleryViewportMeasurable(0, 700), false)
+  assert.equal(isGalleryViewportMeasurable(720, 0), false)
+  assert.equal(isGalleryViewportMeasurable(Number.NaN, 700), false)
 })
 
 test('marquee hit testing follows virtual card geometry and ignores gaps', () => {

@@ -10,6 +10,7 @@ import {
   dispatchKeyboundCommandFallback,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
+  isGalleryViewportMeasurable,
   isHighVelocityScroll,
   isConveyorGalleryShortcut,
   planCardSlotReuse,
@@ -1765,6 +1766,20 @@ function activeBrowser(ctx) {
   return browserForView(ctx, ctx.browser.activeView)
 }
 
+function suspendGalleryViewport(ctx) {
+  if (!ctx) return
+  if (
+    !ctx.galleryViewportSuspended &&
+    ctx.pendingScrollRestore?.view !== ctx.browser.activeView &&
+    isGalleryViewportMeasurable(ctx.list.clientWidth, ctx.list.clientHeight)
+  ) {
+    activeBrowser(ctx).scrollTop = ctx.list.scrollTop
+  }
+  if (!ctx.galleryViewportSuspended) ctx.galleryViewportEpoch += 1
+  ctx.galleryViewportSuspended = true
+  ctx.renderedRangeKey = ''
+}
+
 function isFolderView(ctx, view = ctx.browser.activeView) {
   return ctx.browser.folderViews.has(view)
 }
@@ -2579,9 +2594,19 @@ function renderVisibleCards(node) {
     if (ctx.list.scrollTop) ctx.list.scrollTop = 0
     hideUnusedCards(ctx); ctx.renderedRangeKey = ''; return
   }
+  if (!isGalleryViewportMeasurable(ctx.list.clientWidth, ctx.list.clientHeight)) {
+    suspendGalleryViewport(ctx)
+    return
+  }
+  const view = ctx.browser.activeView
+  if (ctx.galleryViewportSuspended) {
+    ctx.galleryViewportSuspended = false
+    if (ctx.pendingScrollRestore?.view !== view) {
+      ctx.pendingScrollRestore = { view, scrollTop: activeBrowser(ctx).scrollTop }
+    }
+  }
   const metrics = getGalleryMetrics(ctx)
   ctx.lastMetrics = metrics
-  const view = ctx.browser.activeView
   const pendingRestore = ctx.pendingScrollRestore?.view === view
     ? ctx.pendingScrollRestore
     : null
@@ -2838,7 +2863,9 @@ function switchBrowserView(node, view) {
   const plan = planViewScrollSwitch(
     ctx.browser.activeView,
     view,
-    ctx.list.scrollTop,
+    isGalleryViewportMeasurable(ctx.list.clientWidth, ctx.list.clientHeight)
+      ? ctx.list.scrollTop
+      : activeBrowser(ctx).scrollTop,
     savedScrollTops,
     ctx.pendingScrollRestore?.view ?? null
   )
@@ -3084,6 +3111,7 @@ function buildGalleryDom(node) {
     draggedId: null, empty: null, state: null, uiState: null, renderVersion: 0,
     inputVersion: 0, renderedRangeKey: '', renderFrame: 0, renderViewportOnly: false,
     pendingScrollRestore: null,
+    galleryViewportSuspended: false, galleryViewportEpoch: 0,
     deferThumbnailLoads: false, scrollSettleTimer: 0,
     scrollSampleTop: 0, scrollSampleAt: 0,
     listResizeObserver: null, widgetOuterHeight: 0, widgetInnerHeight: 0, widgetWidth: 0,
@@ -3274,6 +3302,13 @@ function buildGalleryDom(node) {
   })
 
   list.addEventListener('scroll', () => {
+    if (
+      ctx.galleryViewportSuspended ||
+      !isGalleryViewportMeasurable(list.clientWidth, list.clientHeight)
+    ) {
+      suspendGalleryViewport(ctx)
+      return
+    }
     if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) return
     const now = globalThis.performance?.now?.() ?? Date.now()
     const previousAt = ctx.scrollSampleAt
@@ -3304,6 +3339,17 @@ function buildGalleryDom(node) {
 
   if (typeof ResizeObserver === 'function') {
     ctx.listResizeObserver = new ResizeObserver(() => {
+      if (!isGalleryViewportMeasurable(list.clientWidth, list.clientHeight)) {
+        suspendGalleryViewport(ctx)
+        return
+      }
+      const resuming = ctx.galleryViewportSuspended
+      if (resuming && ctx.pendingScrollRestore?.view !== ctx.browser.activeView) {
+        ctx.pendingScrollRestore = {
+          view: ctx.browser.activeView,
+          scrollTop: activeBrowser(ctx).scrollTop
+        }
+      }
       const previous = ctx.lastMetrics
       const items = ctx.visibleItems || []
       const anchorIndex = previous
@@ -3314,9 +3360,17 @@ function buildGalleryDom(node) {
         : null
       ctx.renderedRangeKey = ''
       scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
+      if (resuming) return
       if (anchorId && previous && previous.width !== Math.floor(list.clientWidth || 0)) {
+        const view = ctx.browser.activeView
+        const viewportEpoch = ctx.galleryViewportEpoch
         requestAnimationFrame(() => {
-          if (ctx.removed) return
+          if (
+            ctx.removed ||
+            ctx.browser.activeView !== view ||
+            ctx.galleryViewportEpoch !== viewportEpoch ||
+            !isGalleryViewportMeasurable(list.clientWidth, list.clientHeight)
+          ) return
           const index = (ctx.visibleItems || []).findIndex((item) => getViewItemId(ctx, item) === anchorId)
           if (index >= 0) {
             const metrics = getGalleryMetrics(ctx)
@@ -3696,6 +3750,7 @@ app.registerExtension({
         const widget = node.addDOMWidget(inputName, CUSTOM_WIDGET_TYPE, root, {
           getMinHeight: () => MIN_WIDGET_HEIGHT,
           getHeight: () => '100%',
+          onHide: () => suspendGalleryViewport(node.__bil),
           onDraw: (domWidget) => syncDomWidgetSize(node, domWidget),
           afterResize: (domWidgetNode) => syncDomWidgetSize(domWidgetNode, widget),
           serialize: false
