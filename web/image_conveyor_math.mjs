@@ -88,8 +88,8 @@ export function isHighVelocityScroll(deltaPixels, elapsedMs, rowStride) {
   return distance >= stride * 1.5 || distance / elapsed >= stride / 32
 }
 
-export function restoreCanvasFocusAfterFilePicker(fileInput, canvas) {
-  fileInput?.blur?.()
+export function restoreGraphCanvasFocus(previousOwner, canvas) {
+  previousOwner?.blur?.()
   if (!canvas || typeof canvas.focus !== 'function') return false
   try {
     canvas.focus({ preventScroll: true })
@@ -99,10 +99,9 @@ export function restoreCanvasFocusAfterFilePicker(fileInput, canvas) {
   return true
 }
 
-export function isWorkflowSaveShortcut(event) {
-  if (!event || event.defaultPrevented || event.altKey || event.shiftKey) return false
-  if (!(event.ctrlKey || event.metaKey)) return false
-  return String(event.key || '').toLowerCase() === 's'
+export function isConveyorDeleteShortcut(event) {
+  if (!event || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false
+  return event.key === 'Delete' || event.code === 'Delete'
 }
 
 export function calculateMarqueeGridIndexes(totalItems, metrics, bounds) {

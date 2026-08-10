@@ -8,11 +8,11 @@ import {
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
-  isWorkflowSaveShortcut,
+  isConveyorDeleteShortcut,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
-  restoreCanvasFocusAfterFilePicker
+  restoreGraphCanvasFocus
 } from '../web/image_conveyor_math.mjs'
 
 test('responsive metrics add columns as width grows', () => {
@@ -58,13 +58,13 @@ test('marquee hit testing follows virtual card geometry and ignores gaps', () =>
   )
 })
 
-test('workflow save shortcut recognition is exact and browser-safe', () => {
-  assert.equal(isWorkflowSaveShortcut({ key: 's', ctrlKey: true }), true)
-  assert.equal(isWorkflowSaveShortcut({ key: 'S', metaKey: true }), true)
-  assert.equal(isWorkflowSaveShortcut({ key: 's', ctrlKey: true, shiftKey: true }), false)
-  assert.equal(isWorkflowSaveShortcut({ key: 's', ctrlKey: true, altKey: true }), false)
-  assert.equal(isWorkflowSaveShortcut({ key: 's', ctrlKey: true, defaultPrevented: true }), false)
-  assert.equal(isWorkflowSaveShortcut({ key: 'o', ctrlKey: true }), false)
+test('the German Entf key maps to unmodified Delete for conveyor removal', () => {
+  assert.equal(isConveyorDeleteShortcut({ key: 'Delete' }), true)
+  assert.equal(isConveyorDeleteShortcut({ key: '', code: 'Delete' }), true)
+  assert.equal(isConveyorDeleteShortcut({ key: 'Backspace' }), false)
+  assert.equal(isConveyorDeleteShortcut({ key: 'Delete', ctrlKey: true }), false)
+  assert.equal(isConveyorDeleteShortcut({ key: 'Delete', shiftKey: true }), false)
+  assert.equal(isConveyorDeleteShortcut({ key: 'Delete', defaultPrevented: true }), false)
 })
 
 test('ten thousand items keep a bounded live-card range', () => {
@@ -112,18 +112,18 @@ test('only high-velocity scrolling defers intermediate thumbnail requests', () =
   assert.equal(isHighVelocityScroll(350, 100, 220), true)
 })
 
-test('closing the file picker restores native canvas shortcut focus', () => {
+test('widget interactions restore native canvas shortcut focus', () => {
   const calls = []
   const fileInput = { blur: () => calls.push(['blur']) }
   const canvas = { focus: (options) => calls.push(['focus', options]) }
 
-  assert.equal(restoreCanvasFocusAfterFilePicker(fileInput, canvas), true)
+  assert.equal(restoreGraphCanvasFocus(fileInput, canvas), true)
   assert.deepEqual(calls, [['blur'], ['focus', { preventScroll: true }]])
 
-  assert.equal(restoreCanvasFocusAfterFilePicker(fileInput, null), false)
+  assert.equal(restoreGraphCanvasFocus(fileInput, null), false)
   assert.deepEqual(calls.at(-1), ['blur'])
 
-  assert.equal(restoreCanvasFocusAfterFilePicker(null, canvas), true)
+  assert.equal(restoreGraphCanvasFocus(null, canvas), true)
   assert.deepEqual(calls.at(-1), ['focus', { preventScroll: true }])
 })
 

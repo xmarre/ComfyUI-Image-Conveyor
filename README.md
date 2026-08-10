@@ -101,7 +101,7 @@ Queued prompt runs reserve pending items in order. Successful execution marks th
 Available queue controls include:
 
 - mark selected pending or processed;
-- delete selected queue entries;
+- delete selected queue entries with the button or the standard `Delete` key (`Entf` on German keyboards);
 - clear queued reservations;
 - remove processed entries;
 - apply queue sorting;

@@ -13,8 +13,8 @@ import {
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
-  restoreCanvasFocusAfterFilePicker,
-  isWorkflowSaveShortcut
+  restoreGraphCanvasFocus,
+  isConveyorDeleteShortcut
 } from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
@@ -1822,6 +1822,24 @@ function renderSelectionContext(node) {
   ctx.contextAddBtn.hidden = !inputView
 }
 
+function deleteSelectedConveyorItems(node) {
+  const ctx = node.__bil
+  if (!ctx || ctx.browser.activeView !== 'conveyor') return false
+  const selected = ctx.browser.conveyor.selected
+  if (!selected.size) return false
+  const { state, uiState } = getRenderableState(node)
+  const kept = state.items.filter((item) => !selected.has(item.id))
+  if (kept.length === state.items.length) return false
+  state.items = kept
+  uiState.selected_ids = []
+  uiState.source_paths = Object.fromEntries(
+    Object.entries(uiState.source_paths).filter(([id]) => !selected.has(id))
+  )
+  selected.clear()
+  updateState(node, state, uiState)
+  return true
+}
+
 function setItemSelected(node, itemId, checked, event = null) {
   const ctx = node.__bil
   const browser = activeBrowser(ctx)
@@ -2037,7 +2055,7 @@ function createLightbox(node) {
     lightbox.hidden = true
     image.removeAttribute('src')
     delete lightbox.dataset.sourceId
-    node.__bil?.root.focus({ preventScroll: true })
+    restoreGraphCanvasFocus(lightbox, app.canvas?.canvas)
   }
   close.addEventListener('click', hide)
   lightbox.addEventListener('click', (event) => { if (event.target === lightbox) hide() })
@@ -2098,6 +2116,7 @@ function createFolderTabElement(node, viewId, source, folderPath) {
     event.preventDefault()
     event.stopPropagation()
     closeFolderView(node, viewId)
+    restoreGraphCanvasFocus(close, app.canvas?.canvas)
   })
   shell.append(tab, close)
   ctx.tabs.appendChild(shell)
@@ -2261,6 +2280,7 @@ function createCardSlot(node, ctx) {
   checkbox.addEventListener('click', (event) => event.stopPropagation())
   checkbox.addEventListener('change', (event) => {
     if (slot.itemId) setItemSelected(node, slot.itemId, checkbox.checked, event)
+    restoreGraphCanvasFocus(checkbox, app.canvas?.canvas)
   })
   const badge = document.createElement('span')
   badge.className = 'bil-badge'
@@ -2756,16 +2776,44 @@ function scrollItemIntoView(node, index) {
   else if (bottom > ctx.list.scrollTop + ctx.list.clientHeight) ctx.list.scrollTop = bottom - ctx.list.clientHeight
 }
 
-function isTextControl(target) {
-  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target?.isContentEditable
+function isInteractiveWidgetControl(target) {
+  return target instanceof Element && Boolean(
+    target.closest('button, input, textarea, select, a[href], [contenteditable="true"]')
+  )
+}
+
+function shouldRetainWidgetFocus(target) {
+  const control = target instanceof Element
+    ? target.closest('input, textarea, select, [contenteditable="true"]')
+    : null
+  if (!control) return false
+  if (control instanceof HTMLInputElement) {
+    return !['button', 'checkbox', 'color', 'file', 'radio', 'range', 'reset', 'submit'].includes(control.type)
+  }
+  return control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement || control.isContentEditable
+}
+
+function consumeGalleryKeyboardEvent(event) {
+  event.preventDefault()
+  event.stopPropagation()
+  event.stopImmediatePropagation?.()
 }
 
 function handleGalleryKeyDown(node, event) {
   const ctx = node.__bil
-  if (!ctx || isTextControl(event.target)) return
-  if (event.key === 'Escape' && !ctx.lightbox.root.hidden) { event.preventDefault(); ctx.lightbox.hide(); return }
+  if (!ctx || isInteractiveWidgetControl(event.target)) return false
+  if (isConveyorDeleteShortcut(event) && deleteSelectedConveyorItems(node)) {
+    consumeGalleryKeyboardEvent(event)
+    return true
+  }
+  if (event.key === 'Escape' && !ctx.lightbox.root.hidden) {
+    consumeGalleryKeyboardEvent(event)
+    ctx.lightbox.hide()
+    return true
+  }
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false
   const items = ctx.visibleItems || []
-  if (!items.length) return
+  if (!items.length) return false
   const browser = activeBrowser(ctx)
   const itemId = (item) => getViewItemId(ctx, item)
   let index = items.findIndex((item) => itemId(item) === browser.focusedId)
@@ -2783,60 +2831,23 @@ function handleGalleryKeyDown(node, event) {
     case 'PageUp': next -= page; break
     case 'PageDown': next += page; break
     case 'Enter':
-      event.preventDefault()
+      consumeGalleryKeyboardEvent(event)
       if (items[index].kind === 'folder') openFolderView(node, items[index].sourceId, items[index].folderPath)
       else openPreview(node, items[index])
-      return
+      return true
     case ' ': {
-      event.preventDefault()
-      if (items[index].kind === 'folder') return
+      consumeGalleryKeyboardEvent(event)
+      if (items[index].kind === 'folder') return true
       const id = itemId(items[index]); const selected = getViewSelectedIds(node)
-      setItemSelected(node, id, !selected.has(id), event); return
+      setItemSelected(node, id, !selected.has(id), event); return true
     }
-    default: return
+    default: return false
   }
-  event.preventDefault()
+  consumeGalleryKeyboardEvent(event)
   next = Math.max(0, Math.min(items.length - 1, next))
   browser.focusedId = itemId(items[next])
   scrollItemIntoView(node, next)
   scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
-}
-
-function forwardWorkflowSaveShortcut(event) {
-  if (!isWorkflowSaveShortcut(event)) return false
-  const commandManager = app.extensionManager?.command
-  const commandAvailable = typeof commandManager?.execute === 'function' && (
-    !Array.isArray(commandManager.commands) ||
-    commandManager.commands.some((command) => command?.id === 'Comfy.SaveWorkflow')
-  )
-  const canvas = app.canvas?.canvas
-  if (!commandAvailable && typeof canvas?.dispatchEvent !== 'function') return false
-
-  event.preventDefault()
-  event.stopPropagation()
-  event.stopImmediatePropagation?.()
-  if (event.repeat) return true
-
-  if (commandAvailable) {
-    try {
-      commandManager.execute('Comfy.SaveWorkflow', {
-        errorHandler: (error) => console.error('Image Conveyor: workflow save command failed.', error)
-      })
-      return true
-    } catch (error) {
-      console.error('Image Conveyor: workflow save command dispatch failed.', error)
-      if (typeof canvas?.dispatchEvent !== 'function') return true
-    }
-  }
-
-  canvas.dispatchEvent(new KeyboardEvent('keydown', {
-    key: event.key,
-    code: event.code || 'KeyS',
-    ctrlKey: event.ctrlKey,
-    metaKey: event.metaKey,
-    bubbles: true,
-    cancelable: true
-  }))
   return true
 }
 
@@ -2844,7 +2855,6 @@ function buildGalleryDom(node) {
   ensureStyles()
   const root = document.createElement('div')
   root.className = 'bil-root'
-  root.tabIndex = 0
   root.setAttribute('aria-label', 'Image Conveyor browser')
 
   const fileInput = document.createElement('input')
@@ -2959,7 +2969,7 @@ function buildGalleryDom(node) {
   settings.append(settingsSummary, settingsRow)
 
   const list = document.createElement('div')
-  list.className = 'bil-list'; list.tabIndex = 0
+  list.className = 'bil-list'
   list.id = `${tabSetId}-panel`
   list.setAttribute('role', 'tabpanel')
   list.setAttribute('aria-labelledby', conveyorTab.id)
@@ -2991,12 +3001,13 @@ function buildGalleryDom(node) {
     pointerInside: false, middlePanPointerId: null, documentPasteHandler: null,
     documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
     documentMarqueeMoveHandler: null, documentMarqueeEndHandler: null,
-    documentKeyHandler: null, windowFocusHandler: null,
+    documentKeyHandler: null, documentFocusScopeHandler: null, windowFocusHandler: null,
     filePickerPending: false, filePickerFocusTimer: 0, filePickerFocusFrame: 0,
     inputAbortController: null, inputRequestId: 0,
     searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
     uploadDepth: 0, dropzoneLabel: '', duplicateCleanupBusy: false,
     clearExternalDragState: null, restoreCanvasShortcutFocus: null, marqueeSelection: null,
+    keyboardActive: false,
     queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map(),
     thumbnailUrlCache: new WeakMap(), localObjectUrls: new Map(), activePickerInput: null
   }
@@ -3017,10 +3028,12 @@ function buildGalleryDom(node) {
     ctx.filePickerFocusFrame = requestAnimationFrame(() => {
       ctx.filePickerFocusFrame = 0
       if (ctx.removed) return
-      restoreCanvasFocusAfterFilePicker(focusOwner, app.canvas?.canvas)
+      restoreGraphCanvasFocus(focusOwner, app.canvas?.canvas)
     })
   }
-  ctx.restoreCanvasShortcutFocus = () => scheduleCanvasShortcutFocusRestore()
+  ctx.restoreCanvasShortcutFocus = (focusOwner = document.activeElement) => {
+    restoreGraphCanvasFocus(focusOwner, app.canvas?.canvas)
+  }
   const restoreFocusAfterFilePicker = () => {
     if (!ctx.filePickerPending || ctx.removed) return
     const pickerInput = ctx.activePickerInput
@@ -3127,13 +3140,7 @@ function buildGalleryDom(node) {
   }
   setPendingBtn.addEventListener('click', () => mutateSelected('pending'))
   setProcessedBtn.addEventListener('click', () => mutateSelected('processed'))
-  deleteSelectedBtn.addEventListener('click', () => {
-    const { state, uiState } = getRenderableState(node); const selected = ctx.browser.conveyor.selected
-    state.items = state.items.filter((item) => !selected.has(item.id)); uiState.selected_ids = []
-    ctx.browser.conveyor.selected.clear()
-    uiState.source_paths = Object.fromEntries(Object.entries(uiState.source_paths).filter(([id]) => !selected.has(id)))
-    updateState(node, state, uiState)
-  })
+  deleteSelectedBtn.addEventListener('click', () => deleteSelectedConveyorItems(node))
   clearSelectionBtn.addEventListener('click', () => {
     if (isLibraryView(ctx)) {
       activeBrowser(ctx).selected.clear(); renderSelectionContext(node); scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
@@ -3201,20 +3208,21 @@ function buildGalleryDom(node) {
     activeBrowser(ctx).scrollTop = list.scrollTop
     scheduleRenderNode(node, { viewportOnly: true })
   }, { passive: true })
-  root.addEventListener('keydown', (event) => {
-    if (!forwardWorkflowSaveShortcut(event)) handleGalleryKeyDown(node, event)
-  })
   ctx.documentKeyHandler = (event) => {
-    const target = event.composedPath?.()[0] ?? event.target
-    const targetInside = target instanceof Node && root.contains(target)
-    const bodyTarget = target === document || target === document.body || target === document.documentElement
-    if (isWorkflowSaveShortcut(event) && (targetInside || (ctx.pointerInside && bodyTarget))) {
-      forwardWorkflowSaveShortcut(event)
+    if (event.key === 'Escape' && !ctx.lightbox.root.hidden) {
+      consumeGalleryKeyboardEvent(event)
+      ctx.lightbox.hide()
       return
     }
-    if (event.key === 'Escape' && !ctx.lightbox.root.hidden) { event.preventDefault(); ctx.lightbox.hide() }
+    const target = event.composedPath?.()[0] ?? event.target
+    const galleryTarget = target === app.canvas?.canvas || (target instanceof Node && root.contains(target))
+    if (ctx.keyboardActive && galleryTarget) handleGalleryKeyDown(node, event)
   }
   document.addEventListener('keydown', ctx.documentKeyHandler, true)
+  ctx.documentFocusScopeHandler = (event) => {
+    if (!(event.target instanceof Node) || !root.contains(event.target)) ctx.keyboardActive = false
+  }
+  document.addEventListener('pointerdown', ctx.documentFocusScopeHandler, true)
 
   if (typeof ResizeObserver === 'function') {
     ctx.listResizeObserver = new ResizeObserver(() => {
@@ -3246,9 +3254,13 @@ function buildGalleryDom(node) {
   root.addEventListener('pointerleave', () => { ctx.pointerInside = false })
   list.addEventListener('pointerdown', (event) => { beginMarqueeSelection(node, event) })
   root.addEventListener('pointerdown', (event) => {
+    ctx.keyboardActive = true
     if (event.button === 1) { if (!app.canvas) return; ctx.middlePanPointerId = event.pointerId; event.preventDefault(); app.canvas.processMouseDown(event); return }
-    if (!isTextControl(event.target)) root.focus({ preventScroll: true })
   }, true)
+  root.addEventListener('click', (event) => {
+    if (shouldRetainWidgetFocus(event.target)) return
+    restoreGraphCanvasFocus(document.activeElement, app.canvas?.canvas)
+  })
   root.addEventListener('mousedown', (event) => { if (event.button === 1) event.preventDefault() }, true)
   root.addEventListener('auxclick', (event) => { if (event.button === 1) event.preventDefault() }, true)
   ctx.documentMiddlePanMoveHandler = (event) => {
@@ -3284,7 +3296,7 @@ function buildGalleryDom(node) {
 
   ctx.documentPasteHandler = (event) => {
     if (event.defaultPrevented || isModifiedPlainTextPaste(event) || shouldIgnoreClipboardPasteTarget(event.target)) return
-    if (!(ctx.pointerInside || root === document.activeElement || root.contains(document.activeElement))) return
+    if (!(ctx.pointerInside || ctx.keyboardActive || root.contains(document.activeElement))) return
     const files = getClipboardImageFiles(event); if (!files.length) return
     event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation?.(); runUpload(files)
   }
@@ -3309,7 +3321,7 @@ function buildGalleryDom(node) {
     finalizeExternalFileDrag(event)
     const pending = folderTarget ? getDroppedFolderSources(event) : getDroppedImageFiles(event)
     clearExternalDragState()
-    scheduleCanvasShortcutFocusRestore()
+    ctx.restoreCanvasShortcutFocus?.()
     const entries = await pending
     if (folderTarget) {
       if (entries.length) addFolderSources(node, entries)
@@ -3523,6 +3535,10 @@ function initializeNode(node, widget) {
     if (ctx.documentKeyHandler) {
       document.removeEventListener('keydown', ctx.documentKeyHandler, true)
       ctx.documentKeyHandler = null
+    }
+    if (ctx.documentFocusScopeHandler) {
+      document.removeEventListener('pointerdown', ctx.documentFocusScopeHandler, true)
+      ctx.documentFocusScopeHandler = null
     }
     if (ctx.windowFocusHandler) {
       window.removeEventListener('focus', ctx.windowFocusHandler)
