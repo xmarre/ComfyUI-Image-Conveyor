@@ -5,11 +5,11 @@ import {
   calculateMarqueeGridIndexes,
   calculateVisibleCardRange,
   chooseViewAfterClose,
-  delegateGraphKeyboardEvent,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
   isConveyorDeleteShortcut,
+  isConveyorGalleryShortcut,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
@@ -138,34 +138,17 @@ test('widget interactions restore native canvas shortcut focus', () => {
   assert.deepEqual(calls.at(-1), ['focus', { preventScroll: true }])
 })
 
-test('DOM widget keyboard events retain native fields while targeting the graph canvas', () => {
-  const inputTarget = { localName: 'input' }
-  const graphTarget = { localName: 'canvas' }
-  const event = {
-    type: 'keydown',
-    key: 's',
-    code: 'KeyS',
-    keyCode: 83,
-    ctrlKey: true,
-    target: inputTarget,
-    defaultPrevented: false,
-    preventDefault() { this.defaultPrevented = true }
+test('conveyor keyboard ownership excludes every modified ComfyUI hotkey', () => {
+  for (const modifier of ['ctrlKey', 'metaKey', 'altKey', 'shiftKey']) {
+    assert.equal(isConveyorGalleryShortcut({ key: 's', [modifier]: true }), false)
+    assert.equal(isConveyorGalleryShortcut({ key: 'ArrowRight', [modifier]: true }), false)
   }
-  const receiver = { calls: [] }
-  function processKey(received) {
-    if (received.target.localName === 'input') return
-    this.calls.push(received)
-    received.preventDefault()
-  }
-
-  assert.equal(delegateGraphKeyboardEvent(event, processKey, receiver, graphTarget), true)
-  assert.equal(receiver.calls.length, 1)
-  assert.equal(receiver.calls[0].target, graphTarget)
-  assert.equal(receiver.calls[0].keyCode, 83)
-  assert.equal(event.target, inputTarget)
-  assert.equal(event.defaultPrevented, true)
-  assert.equal(delegateGraphKeyboardEvent(event, processKey, receiver, graphTarget), false)
-  assert.equal(delegateGraphKeyboardEvent({ isComposing: true }, processKey, receiver, graphTarget), false)
+  assert.equal(isConveyorGalleryShortcut({ key: 'ArrowRight' }), true)
+  assert.equal(isConveyorGalleryShortcut({ key: 'Enter' }), true)
+  assert.equal(isConveyorGalleryShortcut({ key: 'Delete' }), true)
+  assert.equal(isConveyorGalleryShortcut({ key: 's' }), false)
+  assert.equal(isConveyorGalleryShortcut({ key: 'ArrowRight', isComposing: true }), false)
+  assert.equal(isConveyorGalleryShortcut({ key: 'ArrowRight', defaultPrevented: true }), false)
 })
 
 test('tab switches preserve independent scroll positions', () => {

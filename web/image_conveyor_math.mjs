@@ -100,25 +100,30 @@ export function restoreGraphCanvasFocus(previousOwner, canvas) {
   return !canvas.ownerDocument || canvas.ownerDocument.activeElement === canvas
 }
 
-export function delegateGraphKeyboardEvent(event, processKey, receiver = null, graphTarget = null) {
-  if (!event || event.defaultPrevented || event.isComposing || typeof processKey !== 'function') return false
-  // Retarget the native event without reconstructing read-only legacy fields such as keyCode and which.
-  const delegatedEvent = graphTarget && event.target !== graphTarget
-    ? new Proxy(event, {
-        get(source, property) {
-          if (property === 'target') return graphTarget
-          const value = Reflect.get(source, property, source)
-          return typeof value === 'function' ? value.bind(source) : value
-        }
-      })
-    : event
-  processKey.call(receiver, delegatedEvent)
-  return true
-}
-
 export function isConveyorDeleteShortcut(event) {
   if (!event || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false
   return event.key === 'Delete' || event.code === 'Delete'
+}
+
+const CONVEYOR_GALLERY_KEYS = new Set([
+  'ArrowLeft',
+  'ArrowRight',
+  'ArrowUp',
+  'ArrowDown',
+  'Home',
+  'End',
+  'PageUp',
+  'PageDown',
+  'Enter',
+  ' ',
+  'Escape'
+])
+
+export function isConveyorGalleryShortcut(event) {
+  if (!event || event.defaultPrevented || event.isComposing) return false
+  if (isConveyorDeleteShortcut(event)) return true
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false
+  return CONVEYOR_GALLERY_KEYS.has(event.key)
 }
 
 export function calculateMarqueeGridIndexes(totalItems, metrics, bounds) {

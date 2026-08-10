@@ -7,10 +7,10 @@ import {
   calculateGalleryMetrics,
   calculateVisibleCardRange,
   chooseViewAfterClose,
-  delegateGraphKeyboardEvent,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
+  isConveyorGalleryShortcut,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
@@ -2074,6 +2074,11 @@ function createLightbox(node) {
   }
   close.addEventListener('click', hide)
   lightbox.addEventListener('click', (event) => { if (event.target === lightbox) hide() })
+  lightbox.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    consumeGalleryKeyboardEvent(event)
+    hide()
+  })
   document.body.appendChild(lightbox)
   return { root: lightbox, image, label, close, hide }
 }
@@ -2798,17 +2803,6 @@ function shouldRetainWidgetFocus(target) {
   return control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement || control.isContentEditable
 }
 
-function isNeutralDocumentKeyTarget(target) {
-  return target === document || target === document.body || target === document.documentElement
-}
-
-function shouldDelegateGraphKeyboardEvent(ctx, root, target) {
-  if (target === app.canvas?.canvas || shouldRetainWidgetFocus(target)) return false
-  if (target instanceof Node && root.contains(target)) return true
-  if (!ctx.keyboardActive) return false
-  return isNeutralDocumentKeyTarget(target) || target === app.canvasContainer
-}
-
 function consumeGalleryKeyboardEvent(event) {
   event.preventDefault()
   event.stopPropagation()
@@ -3019,7 +3013,7 @@ function buildGalleryDom(node) {
     pointerInside: false, middlePanPointerId: null, documentPasteHandler: null,
     documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
     documentMarqueeMoveHandler: null, documentMarqueeEndHandler: null,
-    documentKeyHandler: null, documentKeyUpHandler: null, documentFocusScopeHandler: null, windowFocusHandler: null,
+    documentFocusScopeHandler: null, windowFocusHandler: null,
     filePickerPending: false, filePickerFocusTimer: 0, filePickerFocusFrame: 0,
     inputAbortController: null, inputRequestId: 0,
     searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
@@ -3226,27 +3220,6 @@ function buildGalleryDom(node) {
     activeBrowser(ctx).scrollTop = list.scrollTop
     scheduleRenderNode(node, { viewportOnly: true })
   }, { passive: true })
-  ctx.documentKeyHandler = (event) => {
-    if (event.key === 'Escape' && !ctx.lightbox.root.hidden) {
-      consumeGalleryKeyboardEvent(event)
-      ctx.lightbox.hide()
-      return
-    }
-    const target = event.composedPath?.()[0] ?? event.target
-    const galleryTarget = target === app.canvas?.canvas || (target instanceof Node && root.contains(target))
-    if (ctx.keyboardActive && galleryTarget && handleGalleryKeyDown(node, event)) return
-    if (shouldDelegateGraphKeyboardEvent(ctx, root, target)) {
-      delegateGraphKeyboardEvent(event, app.canvas?.processKey, app.canvas, app.canvas?.canvas)
-    }
-  }
-  ctx.documentKeyUpHandler = (event) => {
-    const target = event.composedPath?.()[0] ?? event.target
-    if (shouldDelegateGraphKeyboardEvent(ctx, root, target)) {
-      delegateGraphKeyboardEvent(event, app.canvas?.processKey, app.canvas, app.canvas?.canvas)
-    }
-  }
-  document.addEventListener('keydown', ctx.documentKeyHandler, true)
-  document.addEventListener('keyup', ctx.documentKeyUpHandler, true)
   ctx.documentFocusScopeHandler = (event) => {
     if (!(event.target instanceof Node) || !root.contains(event.target)) releaseGalleryKeyboardOwnership(node)
   }
@@ -3498,6 +3471,12 @@ function initializeNode(node, widget) {
     return true
   }
 
+  chainNodeCallback(node, 'onKeyDown', function (event) {
+    const ctx = node.__bil
+    if (!ctx?.keyboardActive || !isConveyorGalleryShortcut(event)) return
+    handleGalleryKeyDown(node, event)
+  })
+
   chainNodeCallback(node, 'onExecuted', function (output) {
     const payload = output?.batch_image_loader_delta?.[0]
     if (!payload) return
@@ -3562,14 +3541,6 @@ function initializeNode(node, widget) {
     }
     ctx.middlePanPointerId = null
     cancelMarqueeSelection(node, false)
-    if (ctx.documentKeyHandler) {
-      document.removeEventListener('keydown', ctx.documentKeyHandler, true)
-      ctx.documentKeyHandler = null
-    }
-    if (ctx.documentKeyUpHandler) {
-      document.removeEventListener('keyup', ctx.documentKeyUpHandler, true)
-      ctx.documentKeyUpHandler = null
-    }
     if (ctx.documentFocusScopeHandler) {
       document.removeEventListener('pointerdown', ctx.documentFocusScopeHandler, true)
       ctx.documentFocusScopeHandler = null
