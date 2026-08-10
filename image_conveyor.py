@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import folder_paths
@@ -16,10 +17,12 @@ def _deep_copy_json(value: Any) -> Any:
 
 def _normalize_images_per_execution(value: Any) -> int:
     try:
-        count = int(value)
+        number = float(value)
     except (TypeError, ValueError, OverflowError):
         return 1
-    return max(1, min(_MAX_IMAGES_PER_EXECUTION, count))
+    if not math.isfinite(number):
+        return 1
+    return max(1, min(_MAX_IMAGES_PER_EXECUTION, int(number)))
 
 
 def _default_state() -> Dict[str, Any]:
@@ -165,6 +168,7 @@ def _parse_queue_item(raw: Any) -> Optional[Dict[str, Any]]:
         raw_items = payload.get("items")
         if not isinstance(raw_items, list) or not raw_items:
             raise RuntimeError("Image Conveyor: queued image group reservation is invalid.")
+
         items: List[Dict[str, str]] = []
         seen_ids = set()
         for raw_item in raw_items:
@@ -196,16 +200,7 @@ def _parse_queue_item(raw: Any) -> Optional[Dict[str, Any]]:
 
 
 def _get_runtime_source_path(ui_state: Dict[str, Any], item: Dict[str, Any]) -> str:
-    """
-    Resolve the runtime source path for an item, preferring a UI-provided override when present.
-
-    Parameters:
-        ui_state (dict): UI state that may contain a `source_paths` mapping of item IDs to source path overrides.
-        item (dict): Item dictionary containing at least an `"id"` key and an optional `"source_path"` fallback.
-
-    Returns:
-        str: The trimmed source path from `ui_state["source_paths"][item["id"]]` if non-empty, otherwise the trimmed `item["source_path"]` (or an empty string if neither is set).
-    """
+    """Resolve the runtime source path, preferring the UI-only source-path override."""
     source_paths = ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
     if isinstance(source_paths, dict):
         source_path = str(source_paths.get(item["id"], "")).strip()
@@ -246,6 +241,7 @@ def _select_group(
                 f"Image Conveyor: queued image group contains {len(reserved_items)} images, "
                 f"but this prompt requests {count}."
             )
+
         selected: List[Tuple[int, Dict[str, Any]]] = []
         for reserved in reserved_items:
             index, item = _find_item_by_id(state, reserved["id"])
@@ -266,6 +262,7 @@ def _select_group(
                 "Image Conveyor: a legacy single-image reservation cannot satisfy "
                 f"{count} images per execution. Queue this prompt again."
             )
+
         index, item = _find_item_by_id(state, reservation["id"])
         if item is not None:
             return [(index, item)]
@@ -388,9 +385,7 @@ class ImageConveyor:
         del ui_state_json
         state = _normalize_state(state_json)
         if not state["items"]:
-            empty_identity = (
-                f"{state_json}|images_per_execution={state['images_per_execution']}"
-            )
+            empty_identity = f"{state_json}|images_per_execution={state['images_per_execution']}"
             return hashlib.sha256(empty_identity.encode("utf-8")).hexdigest()
 
         selected = _select_group(
@@ -400,8 +395,8 @@ class ImageConveyor:
         hasher = hashlib.sha256()
         hasher.update(b"dont_consume=1" if state["dont_consume"] else b"dont_consume=0")
         hasher.update(f"|images_per_execution={state['images_per_execution']}".encode("utf-8"))
-        for slot, (_index, item) in enumerate(selected, start=1):
-            hasher.update(f"|slot={slot}|".encode("utf-8"))
+        for slot, (index, item) in enumerate(selected, start=1):
+            hasher.update(f"|slot={slot}|index={index}|".encode("utf-8"))
             hasher.update(item["id"].encode("utf-8"))
             hasher.update(b"|")
             hasher.update(item["annotated"].encode("utf-8"))
@@ -442,10 +437,11 @@ class ImageConveyor:
             state, queue_item_json, allow_processed=dont_consume
         )
 
+        loader = nodes.LoadImage()
         loaded_images: List[Any] = []
         first_mask = None
         for slot, (_index, item) in enumerate(selected):
-            image, mask = nodes.LoadImage().load_image(item["annotated"])
+            image, mask = loader.load_image(item["annotated"])
             loaded_images.append(image)
             if slot == 0:
                 first_mask = mask
@@ -474,7 +470,9 @@ class ImageConveyor:
             "consumed": not dont_consume,
         }
 
-        additional_images = loaded_images[1:] + [None] * (_MAX_IMAGES_PER_EXECUTION - len(loaded_images))
+        additional_images = loaded_images[1:] + [None] * (
+            _MAX_IMAGES_PER_EXECUTION - len(loaded_images)
+        )
         return {
             "result": (
                 loaded_images[0],
