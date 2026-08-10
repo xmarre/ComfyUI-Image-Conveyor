@@ -1,14 +1,21 @@
 import hashlib
 import json
 import math
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 import folder_paths
 import nodes
 
 
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 _MAX_IMAGES_PER_EXECUTION = 9
+_REFERENCE_SLOT_COUNT = 8
+_OUTPUT_MODE_PERSISTENT = "persistent_refs"
+_OUTPUT_MODE_QUEUE_GROUP = "queue_group"
+_SUPPORTED_IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".avif"
+}
 
 
 def _deep_copy_json(value: Any) -> Any:
@@ -33,6 +40,9 @@ def _default_state() -> Dict[str, Any]:
         "dont_consume": False,
         "catch_canvas_drops": False,
         "images_per_execution": 1,
+        "output_mode": _OUTPUT_MODE_PERSISTENT,
+        "reference_slots": [None] * _REFERENCE_SLOT_COUNT,
+        "active_reference_preset_id": "",
     }
 
 
@@ -92,6 +102,59 @@ def _normalize_item(item: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _normalize_reference_slot(value: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(value, dict):
+        return None
+    annotated = str(value.get("annotated", "")).strip()
+    suffix = " [input]"
+    if not annotated.endswith(suffix):
+        return None
+    relative_path = annotated[:-len(suffix)].strip().replace("\\", "/")
+    posix = PurePosixPath(relative_path)
+    windows = PureWindowsPath(relative_path)
+    parts = relative_path.split("/")
+    if (
+        not relative_path
+        or posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or any(part in {"", ".", ".."} for part in parts)
+        or Path(relative_path).suffix.lower() not in _SUPPORTED_IMAGE_EXTENSIONS
+    ):
+        return None
+    storage_type = str(value.get("type", "input")).strip().lower() or "input"
+    if storage_type != "input":
+        return None
+    parent = "" if str(posix.parent) == "." else str(posix.parent)
+    return {
+        "annotated": f"{relative_path} [input]",
+        "filename": posix.name,
+        "subfolder": parent,
+        "type": "input",
+    }
+
+
+def _normalize_reference_slots(value: Any) -> List[Optional[Dict[str, str]]]:
+    source = value if isinstance(value, list) else []
+    return [
+        _normalize_reference_slot(source[index]) if index < len(source) else None
+        for index in range(_REFERENCE_SLOT_COUNT)
+    ]
+
+
+def _normalize_output_mode(state: Any, images_per_execution: int) -> str:
+    if isinstance(state, dict) and "output_mode" in state:
+        value = str(state.get("output_mode", "")).strip().lower()
+        if value == _OUTPUT_MODE_QUEUE_GROUP:
+            return _OUTPUT_MODE_QUEUE_GROUP
+        return _OUTPUT_MODE_PERSISTENT
+    return (
+        _OUTPUT_MODE_QUEUE_GROUP
+        if images_per_execution > 1
+        else _OUTPUT_MODE_PERSISTENT
+    )
+
+
 def _normalize_state(raw: Any) -> Dict[str, Any]:
     state = _safe_json_load(raw, _default_state())
     items_raw = state.get("items", []) if isinstance(state, dict) else []
@@ -101,16 +164,33 @@ def _normalize_state(raw: Any) -> Dict[str, Any]:
             normalized = _normalize_item(item)
             if normalized is not None:
                 items.append(normalized)
+    images_per_execution = _normalize_images_per_execution(
+        state.get("images_per_execution", 1) if isinstance(state, dict) else 1
+    )
+    output_mode = _normalize_output_mode(state, images_per_execution)
     return {
         "version": _STATE_VERSION,
         "items": items,
         "auto_queue": bool(state.get("auto_queue", False)) if isinstance(state, dict) else False,
         "dont_consume": bool(state.get("dont_consume", False)) if isinstance(state, dict) else False,
         "catch_canvas_drops": bool(state.get("catch_canvas_drops", False)) if isinstance(state, dict) else False,
-        "images_per_execution": _normalize_images_per_execution(
-            state.get("images_per_execution", 1) if isinstance(state, dict) else 1
+        "images_per_execution": images_per_execution,
+        "output_mode": output_mode,
+        "reference_slots": _normalize_reference_slots(
+            state.get("reference_slots", []) if isinstance(state, dict) else []
+        ),
+        "active_reference_preset_id": (
+            str(state.get("active_reference_preset_id", "")).strip()
+            if isinstance(state, dict)
+            else ""
         ),
     }
+
+
+def _effective_images_per_execution(state: Dict[str, Any]) -> int:
+    if state.get("output_mode") == _OUTPUT_MODE_QUEUE_GROUP:
+        return _normalize_images_per_execution(state.get("images_per_execution", 1))
+    return 1
 
 
 def _normalize_ui_state(raw: Any) -> Dict[str, Any]:
@@ -231,7 +311,7 @@ def _select_group(
     allow_processed: bool = False,
 ) -> List[Tuple[int, Dict[str, Any]]]:
     """Resolve one complete ordered execution group from reservation or queue state."""
-    count = _normalize_images_per_execution(state.get("images_per_execution", 1))
+    count = _effective_images_per_execution(state)
     reservation = _parse_queue_item(queue_item_json)
 
     if reservation is not None and reservation.get("grouped"):
@@ -307,7 +387,10 @@ def _select_item(
 
 def _unresolved_change_hash(state: Dict[str, Any], reason: str) -> str:
     """Return a stable cache sentinel while input validation reports the real error."""
-    identity = f"unresolved|images_per_execution={state['images_per_execution']}|{reason}"
+    identity = (
+        f"unresolved|output_mode={state['output_mode']}|"
+        f"images_per_execution={_effective_images_per_execution(state)}|{reason}"
+    )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
@@ -391,7 +474,10 @@ class ImageConveyor:
         del ui_state_json
         state = _normalize_state(state_json)
         if not state["items"]:
-            empty_identity = f"{state_json}|images_per_execution={state['images_per_execution']}"
+            empty_identity = (
+                f"{state_json}|output_mode={state['output_mode']}|"
+                f"images_per_execution={_effective_images_per_execution(state)}"
+            )
             return hashlib.sha256(empty_identity.encode("utf-8")).hexdigest()
 
         try:
@@ -403,7 +489,10 @@ class ImageConveyor:
 
         hasher = hashlib.sha256()
         hasher.update(b"dont_consume=1" if state["dont_consume"] else b"dont_consume=0")
-        hasher.update(f"|images_per_execution={state['images_per_execution']}".encode("utf-8"))
+        hasher.update(f"|output_mode={state['output_mode']}".encode("utf-8"))
+        hasher.update(
+            f"|images_per_execution={_effective_images_per_execution(state)}".encode("utf-8")
+        )
         for slot, (index, item) in enumerate(selected, start=1):
             hasher.update(f"|slot={slot}|index={index}|".encode("utf-8"))
             hasher.update(item["id"].encode("utf-8"))
@@ -422,6 +511,26 @@ class ImageConveyor:
                     state,
                     f"missing|slot={slot}|index={index}|id={item['id']}|annotated={item['annotated']}",
                 )
+        if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
+            for slot, reference in enumerate(state["reference_slots"], start=1):
+                if reference is None:
+                    hasher.update(f"|reference_slot={slot}|empty".encode("utf-8"))
+                    continue
+                hasher.update(f"|reference_slot={slot}|".encode("utf-8"))
+                hasher.update(reference["annotated"].encode("utf-8"))
+                try:
+                    path = folder_paths.get_annotated_filepath(reference["annotated"])
+                    with open(path, "rb") as handle:
+                        while True:
+                            chunk = handle.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            hasher.update(chunk)
+                except FileNotFoundError:
+                    return _unresolved_change_hash(
+                        state,
+                        f"missing-reference|slot={slot}|annotated={reference['annotated']}",
+                    )
         return hasher.hexdigest()
 
     @classmethod
@@ -441,6 +550,16 @@ class ImageConveyor:
         for _index, item in selected:
             if not folder_paths.exists_annotated_filepath(item["annotated"]):
                 return f"Image Conveyor: missing file '{item['annotated']}'."
+
+        if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
+            for slot, reference in enumerate(state["reference_slots"], start=1):
+                if reference is None:
+                    continue
+                if not folder_paths.exists_annotated_filepath(reference["annotated"]):
+                    return (
+                        f"Image Conveyor: reference slot {slot} is missing "
+                        f"'{reference['annotated']}'."
+                    )
 
         return True
 
@@ -485,9 +604,18 @@ class ImageConveyor:
             "consumed": not dont_consume,
         }
 
-        additional_images = loaded_images[1:] + [None] * (
-            _MAX_IMAGES_PER_EXECUTION - len(loaded_images)
-        )
+        if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
+            additional_images = []
+            for reference in state["reference_slots"]:
+                if reference is None:
+                    additional_images.append(None)
+                else:
+                    image, _mask = loader.load_image(reference["annotated"])
+                    additional_images.append(image)
+        else:
+            additional_images = loaded_images[1:] + [None] * (
+                _MAX_IMAGES_PER_EXECUTION - len(loaded_images)
+            )
         return {
             "result": (
                 loaded_images[0],
