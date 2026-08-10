@@ -7,6 +7,7 @@ import {
   calculateGalleryMetrics,
   calculateVisibleCardRange,
   chooseViewAfterClose,
+  delegateGraphKeyboardEvent,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
@@ -52,6 +53,21 @@ const CARD_SIZES = {
   small: { minWidth: 124, thumbnail: 160 },
   medium: { minWidth: 172, thumbnail: 256 },
   large: { minWidth: 224, thumbnail: 384 }
+}
+let keyboardOwnerNode = null
+
+function claimGalleryKeyboardOwnership(node) {
+  if (keyboardOwnerNode && keyboardOwnerNode !== node) {
+    const previous = keyboardOwnerNode.__bil
+    if (previous) previous.keyboardActive = false
+  }
+  keyboardOwnerNode = node
+  if (node.__bil) node.__bil.keyboardActive = true
+}
+
+function releaseGalleryKeyboardOwnership(node) {
+  if (node.__bil) node.__bil.keyboardActive = false
+  if (keyboardOwnerNode === node) keyboardOwnerNode = null
 }
 
 function structuredCloneCompat(value) {
@@ -1568,8 +1584,7 @@ function ensureStyles() {
     .bil-thumb { width: 100%; height: 100%; display: block; object-fit: contain; background: transparent; opacity: 0; }
     .bil-thumb.bil-thumb-ready { opacity: 1; }
     .bil-thumb-error { opacity: .32; filter: grayscale(1); outline: 1px dashed rgba(255,110,110,.78); outline-offset: -2px; }
-    .bil-card-overlay { position: absolute; inset: 6px 6px auto 6px; display: flex; align-items: flex-start; justify-content: space-between; gap: 4px; pointer-events: none; }
-    .bil-card-check { pointer-events: auto; width: 17px; height: 17px; margin: 0; accent-color: #6aaef7; }
+    .bil-card-overlay { position: absolute; inset: 6px 6px auto 6px; display: flex; align-items: flex-start; justify-content: flex-end; gap: 4px; pointer-events: none; }
     .bil-badge { padding: 2px 6px; border-radius: 999px; font-size: 10px; text-transform: uppercase; letter-spacing: .025em; background: rgba(20,20,20,.82); }
     .bil-badge-pending { color: #e2e2e2; } .bil-badge-queued { color: #ffd276; } .bil-badge-processed { color: #8bea9e; }
     .bil-count-badge { color: #cce4ff; text-transform: none; }
@@ -2213,6 +2228,7 @@ function renderTabs(ctx) {
 function createCardSlot(node, ctx) {
   const card = document.createElement('div')
   card.className = 'bil-card'
+  card.setAttribute('role', 'option')
   card.style.display = 'none'
   const slot = {
     card,
@@ -2274,17 +2290,9 @@ function createCardSlot(node, ctx) {
   folderIcon.hidden = true
   const overlay = document.createElement('div')
   overlay.className = 'bil-card-overlay'
-  const checkbox = document.createElement('input')
-  checkbox.type = 'checkbox'
-  checkbox.className = 'bil-card-check'
-  checkbox.addEventListener('click', (event) => event.stopPropagation())
-  checkbox.addEventListener('change', (event) => {
-    if (slot.itemId) setItemSelected(node, slot.itemId, checkbox.checked, event)
-    restoreGraphCanvasFocus(checkbox, app.canvas?.canvas)
-  })
   const badge = document.createElement('span')
   badge.className = 'bil-badge'
-  overlay.append(checkbox, badge)
+  overlay.append(badge)
   media.append(thumb, folderIcon, overlay)
 
   const footer = document.createElement('div')
@@ -2335,7 +2343,7 @@ function createCardSlot(node, ctx) {
   actions.append(path, pendingBtn, processedBtn, deleteBtn, addBtn)
   footer.append(titleRow, actions)
   card.append(media, footer)
-  Object.assign(slot, { media, thumb, folderIcon, checkbox, badge, name, indexText, path, pendingBtn, processedBtn, deleteBtn, addBtn })
+  Object.assign(slot, { media, thumb, folderIcon, badge, name, indexText, path, pendingBtn, processedBtn, deleteBtn, addBtn })
   return slot
 }
 
@@ -2382,7 +2390,6 @@ function hideUnusedCards(ctx, start = 0) {
     slot.card.style.display = 'none'
     slot.card.classList.remove('bil-selected', 'bil-focused', 'bil-drag-target', 'bil-folder-card')
     slot.folderIcon.hidden = true
-    slot.checkbox.hidden = false
     resetCardThumbnail(slot)
   }
 }
@@ -2428,7 +2435,7 @@ function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotate
   if (slot.selected !== isSelected) {
     slot.selected = isSelected
     slot.card.classList.toggle('bil-selected', isSelected)
-    slot.checkbox.checked = isSelected
+    slot.card.setAttribute('aria-selected', String(isSelected))
   }
   const isFocused = browser.focusedId === itemId
   if (slot.focused !== isFocused) {
@@ -2436,7 +2443,6 @@ function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotate
     slot.card.classList.toggle('bil-focused', isFocused)
   }
   if (staticContentChanged) {
-    slot.checkbox.setAttribute('aria-label', `Select ${label}`)
     slot.card.title = displayPath
     slot.name.textContent = label
     slot.indexText.textContent = `#${itemIndex + 1}`
@@ -2447,7 +2453,6 @@ function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotate
   slot.card.classList.toggle('bil-folder-card', folderItem)
   slot.folderIcon.hidden = !folderItem
   slot.thumb.hidden = folderItem
-  slot.checkbox.hidden = folderItem
   const draggable = !inputView && canReorderConveyor(ctx)
   if (slot.draggable !== draggable) {
     slot.draggable = draggable
@@ -2793,6 +2798,17 @@ function shouldRetainWidgetFocus(target) {
   return control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement || control.isContentEditable
 }
 
+function isNeutralDocumentKeyTarget(target) {
+  return target === document || target === document.body || target === document.documentElement
+}
+
+function shouldDelegateGraphKeyboardEvent(ctx, root, target) {
+  if (target === app.canvas?.canvas || shouldRetainWidgetFocus(target)) return false
+  if (target instanceof Node && root.contains(target)) return true
+  if (!ctx.keyboardActive) return false
+  return isNeutralDocumentKeyTarget(target) || target === app.canvasContainer
+}
+
 function consumeGalleryKeyboardEvent(event) {
   event.preventDefault()
   event.stopPropagation()
@@ -2977,6 +2993,8 @@ function buildGalleryDom(node) {
   inputTab.setAttribute('aria-controls', list.id)
   const listInner = document.createElement('div'); listInner.className = 'bil-list-inner'
   const listWindow = document.createElement('div'); listWindow.className = 'bil-list-window'
+  listWindow.setAttribute('role', 'listbox')
+  listWindow.setAttribute('aria-multiselectable', 'true')
   const selectionMarquee = document.createElement('div')
   selectionMarquee.className = 'bil-selection-marquee'; selectionMarquee.hidden = true
   listInner.append(listWindow, selectionMarquee); list.appendChild(listInner)
@@ -3001,7 +3019,7 @@ function buildGalleryDom(node) {
     pointerInside: false, middlePanPointerId: null, documentPasteHandler: null,
     documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
     documentMarqueeMoveHandler: null, documentMarqueeEndHandler: null,
-    documentKeyHandler: null, documentFocusScopeHandler: null, windowFocusHandler: null,
+    documentKeyHandler: null, documentKeyUpHandler: null, documentFocusScopeHandler: null, windowFocusHandler: null,
     filePickerPending: false, filePickerFocusTimer: 0, filePickerFocusFrame: 0,
     inputAbortController: null, inputRequestId: 0,
     searchTimer: 0, lightbox: null, lastMetrics: null, removed: false,
@@ -3216,11 +3234,21 @@ function buildGalleryDom(node) {
     }
     const target = event.composedPath?.()[0] ?? event.target
     const galleryTarget = target === app.canvas?.canvas || (target instanceof Node && root.contains(target))
-    if (ctx.keyboardActive && galleryTarget) handleGalleryKeyDown(node, event)
+    if (ctx.keyboardActive && galleryTarget && handleGalleryKeyDown(node, event)) return
+    if (shouldDelegateGraphKeyboardEvent(ctx, root, target)) {
+      delegateGraphKeyboardEvent(event, app.canvas?.processKey, app.canvas, app.canvas?.canvas)
+    }
+  }
+  ctx.documentKeyUpHandler = (event) => {
+    const target = event.composedPath?.()[0] ?? event.target
+    if (shouldDelegateGraphKeyboardEvent(ctx, root, target)) {
+      delegateGraphKeyboardEvent(event, app.canvas?.processKey, app.canvas, app.canvas?.canvas)
+    }
   }
   document.addEventListener('keydown', ctx.documentKeyHandler, true)
+  document.addEventListener('keyup', ctx.documentKeyUpHandler, true)
   ctx.documentFocusScopeHandler = (event) => {
-    if (!(event.target instanceof Node) || !root.contains(event.target)) ctx.keyboardActive = false
+    if (!(event.target instanceof Node) || !root.contains(event.target)) releaseGalleryKeyboardOwnership(node)
   }
   document.addEventListener('pointerdown', ctx.documentFocusScopeHandler, true)
 
@@ -3254,7 +3282,7 @@ function buildGalleryDom(node) {
   root.addEventListener('pointerleave', () => { ctx.pointerInside = false })
   list.addEventListener('pointerdown', (event) => { beginMarqueeSelection(node, event) })
   root.addEventListener('pointerdown', (event) => {
-    ctx.keyboardActive = true
+    claimGalleryKeyboardOwnership(node)
     if (event.button === 1) { if (!app.canvas) return; ctx.middlePanPointerId = event.pointerId; event.preventDefault(); app.canvas.processMouseDown(event); return }
   }, true)
   root.addEventListener('click', (event) => {
@@ -3321,6 +3349,7 @@ function buildGalleryDom(node) {
     finalizeExternalFileDrag(event)
     const pending = folderTarget ? getDroppedFolderSources(event) : getDroppedImageFiles(event)
     clearExternalDragState()
+    claimGalleryKeyboardOwnership(node)
     ctx.restoreCanvasShortcutFocus?.()
     const entries = await pending
     if (folderTarget) {
@@ -3506,6 +3535,7 @@ function initializeNode(node, widget) {
     canvasDropCoordinator.unregisterNode(node)
     const ctx = node.__bil
     if (!ctx) return
+    releaseGalleryKeyboardOwnership(node)
     ctx.removed = true
     ctx.inputRequestId += 1
     if (ctx.documentPasteHandler) {
@@ -3535,6 +3565,10 @@ function initializeNode(node, widget) {
     if (ctx.documentKeyHandler) {
       document.removeEventListener('keydown', ctx.documentKeyHandler, true)
       ctx.documentKeyHandler = null
+    }
+    if (ctx.documentKeyUpHandler) {
+      document.removeEventListener('keyup', ctx.documentKeyUpHandler, true)
+      ctx.documentKeyUpHandler = null
     }
     if (ctx.documentFocusScopeHandler) {
       document.removeEventListener('pointerdown', ctx.documentFocusScopeHandler, true)

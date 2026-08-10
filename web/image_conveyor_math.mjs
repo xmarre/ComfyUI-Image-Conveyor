@@ -89,13 +89,30 @@ export function isHighVelocityScroll(deltaPixels, elapsedMs, rowStride) {
 }
 
 export function restoreGraphCanvasFocus(previousOwner, canvas) {
-  previousOwner?.blur?.()
   if (!canvas || typeof canvas.focus !== 'function') return false
+  previousOwner?.blur?.()
+  if (typeof canvas.tabIndex === 'number' && canvas.tabIndex < 0) canvas.tabIndex = -1
   try {
     canvas.focus({ preventScroll: true })
   } catch {
     canvas.focus()
   }
+  return !canvas.ownerDocument || canvas.ownerDocument.activeElement === canvas
+}
+
+export function delegateGraphKeyboardEvent(event, processKey, receiver = null, graphTarget = null) {
+  if (!event || event.defaultPrevented || event.isComposing || typeof processKey !== 'function') return false
+  // Retarget the native event without reconstructing read-only legacy fields such as keyCode and which.
+  const delegatedEvent = graphTarget && event.target !== graphTarget
+    ? new Proxy(event, {
+        get(source, property) {
+          if (property === 'target') return graphTarget
+          const value = Reflect.get(source, property, source)
+          return typeof value === 'function' ? value.bind(source) : value
+        }
+      })
+    : event
+  processKey.call(receiver, delegatedEvent)
   return true
 }
 

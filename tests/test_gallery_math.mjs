@@ -5,6 +5,7 @@ import {
   calculateMarqueeGridIndexes,
   calculateVisibleCardRange,
   chooseViewAfterClose,
+  delegateGraphKeyboardEvent,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
@@ -115,16 +116,56 @@ test('only high-velocity scrolling defers intermediate thumbnail requests', () =
 test('widget interactions restore native canvas shortcut focus', () => {
   const calls = []
   const fileInput = { blur: () => calls.push(['blur']) }
-  const canvas = { focus: (options) => calls.push(['focus', options]) }
+  const ownerDocument = { activeElement: fileInput }
+  const canvas = {
+    ownerDocument,
+    tabIndex: -1,
+    focus(options) {
+      calls.push(['focus', options])
+      ownerDocument.activeElement = this
+    }
+  }
 
   assert.equal(restoreGraphCanvasFocus(fileInput, canvas), true)
   assert.deepEqual(calls, [['blur'], ['focus', { preventScroll: true }]])
+  assert.equal(ownerDocument.activeElement, canvas)
+  assert.equal(canvas.tabIndex, -1)
 
   assert.equal(restoreGraphCanvasFocus(fileInput, null), false)
-  assert.deepEqual(calls.at(-1), ['blur'])
+  assert.deepEqual(calls.at(-1), ['focus', { preventScroll: true }])
 
   assert.equal(restoreGraphCanvasFocus(null, canvas), true)
   assert.deepEqual(calls.at(-1), ['focus', { preventScroll: true }])
+})
+
+test('DOM widget keyboard events retain native fields while targeting the graph canvas', () => {
+  const inputTarget = { localName: 'input' }
+  const graphTarget = { localName: 'canvas' }
+  const event = {
+    type: 'keydown',
+    key: 's',
+    code: 'KeyS',
+    keyCode: 83,
+    ctrlKey: true,
+    target: inputTarget,
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true }
+  }
+  const receiver = { calls: [] }
+  function processKey(received) {
+    if (received.target.localName === 'input') return
+    this.calls.push(received)
+    received.preventDefault()
+  }
+
+  assert.equal(delegateGraphKeyboardEvent(event, processKey, receiver, graphTarget), true)
+  assert.equal(receiver.calls.length, 1)
+  assert.equal(receiver.calls[0].target, graphTarget)
+  assert.equal(receiver.calls[0].keyCode, 83)
+  assert.equal(event.target, inputTarget)
+  assert.equal(event.defaultPrevented, true)
+  assert.equal(delegateGraphKeyboardEvent(event, processKey, receiver, graphTarget), false)
+  assert.equal(delegateGraphKeyboardEvent({ isComposing: true }, processKey, receiver, graphTarget), false)
 })
 
 test('tab switches preserve independent scroll positions', () => {
