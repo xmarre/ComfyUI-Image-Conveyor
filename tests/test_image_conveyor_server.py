@@ -1,5 +1,6 @@
 import errno
 import importlib.util
+import json
 import os
 import sqlite3
 import tempfile
@@ -334,6 +335,126 @@ class InputLibraryTest(unittest.TestCase):
 
         self.assertTrue(os.path.exists(first))
         self.assertTrue(os.path.exists(second))
+
+    def test_reference_preset_crud_is_ordered_case_unique_and_sparse(self):
+        self.write_input("refs/a.png", b"a")
+        self.write_input("refs/b.png", b"b")
+        empty = [None] * 8
+        beta_slots = list(empty)
+        beta_slots[0] = {"annotated": "refs/b.png [input]", "type": "input"}
+        alpha_slots = list(empty)
+        alpha_slots[2] = {"annotated": "refs/a.png [input]", "type": "input"}
+
+        beta = self.library.preset_store.create("Beta", beta_slots)
+        alpha = self.library.preset_store.create("Alpha", alpha_slots)
+        self.assertEqual(["Alpha", "Beta"], [preset["name"] for preset in self.library.preset_store.list()])
+        self.assertEqual(8, len(alpha["slots"]))
+        self.assertIsNone(alpha["slots"][0])
+        self.assertEqual("refs/a.png [input]", alpha["slots"][2]["annotated"])
+
+        with self.assertRaisesRegex(server.InvalidPreset, "already exists"):
+            self.library.preset_store.create("alpha", empty)
+
+        updated = self.library.preset_store.update(beta["id"], name="Gamma", slots=alpha_slots)
+        self.assertEqual("Gamma", updated["name"])
+        self.assertEqual("refs/a.png [input]", updated["slots"][2]["annotated"])
+        self.assertTrue(self.library.preset_store.delete(alpha["id"]))
+        self.assertFalse(self.library.preset_store.delete(alpha["id"]))
+        self.assertEqual(["Gamma"], [preset["name"] for preset in self.library.preset_store.list()])
+
+    def test_reference_preset_rejects_missing_traversal_and_absolute_paths(self):
+        invalid = (
+            "missing.png [input]",
+            "../escape.png [input]",
+            "/tmp/escape.png [input]",
+            "C:\\tmp\\escape.png [input]",
+        )
+        for annotated in invalid:
+            slots = [None] * 8
+            slots[0] = {"annotated": annotated, "type": "input"}
+            with self.subTest(annotated=annotated), self.assertRaises(server.InvalidPreset):
+                self.library.preset_store.create("Invalid", slots)
+
+    def test_malformed_preset_storage_is_quarantined_without_overwrite(self):
+        path = self.library.preset_store.path
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{broken")
+        self.assertEqual([], self.library.preset_store.list())
+        self.assertFalse(os.path.exists(path))
+        quarantined = list(Path(path).parent.glob("reference-presets.json.corrupt-*"))
+        self.assertEqual(1, len(quarantined))
+        self.assertEqual("{broken", quarantined[0].read_text(encoding="utf-8"))
+
+    def test_preset_atomic_write_leaves_no_temporary_file(self):
+        self.write_input("ref.png", b"ref")
+        slots = [None] * 8
+        slots[0] = {"annotated": "ref.png [input]", "type": "input"}
+        self.library.preset_store.create("Atomic", slots)
+        directory = os.path.dirname(self.library.preset_store.path)
+        self.assertEqual([], [name for name in os.listdir(directory) if name.endswith(".tmp")])
+        with open(self.library.preset_store.path, "r", encoding="utf-8") as handle:
+            self.assertEqual(1, json.load(handle)["version"])
+
+    def test_duplicate_cleanup_relinks_presets_before_deleting(self):
+        self.write_input("original.png", b"same")
+        duplicate = self.write_input("image_conveyor/copy.png", b"same")
+        slots = [None] * 8
+        slots[4] = {"annotated": "image_conveyor/copy.png [input]", "type": "input"}
+        self.library.preset_store.create("Character", slots)
+        report = self.library.find_managed_duplicates()
+        result = self.library.delete_managed_duplicates(report["groups"])
+
+        self.assertFalse(os.path.exists(duplicate))
+        self.assertEqual(1, result["presets_relinked"])
+        self.assertEqual(
+            "original.png [input]",
+            self.library.preset_store.list()[0]["slots"][4]["annotated"],
+        )
+
+    def test_duplicate_cleanup_does_not_delete_when_preset_relink_write_fails(self):
+        self.write_input("original.png", b"same")
+        duplicate = self.write_input("image_conveyor/copy.png", b"same")
+        slots = [None] * 8
+        slots[0] = {"annotated": "image_conveyor/copy.png [input]", "type": "input"}
+        self.library.preset_store.create("Character", slots)
+        report = self.library.find_managed_duplicates()
+        with mock.patch.object(self.library.preset_store, "_write_unlocked", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.library.delete_managed_duplicates(report["groups"])
+
+        self.assertTrue(os.path.exists(duplicate))
+
+    def test_duplicate_cleanup_is_blocked_after_malformed_preset_recovery(self):
+        self.write_input("original.png", b"same")
+        duplicate = self.write_input("image_conveyor/copy.png", b"same")
+        preset_path = self.library.preset_store.path
+        os.makedirs(os.path.dirname(preset_path), exist_ok=True)
+        with open(preset_path, "w", encoding="utf-8") as handle:
+            handle.write("{malformed")
+        self.assertEqual([], self.library.preset_store.list())
+        report = self.library.find_managed_duplicates()
+
+        with self.assertRaisesRegex(server.InvalidPreset, "cleanup is blocked"):
+            self.library.delete_managed_duplicates(report["groups"])
+
+        self.assertTrue(os.path.exists(duplicate))
+
+    def test_duplicate_cleanup_rejects_repeated_paths_before_mutation(self):
+        self.write_input("original.png", b"same")
+        duplicate = self.write_input("image_conveyor/copy.png", b"same")
+        digest = server.hashlib.sha256(b"same").hexdigest()
+        groups = [{
+            "digest": digest,
+            "keep_path": "original.png",
+            "duplicates": [
+                {"relative_path": "image_conveyor/copy.png"},
+                {"relative_path": "image_conveyor/copy.png"},
+            ],
+        }]
+        with self.assertRaisesRegex(server.InvalidUpload, "repeated path"):
+            self.library.delete_managed_duplicates(groups)
+        self.assertTrue(os.path.exists(duplicate))
 
     def test_concurrent_identical_uploads_create_one_file(self):
         barrier = threading.Barrier(2)
