@@ -5,13 +5,15 @@ import {
   calculateMarqueeGridIndexes,
   calculateVisibleCardRange,
   chooseViewAfterClose,
-  delegateGraphKeyboardEvent,
+  dispatchKeyboundCommandFallback,
+  findKeyboundCommand,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
   isConveyorDeleteShortcut,
   isConveyorGalleryShortcut,
   isReservedTextInputShortcut,
+  keyboardComboSignature,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
@@ -140,36 +142,128 @@ test('widget interactions restore native canvas shortcut focus', () => {
   assert.deepEqual(calls.at(-1), ['focus', { preventScroll: true }])
 })
 
-test('neutral workspace keys enter ComfyUI with the original keyboard fields', () => {
-  const body = { localName: 'body' }
-  const canvas = { localName: 'canvas' }
+test('live ComfyUI bindings provide a single fallback when the native listener is absent', () => {
+  const canvas = { tagName: 'CANVAS', closest: () => null }
+  const save = {
+    id: 'Comfy.SaveWorkflow',
+    keybinding: {
+      combo: {
+        key: 's', ctrl: true, alt: false, shift: false,
+        isReservedByTextInput: false
+      },
+      targetElementId: null
+    }
+  }
+  const calls = []
+  const manager = {
+    commands: [save],
+    execute(id, options) { calls.push({ id, options }) }
+  }
   const event = {
-    type: 'keydown',
-    key: 's',
-    code: 'KeyS',
-    keyCode: 83,
-    which: 83,
-    ctrlKey: true,
-    target: body,
-    defaultPrevented: false,
+    key: 's', code: 'KeyS', keyCode: 83, ctrlKey: true,
+    target: canvas, defaultPrevented: false,
+    composedPath: () => [canvas],
     preventDefault() { this.defaultPrevented = true },
     stopImmediatePropagation() { this.immediatePropagationStopped = true }
   }
-  const receiver = { calls: [] }
-  function processKey(received) {
-    this.calls.push(received)
-    assert.equal(received.target, canvas)
-    assert.equal(received.keyCode, 83)
-    assert.equal(received.which, 83)
-    received.preventDefault()
-    received.stopImmediatePropagation()
-  }
 
-  assert.equal(delegateGraphKeyboardEvent(event, processKey, receiver, canvas), true)
-  assert.equal(receiver.calls.length, 1)
-  assert.equal(event.target, body)
+  assert.equal(keyboardComboSignature(event), 'S:true:false:false')
+  assert.equal(keyboardComboSignature({ key: 's', metaKey: true }), 'S:true:false:false')
+  assert.equal(findKeyboundCommand(manager.commands, event, canvas), save)
+  assert.equal(dispatchKeyboundCommandFallback(event, manager), true)
   assert.equal(event.defaultPrevented, true)
   assert.equal(event.immediatePropagationStopped, true)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].id, 'Comfy.SaveWorkflow')
+  assert.equal(typeof calls[0].options.errorHandler, 'function')
+  assert.equal(calls[0].options.metadata, undefined)
+
+  assert.equal(dispatchKeyboundCommandFallback(event, manager), false)
+  assert.equal(calls.length, 1)
+})
+
+test('fallback honors live reassignment, canvas scope, text editing, and modal state', () => {
+  const canvas = { tagName: 'CANVAS' }
+  const input = { tagName: 'INPUT' }
+  const outside = { tagName: 'BUTTON' }
+  const container = { contains: (target) => target === canvas || target === input }
+  const documentRef = { getElementById: (id) => id === 'graph-canvas-container' ? container : null }
+  const command = {
+    id: 'Comfy.Canvas.SelectAll',
+    keybinding: {
+      combo: {
+        key: 'x', ctrl: true, alt: false, shift: true,
+        isReservedByTextInput: true
+      },
+      targetElementId: 'graph-canvas'
+    }
+  }
+  const matching = { key: 'x', ctrlKey: true, shiftKey: true }
+
+  assert.equal(findKeyboundCommand([command], matching, canvas, documentRef), command)
+  assert.equal(findKeyboundCommand([command], matching, outside, documentRef), null)
+  assert.equal(findKeyboundCommand([command], matching, input, documentRef), null)
+
+  const manager = { commands: [command], execute: () => assert.fail('modal command executed') }
+  assert.equal(dispatchKeyboundCommandFallback(
+    { ...matching, preventDefault: () => assert.fail('modal event cancelled') },
+    manager,
+    { target: canvas, documentRef, modalOpen: true }
+  ), false)
+})
+
+test('window listener ordering executes each live command once', () => {
+  const canvas = { tagName: 'CANVAS', closest: () => null }
+  const command = {
+    id: 'Comfy.SaveWorkflow',
+    keybinding: {
+      combo: {
+        key: 's', ctrl: true, alt: false, shift: false,
+        isReservedByTextInput: false
+      }
+    }
+  }
+  const manager = { commands: [command], execute: () => { fallbackCalls += 1 } }
+  const windowTarget = new EventTarget()
+  let nativeActive = false
+  let nativeCalls = 0
+  let fallbackCalls = 0
+  let downstreamCalls = 0
+
+  windowTarget.addEventListener('keydown', (event) => {
+    if (!nativeActive) return
+    nativeCalls += 1
+    event.preventDefault()
+  })
+  windowTarget.addEventListener('keydown', (event) => {
+    dispatchKeyboundCommandFallback(event, manager, { target: canvas })
+  })
+  windowTarget.addEventListener('keydown', () => { downstreamCalls += 1 })
+
+  const makeEvent = () => {
+    const event = new Event('keydown', { cancelable: true })
+    Object.defineProperties(event, {
+      key: { value: 's' },
+      ctrlKey: { value: true },
+      metaKey: { value: false },
+      altKey: { value: false },
+      shiftKey: { value: false }
+    })
+    return event
+  }
+
+  assert.equal(windowTarget.dispatchEvent(makeEvent()), false)
+  assert.deepEqual(
+    { nativeCalls, fallbackCalls, downstreamCalls },
+    { nativeCalls: 0, fallbackCalls: 1, downstreamCalls: 0 }
+  )
+
+  nativeActive = true
+  assert.equal(windowTarget.dispatchEvent(makeEvent()), false)
+  assert.deepEqual(
+    { nativeCalls, fallbackCalls, downstreamCalls },
+    { nativeCalls: 1, fallbackCalls: 1, downstreamCalls: 1 }
+  )
 })
 
 test('text controls reserve editing chords while allowing ComfyUI commands', () => {

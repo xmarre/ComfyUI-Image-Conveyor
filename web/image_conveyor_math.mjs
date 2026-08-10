@@ -100,21 +100,6 @@ export function restoreGraphCanvasFocus(previousOwner, canvas) {
   return !canvas.ownerDocument || canvas.ownerDocument.activeElement === canvas
 }
 
-export function delegateGraphKeyboardEvent(event, processKey, receiver = null, graphTarget = null) {
-  if (!event || event.defaultPrevented || event.isComposing || typeof processKey !== 'function') return false
-  const delegatedEvent = graphTarget && event.target !== graphTarget
-    ? new Proxy(event, {
-        get(source, property) {
-          if (property === 'target') return graphTarget
-          const value = Reflect.get(source, property, source)
-          return typeof value === 'function' ? value.bind(source) : value
-        }
-      })
-    : event
-  processKey.call(receiver, delegatedEvent)
-  return true
-}
-
 const TEXT_INPUT_RESERVED_SHORTCUTS = new Set([
   'Ctrl+a', 'Ctrl+c', 'Ctrl+v', 'Ctrl+x', 'Ctrl+z', 'Ctrl+y', 'Ctrl+p',
   'Enter', 'Shift+Enter', 'Ctrl+Backspace', 'Ctrl+Delete',
@@ -139,6 +124,99 @@ export function isReservedTextInputShortcut(event) {
   const rawKey = String(event.key || '')
   modifiers.push(rawKey.length === 1 ? rawKey.toLowerCase() : rawKey)
   return TEXT_INPUT_RESERVED_SHORTCUTS.has(modifiers.join('+'))
+}
+
+export function keyboardComboSignature(eventOrCombo) {
+  if (!eventOrCombo) return ''
+  const key = String(eventOrCombo.key ?? '').toUpperCase()
+  const isCombo = Object.hasOwn(eventOrCombo, 'ctrl')
+  const ctrl = isCombo
+    ? Boolean(eventOrCombo.ctrl)
+    : Boolean(eventOrCombo.ctrlKey || eventOrCombo.metaKey)
+  const alt = Boolean(isCombo ? eventOrCombo.alt : eventOrCombo.altKey)
+  const shift = Boolean(isCombo ? eventOrCombo.shift : eventOrCombo.shiftKey)
+  return `${key}:${ctrl}:${alt}:${shift}`
+}
+
+function isTextEditingTarget(target) {
+  const tagName = String(target?.tagName ?? '').toUpperCase()
+  return tagName === 'INPUT' ||
+    tagName === 'TEXTAREA' ||
+    target?.contentEditable === 'true' ||
+    (tagName === 'SPAN' && target?.classList?.contains?.('property_value'))
+}
+
+export function findKeyboundCommand(commands, event, target, documentRef = globalThis.document) {
+  if (!event || event.defaultPrevented || event.isComposing) return null
+  const eventSignature = keyboardComboSignature(event)
+  if (!eventSignature || eventSignature.startsWith('CONTROL:') ||
+      eventSignature.startsWith('META:') || eventSignature.startsWith('ALT:') ||
+      eventSignature.startsWith('SHIFT:')) return null
+  if (event.key === 'Escape' && target?.closest?.('[role="menu"]')) return null
+
+  for (const command of Array.from(commands ?? [])) {
+    let binding
+    try {
+      binding = command?.keybinding
+    } catch {
+      continue
+    }
+    if (!binding?.combo || keyboardComboSignature(binding.combo) !== eventSignature) continue
+
+    if (isTextEditingTarget(target)) {
+      const reserved = typeof binding.combo.isReservedByTextInput === 'boolean'
+        ? binding.combo.isReservedByTextInput
+        : isReservedTextInputShortcut(event)
+      if (reserved) return null
+    }
+
+    const targetElementId = binding.targetElementId === 'graph-canvas'
+      ? 'graph-canvas-container'
+      : binding.targetElementId
+    if (targetElementId) {
+      const container = documentRef?.getElementById?.(targetElementId)
+      if (!container?.contains?.(target)) continue
+    }
+    return command
+  }
+  return null
+}
+
+const RUN_COMMAND_IDS = new Set([
+  'Comfy.QueuePrompt',
+  'Comfy.QueuePromptFront',
+  'Comfy.QueueSelectedOutputNodes'
+])
+
+export function dispatchKeyboundCommandFallback(
+  event,
+  commandManager,
+  {
+    target = event?.composedPath?.()[0] ?? event?.target,
+    documentRef = globalThis.document,
+    modalOpen = false,
+    onError = () => {}
+  } = {}
+) {
+  if (modalOpen || typeof commandManager?.execute !== 'function') return false
+  const command = findKeyboundCommand(commandManager.commands, event, target, documentRef)
+  if (!command?.id) return false
+
+  event.preventDefault?.()
+  event.stopImmediatePropagation?.()
+  const options = {
+    errorHandler: onError,
+    ...(RUN_COMMAND_IDS.has(command.id)
+      ? { metadata: { trigger_source: 'keybinding' } }
+      : {})
+  }
+  try {
+    const result = commandManager.execute(command.id, options)
+    result?.catch?.(onError)
+  } catch (error) {
+    onError(error)
+  }
+  return true
 }
 
 export function isConveyorDeleteShortcut(event) {

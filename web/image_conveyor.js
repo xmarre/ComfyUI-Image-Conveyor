@@ -7,12 +7,11 @@ import {
   calculateGalleryMetrics,
   calculateVisibleCardRange,
   chooseViewAfterClose,
-  delegateGraphKeyboardEvent,
+  dispatchKeyboundCommandFallback,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isHighVelocityScroll,
   isConveyorGalleryShortcut,
-  isReservedTextInputShortcut,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
@@ -89,23 +88,14 @@ function conveyorForKeyboardTarget(target) {
   return null
 }
 
-function isTextEditingControl(target) {
-  if (!(target instanceof Element)) return false
-  const control = target.closest('input, textarea, [contenteditable="true"]')
-  if (!control) return false
-  if (control instanceof HTMLInputElement) {
-    return !['button', 'checkbox', 'color', 'file', 'radio', 'range', 'reset', 'submit'].includes(control.type)
-  }
-  return control instanceof HTMLTextAreaElement || control.isContentEditable
-}
-
 const keyboardCoordinator = {
   attached: false,
 
   registerNode(node) {
     keyboardNodes.add(node)
     if (this.attached) return
-    document.addEventListener('keydown', this.handleKeyDown, true)
+    document.addEventListener('keydown', this.handleGalleryKeyDown, true)
+    window.addEventListener('keydown', this.handleComfyFallbackKeyDown)
     this.attached = true
   },
 
@@ -113,18 +103,15 @@ const keyboardCoordinator = {
     keyboardNodes.delete(node)
     releaseGalleryKeyboardOwnership(node)
     if (keyboardNodes.size || !this.attached) return
-    document.removeEventListener('keydown', this.handleKeyDown, true)
+    document.removeEventListener('keydown', this.handleGalleryKeyDown, true)
+    window.removeEventListener('keydown', this.handleComfyFallbackKeyDown)
     this.attached = false
   },
 
-  handleKeyDown(event) {
+  handleGalleryKeyDown(event) {
     if (event.defaultPrevented || event.isComposing || !keyboardNodes.size) return
     const target = eventOrigin(event)
     const canvas = app.canvas?.canvas
-    if (!canvas) return
-
-    // ComfyUI's legacy shortcut entry point is attached directly to the canvas.
-    // DOM widgets and a neutral document body sit outside that event path.
     const neutralTarget = isNeutralKeyboardTarget(target)
     const targetNode = target === canvas || neutralTarget
       ? null
@@ -135,17 +122,29 @@ const keyboardCoordinator = {
       targetNode === owner ||
       neutralTarget
     )
-    if (ownerOwnsTarget && isConveyorGalleryShortcut(event) && handleGalleryKeyDown(owner, event)) return
+    if (ownerOwnsTarget && isConveyorGalleryShortcut(event)) handleGalleryKeyDown(owner, event)
+  },
 
-    if (target === canvas) return
-    if (!targetNode && !neutralTarget) return
-    if (isInteractiveWidgetControl(target)) {
-      if (isTextEditingControl(target)) {
-        if (isReservedTextInputShortcut(event)) return
-      } else if (!(event.ctrlKey || event.metaKey || event.altKey)) return
-    }
-    delegateGraphKeyboardEvent(event, app.canvas?.processKey, app.canvas, canvas)
+  handleComfyFallbackKeyDown(event) {
+    if (event.defaultPrevented || event.isComposing || !keyboardNodes.size) return
+    dispatchKeyboundCommandFallback(event, app.extensionManager?.command, {
+      modalOpen: hasVisibleModal(),
+      onError: (error) => console.error('Image Conveyor: ComfyUI shortcut command failed.', error)
+    })
   }
+}
+
+function hasVisibleModal() {
+  const candidates = document.querySelectorAll(
+    'dialog[open], [aria-modal="true"], .p-dialog-mask, .comfy-modal'
+  )
+  for (const element of candidates) {
+    if (element.hidden || element.getAttribute?.('aria-hidden') === 'true') continue
+    const style = globalThis.getComputedStyle?.(element)
+    if (style?.display === 'none' || style?.visibility === 'hidden') continue
+    return true
+  }
+  return false
 }
 
 function structuredCloneCompat(value) {
