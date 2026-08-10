@@ -48,4 +48,29 @@ jobs:
         run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py
 
       - name: Check whitespace errors
-        run: git diff --check "$(git merge-base HEAD origin/main)"...HEAD
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_REF" ]]; then
+            git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+            compare_ref="origin/$BASE_REF"
+          elif [[ "$EVENT_NAME" == "push" && -n "$BEFORE_SHA" && "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            if ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "$BEFORE_SHA"
+            fi
+            compare_ref="$BEFORE_SHA"
+          elif git rev-parse --verify origin/main >/dev/null 2>&1; then
+            compare_ref="origin/main"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            compare_ref="HEAD^"
+          else
+            compare_ref="HEAD"
+          fi
+
+          merge_base="$(git merge-base HEAD "$compare_ref")"
+          git diff --check "$merge_base"...HEAD
