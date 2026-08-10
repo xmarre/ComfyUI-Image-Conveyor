@@ -305,6 +305,12 @@ def _select_item(
     return _select_group(single_state, queue_item_json, allow_processed=allow_processed)[0]
 
 
+def _unresolved_change_hash(state: Dict[str, Any], reason: str) -> str:
+    """Return a stable cache sentinel while input validation reports the real error."""
+    identity = f"unresolved|images_per_execution={state['images_per_execution']}|{reason}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 class ImageConveyor:
     CATEGORY = "image"
     FUNCTION = "load_next"
@@ -388,9 +394,12 @@ class ImageConveyor:
             empty_identity = f"{state_json}|images_per_execution={state['images_per_execution']}"
             return hashlib.sha256(empty_identity.encode("utf-8")).hexdigest()
 
-        selected = _select_group(
-            state, queue_item_json, allow_processed=state["dont_consume"]
-        )
+        try:
+            selected = _select_group(
+                state, queue_item_json, allow_processed=state["dont_consume"]
+            )
+        except RuntimeError as exc:
+            return _unresolved_change_hash(state, f"selection|{exc}")
 
         hasher = hashlib.sha256()
         hasher.update(b"dont_consume=1" if state["dont_consume"] else b"dont_consume=0")
@@ -400,13 +409,19 @@ class ImageConveyor:
             hasher.update(item["id"].encode("utf-8"))
             hasher.update(b"|")
             hasher.update(item["annotated"].encode("utf-8"))
-            path = folder_paths.get_annotated_filepath(item["annotated"])
-            with open(path, "rb") as handle:
-                while True:
-                    chunk = handle.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    hasher.update(chunk)
+            try:
+                path = folder_paths.get_annotated_filepath(item["annotated"])
+                with open(path, "rb") as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+            except FileNotFoundError:
+                return _unresolved_change_hash(
+                    state,
+                    f"missing|slot={slot}|index={index}|id={item['id']}|annotated={item['annotated']}",
+                )
         return hasher.hexdigest()
 
     @classmethod
