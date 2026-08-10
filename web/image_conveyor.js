@@ -3,9 +3,12 @@ import { api } from '../../scripts/api.js'
 import '../../scripts/domWidget.js'
 import {
   CARD_FOOTER_HEIGHT,
+  calculateGalleryDropIntent,
   calculateMarqueeGridIndexes,
   calculateGalleryMetrics,
+  calculateReorderDestinationIndex,
   calculateVisibleCardRange,
+  clientPointToScrollContent,
   chooseViewAfterClose,
   dispatchKeyboundCommandFallback,
   groupDirectoryPickerFiles,
@@ -822,6 +825,17 @@ function moveItems(state, draggedId, targetId) {
   if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return false
   const [moved] = state.items.splice(fromIndex, 1)
   state.items.splice(toIndex, 0, moved)
+  return true
+}
+
+function moveItemToInsertionIndex(state, draggedId, insertionIndex) {
+  if (!draggedId || !Array.isArray(state?.items)) return false
+  const fromIndex = state.items.findIndex((item) => item.id === draggedId)
+  if (fromIndex < 0) return false
+  const destination = calculateReorderDestinationIndex(state.items.length, fromIndex, insertionIndex)
+  if (destination < 0) return false
+  const [moved] = state.items.splice(fromIndex, 1)
+  state.items.splice(destination, 0, moved)
   return true
 }
 
@@ -1649,6 +1663,8 @@ function ensureStyles() {
     .bil-list-inner, .bil-list-window { position: relative; min-height: 100%; }
     .bil-selection-marquee { position: absolute; z-index: 4; pointer-events: none; box-sizing: border-box; border: 1px solid rgba(125,185,255,.95); background: rgba(80,145,225,.18); box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); }
     .bil-selection-marquee[hidden] { display: none; }
+    .bil-drop-indicator { position: absolute; z-index: 5; pointer-events: none; border-radius: 999px; background: #7db9ff; box-shadow: 0 0 0 1px rgba(15,35,58,.75), 0 0 10px rgba(100,175,255,.85); }
+    .bil-drop-indicator[hidden] { display: none; }
     .bil-empty { min-height: 100%; display: flex; align-items: center; justify-content: center; box-sizing: border-box; padding: 20px; text-align: center; border: 1px dashed rgba(255,255,255,.14); border-radius: 10px; opacity: .7; }
     .bil-card {
       position: absolute; display: flex; flex-direction: column; overflow: hidden; box-sizing: border-box;
@@ -1997,9 +2013,17 @@ function setsEqual(left, right) {
 
 function marqueeContentPoint(ctx, clientX, clientY) {
   const rect = ctx.list.getBoundingClientRect()
-  const x = Math.min(Math.max(clientX - rect.left, 0), ctx.list.clientWidth)
-  const y = Math.min(Math.max(clientY - rect.top, 0), ctx.list.clientHeight)
-  return { x: x + ctx.list.scrollLeft, y: y + ctx.list.scrollTop }
+  return clientPointToScrollContent(
+    clientX,
+    clientY,
+    rect,
+    ctx.list.clientWidth,
+    ctx.list.clientHeight,
+    ctx.list.scrollLeft,
+    ctx.list.scrollTop,
+    ctx.list.offsetWidth,
+    ctx.list.offsetHeight
+  )
 }
 
 function marqueeAutoscrollVelocity(list, clientY) {
@@ -2118,9 +2142,7 @@ function beginMarqueeSelection(node, event) {
   if (!ctx || event.button !== 0 || event.isPrimary === false || ctx.marqueeSelection) return false
   if (event.target instanceof Element && event.target.closest('.bil-card')) return false
   const rect = ctx.list.getBoundingClientRect()
-  const localX = event.clientX - rect.left
-  const localY = event.clientY - rect.top
-  if (localX < 0 || localY < 0 || localX > ctx.list.clientWidth || localY > ctx.list.clientHeight) return false
+  if (event.clientX < rect.left || event.clientY < rect.top || event.clientX > rect.right || event.clientY > rect.bottom) return false
   const browser = activeBrowser(ctx)
   ctx.marqueeSelection = {
     pointerId: event.pointerId,
@@ -2191,6 +2213,52 @@ function clearCardDragTargets(ctx, except = null) {
   for (const slot of ctx.cardPool) {
     if (slot.card !== except) slot.card.classList.remove('bil-drag-target')
   }
+}
+
+function clearInternalDragTarget(ctx) {
+  if (!ctx) return
+  clearCardDragTargets(ctx)
+  ctx.dragIntent = null
+  if (ctx.dropIndicator) ctx.dropIndicator.hidden = true
+}
+
+function renderInternalDragTarget(ctx, intent) {
+  clearCardDragTargets(ctx)
+  ctx.dropIndicator.hidden = true
+  if (!intent) return
+  if (intent.type === 'card') {
+    const target = ctx.cardPool.find((slot) => slot.itemIndex === intent.targetIndex)
+    target?.card.classList.add('bil-drag-target')
+    return
+  }
+  const indicator = ctx.dropIndicator
+  indicator.hidden = false
+  if (intent.orientation === 'horizontal') {
+    Object.assign(indicator.style, {
+      left: `${intent.left}px`,
+      top: `${intent.top - 2}px`,
+      width: `${ctx.lastMetrics?.width || ctx.list.clientWidth}px`,
+      height: '4px'
+    })
+    return
+  }
+  Object.assign(indicator.style, {
+    left: `${intent.left - 2}px`,
+    top: `${intent.top}px`,
+    width: '4px',
+    height: `${intent.height}px`
+  })
+}
+
+function internalDragIntentAt(ctx, clientX, clientY) {
+  if (!ctx.draggedId || !canReorderConveyor(ctx)) return null
+  const point = marqueeContentPoint(ctx, clientX, clientY)
+  return calculateGalleryDropIntent(
+    ctx.visibleItems?.length || 0,
+    getGalleryMetrics(ctx),
+    point.x,
+    point.y
+  )
 }
 
 function folderViewId(sourceId, folderPath = '') {
@@ -2350,21 +2418,10 @@ function createCardSlot(node, ctx) {
     if (!slot.draggable || !slot.itemId) { event.preventDefault(); return }
     ctx.draggedId = slot.itemId
     event.dataTransfer?.setData('text/plain', slot.itemId)
-    clearCardDragTargets(ctx)
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+    clearInternalDragTarget(ctx)
   })
-  card.addEventListener('dragend', () => { ctx.draggedId = null; clearCardDragTargets(ctx) })
-  card.addEventListener('dragover', (event) => {
-    if (!slot.draggable || !ctx.draggedId) return
-    event.preventDefault(); clearCardDragTargets(ctx, card); card.classList.add('bil-drag-target')
-  })
-  card.addEventListener('dragleave', () => card.classList.remove('bil-drag-target'))
-  card.addEventListener('drop', (event) => {
-    if (!slot.draggable || !slot.itemId || !ctx.draggedId) return
-    event.preventDefault(); clearCardDragTargets(ctx)
-    const { state, uiState } = getRenderableState(node)
-    if (moveItems(state, ctx.draggedId, slot.itemId)) updateState(node, state, uiState)
-    ctx.draggedId = null
-  })
+  card.addEventListener('dragend', () => { ctx.draggedId = null; clearInternalDragTarget(ctx) })
 
   const media = document.createElement('div')
   media.className = 'bil-media'
@@ -2668,6 +2725,7 @@ function renderVisibleCards(node) {
     )
   }
   hideUnusedCards(ctx, needed)
+  if (ctx.dragIntent) renderInternalDragTarget(ctx, ctx.dragIntent)
   ctx.renderedRangeKey = key
 }
 
@@ -3095,7 +3153,9 @@ function buildGalleryDom(node) {
   listWindow.setAttribute('aria-multiselectable', 'true')
   const selectionMarquee = document.createElement('div')
   selectionMarquee.className = 'bil-selection-marquee'; selectionMarquee.hidden = true
-  listInner.append(listWindow, selectionMarquee); list.appendChild(listInner)
+  const dropIndicator = document.createElement('div')
+  dropIndicator.className = 'bil-drop-indicator'; dropIndicator.hidden = true
+  listInner.append(listWindow, selectionMarquee, dropIndicator); list.appendChild(listInner)
   root.append(fileInput, folderInput, header, browserbar, secondary, summaryRow, contextBar, settings, list)
 
   node.__bil = {
@@ -3106,9 +3166,9 @@ function buildGalleryDom(node) {
     contextLabel, setPendingBtn, setProcessedBtn, deleteSelectedBtn, contextAddBtn,
     cleanDuplicatesBtn,
     autoQueueCheckbox: autoQueue.checkbox, dontConsumeCheckbox: dontConsume.checkbox,
-    canvasDropCheckbox: canvasDrop.checkbox, list, listInner, listWindow, selectionMarquee,
+    canvasDropCheckbox: canvasDrop.checkbox, list, listInner, listWindow, selectionMarquee, dropIndicator,
     browser: createBrowserState(), visibleItems: [], cardPool: [],
-    draggedId: null, empty: null, state: null, uiState: null, renderVersion: 0,
+    draggedId: null, dragIntent: null, empty: null, state: null, uiState: null, renderVersion: 0,
     inputVersion: 0, renderedRangeKey: '', renderFrame: 0, renderViewportOnly: false,
     pendingScrollRestore: null,
     galleryViewportSuspended: false, galleryViewportEpoch: 0,
@@ -3385,6 +3445,36 @@ function buildGalleryDom(node) {
   root.addEventListener('pointerenter', () => { ctx.pointerInside = true })
   root.addEventListener('pointerleave', () => { ctx.pointerInside = false })
   list.addEventListener('pointerdown', (event) => { beginMarqueeSelection(node, event) })
+  list.addEventListener('dragover', (event) => {
+    if (!ctx.draggedId) return
+    const intent = internalDragIntentAt(ctx, event.clientX, event.clientY)
+    if (!intent) { clearInternalDragTarget(ctx); return }
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+    ctx.dragIntent = intent
+    renderInternalDragTarget(ctx, intent)
+  })
+  list.addEventListener('dragleave', (event) => {
+    if (!ctx.draggedId) return
+    if (event.relatedTarget instanceof Node && list.contains(event.relatedTarget)) return
+    clearInternalDragTarget(ctx)
+  })
+  list.addEventListener('drop', (event) => {
+    if (!ctx.draggedId) return
+    const draggedId = ctx.draggedId
+    const intent = internalDragIntentAt(ctx, event.clientX, event.clientY) || ctx.dragIntent
+    event.preventDefault()
+    event.stopPropagation()
+    ctx.draggedId = null
+    clearInternalDragTarget(ctx)
+    if (!intent) return
+    const { state, uiState } = getRenderableState(node)
+    const changed = intent.type === 'card'
+      ? moveItems(state, draggedId, ctx.visibleItems?.[intent.targetIndex]?.id)
+      : moveItemToInsertionIndex(state, draggedId, intent.insertionIndex)
+    if (changed) updateState(node, state, uiState)
+  })
   root.addEventListener('pointerdown', (event) => {
     claimGalleryKeyboardOwnership(node)
     if (event.button === 1) { if (!app.canvas) return; ctx.middlePanPointerId = event.pointerId; event.preventDefault(); app.canvas.processMouseDown(event); return }

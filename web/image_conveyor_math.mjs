@@ -289,6 +289,111 @@ export function calculateMarqueeGridIndexes(totalItems, metrics, bounds) {
   return indexes
 }
 
+export function clientPointToScrollContent(
+  clientX,
+  clientY,
+  rect,
+  clientWidth,
+  clientHeight,
+  scrollLeft = 0,
+  scrollTop = 0,
+  layoutWidth = clientWidth,
+  layoutHeight = clientHeight
+) {
+  const width = Math.max(0, Number(clientWidth) || 0)
+  const height = Math.max(0, Number(clientHeight) || 0)
+  const boxWidth = Math.max(0, Number(layoutWidth) || width)
+  const boxHeight = Math.max(0, Number(layoutHeight) || height)
+  const renderedWidth = Math.max(0, Number(rect?.width) || 0)
+  const renderedHeight = Math.max(0, Number(rect?.height) || 0)
+  const scaleX = boxWidth > 0 && renderedWidth > 0 ? renderedWidth / boxWidth : 1
+  const scaleY = boxHeight > 0 && renderedHeight > 0 ? renderedHeight / boxHeight : 1
+  const localX = (Number(clientX) - (Number(rect?.left) || 0)) / scaleX
+  const localY = (Number(clientY) - (Number(rect?.top) || 0)) / scaleY
+  return {
+    x: Math.min(Math.max(localX, 0), width) + Math.max(0, Number(scrollLeft) || 0),
+    y: Math.min(Math.max(localY, 0), height) + Math.max(0, Number(scrollTop) || 0)
+  }
+}
+
+export function calculateReorderDestinationIndex(length, fromIndex, insertionIndex) {
+  const count = Math.max(0, Math.floor(Number(length) || 0))
+  const from = Math.floor(Number(fromIndex))
+  if (!count || !Number.isFinite(from) || from < 0 || from >= count) return -1
+  const boundary = Math.min(count, Math.max(0, Math.floor(Number(insertionIndex) || 0)))
+  const destination = from < boundary ? boundary - 1 : boundary
+  return destination === from ? -1 : destination
+}
+
+export function calculateGalleryDropIntent(totalItems, metrics, contentX, contentY) {
+  const count = Math.max(0, Math.floor(Number(totalItems) || 0))
+  if (!count || !metrics) return null
+
+  const columns = Math.max(1, Math.floor(Number(metrics.columns) || 1))
+  const cardWidth = Math.max(1, Number(metrics.cardWidth) || 1)
+  const cardHeight = Math.max(1, Number(metrics.cardHeight) || 1)
+  const columnStride = Math.max(cardWidth, Number(metrics.columnStride) || cardWidth)
+  const rowStride = Math.max(cardHeight, Number(metrics.rowStride) || cardHeight)
+  const gap = Math.max(0, rowStride - cardHeight)
+  const rows = Math.ceil(count / columns)
+  const x = Math.max(0, Number(contentX) || 0)
+  const y = Math.max(0, Number(contentY) || 0)
+  const row = Math.min(rows - 1, Math.floor(y / rowStride))
+  const rowStart = row * columns
+  const rowCount = Math.min(columns, count - rowStart)
+  const rowTop = row * rowStride
+  const rowOffset = y - rowTop
+
+  if (rowOffset >= cardHeight && row < rows - 1) {
+    return {
+      type: 'insertion',
+      insertionIndex: Math.min(count, rowStart + rowCount),
+      orientation: 'horizontal',
+      left: 0,
+      top: rowTop + cardHeight + gap / 2
+    }
+  }
+
+  const column = Math.floor(x / columnStride)
+  if (column >= rowCount) {
+    const lastColumn = rowCount - 1
+    return {
+      type: 'insertion',
+      insertionIndex: rowStart + rowCount,
+      orientation: 'vertical',
+      left: lastColumn * columnStride + cardWidth,
+      top: rowTop,
+      height: cardHeight
+    }
+  }
+
+  const cardIndex = rowStart + Math.max(0, column)
+  const cardLeft = Math.max(0, column) * columnStride
+  const columnOffset = x - cardLeft
+  const edgeWidth = Math.min(cardWidth / 3, Math.max(18, cardWidth * 0.2))
+  if (columnOffset <= edgeWidth) {
+    return {
+      type: 'insertion',
+      insertionIndex: cardIndex,
+      orientation: 'vertical',
+      left: cardLeft,
+      top: rowTop,
+      height: cardHeight
+    }
+  }
+  if (columnOffset >= cardWidth - edgeWidth) {
+    return {
+      type: 'insertion',
+      insertionIndex: cardIndex + 1,
+      orientation: 'vertical',
+      left: cardLeft + cardWidth,
+      top: rowTop,
+      height: cardHeight
+    }
+  }
+  return { type: 'card', targetIndex: cardIndex }
+}
+
 export function planViewScrollSwitch(
   activeView,
   nextView,

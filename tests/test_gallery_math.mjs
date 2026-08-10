@@ -2,8 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   calculateGalleryMetrics,
+  calculateGalleryDropIntent,
   calculateMarqueeGridIndexes,
+  calculateReorderDestinationIndex,
   calculateVisibleCardRange,
+  clientPointToScrollContent,
   chooseViewAfterClose,
   dispatchKeyboundCommandFallback,
   findKeyboundCommand,
@@ -69,6 +72,82 @@ test('marquee hit testing follows virtual card geometry and ignores gaps', () =>
     }),
     [0, 1, 2, 3, 4]
   )
+})
+
+test('client points map into unscaled scroll content under canvas transforms', () => {
+  assert.deepEqual(
+    clientPointToScrollContent(
+      150,
+      100,
+      { left: 100, top: 50, width: 200, height: 150 },
+      400,
+      300,
+      12,
+      40
+    ),
+    { x: 112, y: 140 }
+  )
+  assert.deepEqual(
+    clientPointToScrollContent(
+      90,
+      500,
+      { left: 100, top: 50, width: 800, height: 600 },
+      400,
+      300
+    ),
+    { x: 0, y: 225 }
+  )
+  assert.deepEqual(
+    clientPointToScrollContent(
+      300,
+      200,
+      { left: 100, top: 50, width: 416, height: 320 },
+      400,
+      300,
+      0,
+      0,
+      416,
+      320
+    ),
+    { x: 200, y: 150 }
+  )
+})
+
+test('insertion boundaries account for removing the dragged item first', () => {
+  assert.equal(calculateReorderDestinationIndex(5, 0, 3), 2)
+  assert.equal(calculateReorderDestinationIndex(5, 4, 1), 1)
+  assert.equal(calculateReorderDestinationIndex(5, 2, 2), -1)
+  assert.equal(calculateReorderDestinationIndex(5, 2, 3), -1)
+  assert.equal(calculateReorderDestinationIndex(5, 2, 5), 4)
+})
+
+test('gallery reorder hit testing covers card centers, sides, and grid gaps', () => {
+  const metrics = calculateGalleryMetrics(400, 100, 10)
+  const firstCenter = calculateGalleryDropIntent(5, metrics, metrics.cardWidth / 2, 20)
+  assert.deepEqual(firstCenter, { type: 'card', targetIndex: 0 })
+
+  const firstLeft = calculateGalleryDropIntent(5, metrics, 1, 20)
+  assert.equal(firstLeft.type, 'insertion')
+  assert.equal(firstLeft.insertionIndex, 0)
+  assert.equal(firstLeft.orientation, 'vertical')
+
+  const exactFirstBorder = calculateGalleryDropIntent(5, metrics, metrics.cardWidth, 20)
+  assert.equal(exactFirstBorder.type, 'insertion')
+  assert.equal(exactFirstBorder.insertionIndex, 1)
+  assert.equal(exactFirstBorder.left, metrics.cardWidth)
+
+  const firstGap = calculateGalleryDropIntent(5, metrics, metrics.cardWidth + 4, 20)
+  assert.equal(firstGap.type, 'insertion')
+  assert.equal(firstGap.insertionIndex, 1)
+
+  const rowGap = calculateGalleryDropIntent(5, metrics, 40, metrics.cardHeight + 5)
+  assert.equal(rowGap.type, 'insertion')
+  assert.equal(rowGap.insertionIndex, 3)
+  assert.equal(rowGap.orientation, 'horizontal')
+
+  const afterLast = calculateGalleryDropIntent(5, metrics, metrics.width, metrics.rowStride + 20)
+  assert.equal(afterLast.type, 'insertion')
+  assert.equal(afterLast.insertionIndex, 5)
 })
 
 test('the German Entf key maps to unmodified Delete for conveyor removal', () => {
