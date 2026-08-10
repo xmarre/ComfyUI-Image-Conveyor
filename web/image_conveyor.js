@@ -3,23 +3,32 @@ import { api } from '../../scripts/api.js'
 import '../../scripts/domWidget.js'
 import {
   CARD_FOOTER_HEIGHT,
+  calculateAutoQueueExtraExecutions,
   calculateGalleryDropIntent,
   calculateMarqueeGridIndexes,
   calculateGalleryMetrics,
   calculateReorderDestinationIndex,
   calculateVisibleCardRange,
-  clientPointToScrollContent,
   chooseViewAfterClose,
+  clientPointToScrollContent,
+  completeExecutionGroupCount,
   dispatchKeyboundCommandFallback,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
   isGalleryViewportMeasurable,
   isHighVelocityScroll,
   isConveyorGalleryShortcut,
+  makeQueueReservationPayload,
+  markReservedGroupQueued,
+  normalizeImagesPerExecution,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
+  processedItemIdsFromDelta,
+  queueReservationMembers,
   restoreGraphCanvasFocus,
+  selectExecutionGroup,
+  shouldReanchorGalleryResize,
   isConveyorDeleteShortcut
 } from './image_conveyor_math.mjs'
 
@@ -174,7 +183,8 @@ function defaultState() {
     items: [],
     auto_queue: false,
     dont_consume: false,
-    catch_canvas_drops: false
+    catch_canvas_drops: false,
+    images_per_execution: 1
   }
 }
 
@@ -229,7 +239,8 @@ function parseState(raw) {
     items,
     auto_queue: Boolean(state.auto_queue),
     dont_consume: Boolean(state.dont_consume),
-    catch_canvas_drops: Boolean(state.catch_canvas_drops)
+    catch_canvas_drops: Boolean(state.catch_canvas_drops),
+    images_per_execution: normalizeImagesPerExecution(state.images_per_execution ?? 1)
   }
 }
 
@@ -270,7 +281,8 @@ function serializeState(state) {
       items: state.items,
       auto_queue: Boolean(state.auto_queue),
       dont_consume: Boolean(state.dont_consume),
-      catch_canvas_drops: Boolean(state.catch_canvas_drops)
+      catch_canvas_drops: Boolean(state.catch_canvas_drops),
+      images_per_execution: normalizeImagesPerExecution(state.images_per_execution)
     },
     null,
     0
@@ -472,11 +484,16 @@ function findFirstByStatus(state, statuses) {
   return state.items.find((item) => statuses.includes(item.status)) ?? null
 }
 
+function findNextLoadGroup(state) {
+  return selectExecutionGroup(
+    state.items,
+    state.images_per_execution,
+    state.dont_consume
+  )
+}
+
 function findNextLoadItem(state) {
-  if (state.dont_consume) {
-    return findFirstByStatus(state, ['pending', 'queued']) ?? state.items[0] ?? null
-  }
-  return findFirstByStatus(state, ['pending'])
+  return findNextLoadGroup(state)[0] ?? null
 }
 
 function countItemsByStatus(state, status) {
@@ -520,8 +537,10 @@ const autoQueueCoordinator = {
       const { state } = getCurrentState(node)
       if (!state.auto_queue || state.dont_consume) continue
       const pendingCount = countItemsByStatus(state, 'pending')
-      if (pendingCount <= 0) continue
-      eligible.push({ node, pendingCount })
+      const imagesPerExecution = normalizeImagesPerExecution(state.images_per_execution)
+      const completeGroups = completeExecutionGroupCount(pendingCount, imagesPerExecution)
+      if (completeGroups <= 0) continue
+      eligible.push({ node, pendingCount, imagesPerExecution, completeGroups })
     }
     return eligible
   },
@@ -537,7 +556,7 @@ const autoQueueCoordinator = {
       if (eligibleNodes.length > 1 && !this.warnedAboutMultipleNodes) {
         this.warnedAboutMultipleNodes = true
         console.warn(
-          'Image Conveyor: auto-queue is only applied when exactly one conveyor node with pending items has auto-queue enabled.'
+          'Image Conveyor: auto-queue is only applied when exactly one conveyor node with complete pending groups has auto-queue enabled.'
         )
       }
       if (eligibleNodes.length <= 1) {
@@ -552,15 +571,19 @@ const autoQueueCoordinator = {
       1,
       Math.floor(Number(event?.detail?.batchCount) || 1)
     )
-    const { pendingCount } = eligibleNodes[0]
-    const extraCount = pendingCount - requestedBatchCount
+    const { pendingCount, imagesPerExecution } = eligibleNodes[0]
+    const extraCount = calculateAutoQueueExtraExecutions(
+      pendingCount,
+      imagesPerExecution,
+      requestedBatchCount
+    )
     if (extraCount <= 0) return
 
     this.pendingInternalQueueRequests += 1
     queueMicrotask(() => {
       void app.queuePrompt(0, extraCount).catch((error) => {
         console.error(
-          'Image Conveyor: failed to auto-queue remaining pending images.',
+          'Image Conveyor: failed to auto-queue remaining complete image groups.',
           error
         )
       })
@@ -1659,6 +1682,7 @@ function ensureStyles() {
     .bil-settings-row { flex-wrap: wrap; padding: 0 7px 7px; }
     .bil-toggle { display: inline-flex; align-items: center; gap: 5px; user-select: none; white-space: nowrap; }
     .bil-toggle input { margin: 0; }
+    .bil-images-per-execution { max-width: 52px; padding-left: 5px; padding-right: 5px; }
     .bil-list { position: relative; min-height: 0; overflow: auto; flex: 1 1 0; overscroll-behavior: contain; outline: none; }
     .bil-list-inner, .bil-list-window { position: relative; min-height: 100%; }
     .bil-selection-marquee { position: absolute; z-index: 4; pointer-events: none; box-sizing: border-box; border: 1px solid rgba(125,185,255,.95); background: rgba(80,145,225,.18); box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); }
@@ -1706,12 +1730,19 @@ function ensureStyles() {
 
 function applyBackendDelta(node, delta) {
   if (!delta || typeof delta !== 'object') return
+  const processedIds = processedItemIdsFromDelta(delta)
+  if (!processedIds.length) return
   const { state, uiState } = getCurrentState(node)
-  const item = state.items.find((entry) => entry.id === delta.processed_item_id)
-  if (!item || delta.consumed === false) return
-  item.status = delta.new_status === 'processed' ? 'processed' : item.status
-  item.last_processed_at = Date.now()
-  updateState(node, state, uiState, { rerender: true })
+  const processedSet = new Set(processedIds)
+  const now = Date.now()
+  let changed = false
+  for (const item of state.items) {
+    if (!processedSet.has(item.id)) continue
+    item.status = delta.new_status === 'processed' ? 'processed' : item.status
+    item.last_processed_at = now
+    changed = true
+  }
+  if (changed) updateState(node, state, uiState, { rerender: true })
 }
 
 function attachQueueLifecycle(node) {
@@ -1723,28 +1754,31 @@ function attachQueueLifecycle(node) {
 
   queueWidget.beforeQueued = () => {
     const { state } = getCurrentState(node)
-    const item = findNextLoadItem(state)
+    const count = normalizeImagesPerExecution(state.images_per_execution)
+    const group = findNextLoadGroup(state)
     updateQueueWidget(
       node,
-      item
-        ? {
-            id: item.id,
-            annotated: item.annotated
-          }
-        : null
+      group.length === count ? makeQueueReservationPayload(group) : null
     )
   }
 
   queueWidget.afterQueued = () => {
     const queuePayload = safeJsonParse(queueWidget.value, {})
-    if (!queuePayload?.id) return
+    const members = queueReservationMembers(queuePayload)
+    if (!members.length) return
     const { state, uiState } = getCurrentState(node)
     if (state.dont_consume) return
-    const item = state.items.find((entry) => entry.id === queuePayload.id)
-    if (!item) return
-    item.status = 'queued'
-    item.last_queued_at = Date.now()
-    updateState(node, state, uiState, { rerender: true })
+    if (Array.isArray(queuePayload.items)) {
+      const byId = new Map(state.items.map((item) => [item.id, item]))
+      if (!members.every((member) => byId.get(member.id)?.annotated === member.annotated)) return
+    }
+    const changed = markReservedGroupQueued(
+      state.items,
+      queuePayload,
+      false,
+      Date.now()
+    )
+    if (changed) updateState(node, state, uiState, { rerender: true })
   }
 }
 
@@ -2804,6 +2838,7 @@ function renderGalleryNode(node) {
   ctx.autoQueueCheckbox.checked = Boolean(state.auto_queue)
   ctx.dontConsumeCheckbox.checked = Boolean(state.dont_consume)
   ctx.canvasDropCheckbox.checked = Boolean(state.catch_canvas_drops)
+  ctx.imagesPerExecutionSelect.value = String(normalizeImagesPerExecution(state.images_per_execution))
 
   if (!ctx.visibleItems.length) {
     hideUnusedCards(ctx); ctx.renderedRangeKey = ''
@@ -3131,13 +3166,28 @@ function buildGalleryDom(node) {
   const autoQueue = makeToggle('Auto queue all pending', 'Auto queue all pending images')
   const dontConsume = makeToggle("Don't consume", 'Do not consume images')
   const canvasDrop = makeToggle('Catch canvas drops', 'Catch image drops anywhere on the canvas')
+  const imagesPerExecutionLabel = document.createElement('label')
+  imagesPerExecutionLabel.className = 'bil-toggle'
+  const imagesPerExecutionText = document.createElement('span')
+  imagesPerExecutionText.textContent = 'Images per execution'
+  const imagesPerExecutionSelect = document.createElement('select')
+  imagesPerExecutionSelect.className = 'bil-select bil-images-per-execution'
+  imagesPerExecutionSelect.setAttribute('aria-label', 'Images per execution')
+  imagesPerExecutionSelect.title = 'Number of consecutive Conveyor images returned by each execution. 1 keeps the normal single-image behavior; 2-9 expose additional images through image_2 ... image_9.'
+  for (let count = 1; count <= 9; count += 1) {
+    const option = document.createElement('option')
+    option.value = String(count)
+    option.textContent = String(count)
+    imagesPerExecutionSelect.appendChild(option)
+  }
+  imagesPerExecutionLabel.append(imagesPerExecutionText, imagesPerExecutionSelect)
   const selectVisibleBtn = document.createElement('button'); selectVisibleBtn.className = 'bil-btn'; selectVisibleBtn.type = 'button'; selectVisibleBtn.textContent = 'Select all'
   const clearQueuedBtn = document.createElement('button'); clearQueuedBtn.className = 'bil-btn'; clearQueuedBtn.type = 'button'; clearQueuedBtn.textContent = 'Clear queued'
   const clearProcessedBtn = document.createElement('button'); clearProcessedBtn.className = 'bil-btn'; clearProcessedBtn.type = 'button'; clearProcessedBtn.textContent = 'Remove processed'
   const jumpPendingBtn = document.createElement('button'); jumpPendingBtn.className = 'bil-btn'; jumpPendingBtn.type = 'button'; jumpPendingBtn.textContent = 'Jump to next pending'
   const cleanDuplicatesBtn = document.createElement('button'); cleanDuplicatesBtn.className = 'bil-btn'; cleanDuplicatesBtn.type = 'button'; cleanDuplicatesBtn.textContent = 'Clean exact duplicates'
   cleanDuplicatesBtn.title = 'Preview and remove byte-identical redundant files from the legacy input/image_conveyor folder'
-  settingsRow.append(autoQueue.label, dontConsume.label, canvasDrop.label, selectVisibleBtn, clearQueuedBtn, clearProcessedBtn, jumpPendingBtn, cleanDuplicatesBtn)
+  settingsRow.append(autoQueue.label, dontConsume.label, imagesPerExecutionLabel, canvasDrop.label, selectVisibleBtn, clearQueuedBtn, clearProcessedBtn, jumpPendingBtn, cleanDuplicatesBtn)
   settings.append(settingsSummary, settingsRow)
 
   const list = document.createElement('div')
@@ -3166,7 +3216,8 @@ function buildGalleryDom(node) {
     contextLabel, setPendingBtn, setProcessedBtn, deleteSelectedBtn, contextAddBtn,
     cleanDuplicatesBtn,
     autoQueueCheckbox: autoQueue.checkbox, dontConsumeCheckbox: dontConsume.checkbox,
-    canvasDropCheckbox: canvasDrop.checkbox, list, listInner, listWindow, selectionMarquee, dropIndicator,
+    canvasDropCheckbox: canvasDrop.checkbox, imagesPerExecutionSelect,
+    list, listInner, listWindow, selectionMarquee, dropIndicator,
     browser: createBrowserState(), visibleItems: [], cardPool: [],
     draggedId: null, dragIntent: null, empty: null, state: null, uiState: null, renderVersion: 0,
     inputVersion: 0, renderedRangeKey: '', renderFrame: 0, renderViewportOnly: false,
@@ -3175,6 +3226,7 @@ function buildGalleryDom(node) {
     deferThumbnailLoads: false, scrollSettleTimer: 0,
     scrollSampleTop: 0, scrollSampleAt: 0,
     listResizeObserver: null, widgetOuterHeight: 0, widgetInnerHeight: 0, widgetWidth: 0,
+    resizeAnchorWidgetWidth: 0,
     pointerInside: false, middlePanPointerId: null, documentPasteHandler: null,
     documentMiddlePanMoveHandler: null, documentMiddlePanEndHandler: null,
     documentMarqueeMoveHandler: null, documentMarqueeEndHandler: null,
@@ -3337,6 +3389,12 @@ function buildGalleryDom(node) {
   })
   autoQueue.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.auto_queue = autoQueue.checkbox.checked; updateState(node, state, uiState) })
   dontConsume.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.dont_consume = dontConsume.checkbox.checked; updateState(node, state, uiState) })
+  imagesPerExecutionSelect.addEventListener('change', () => {
+    const { state, uiState } = getRenderableState(node)
+    state.images_per_execution = normalizeImagesPerExecution(imagesPerExecutionSelect.value)
+    imagesPerExecutionSelect.value = String(state.images_per_execution)
+    updateState(node, state, uiState)
+  })
   canvasDrop.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.catch_canvas_drops = canvasDrop.checkbox.checked; updateState(node, state, uiState) })
   clearQueuedBtn.addEventListener('click', () => { const { state, uiState } = getRenderableState(node); for (const item of state.items) if (item.status === 'queued') item.status = 'pending'; updateState(node, state, uiState) })
   clearProcessedBtn.addEventListener('click', () => {
@@ -3403,6 +3461,9 @@ function buildGalleryDom(node) {
         suspendGalleryViewport(ctx)
         return
       }
+      const previousWidgetWidth = ctx.resizeAnchorWidgetWidth || ctx.widgetWidth
+      const currentWidgetWidth = ctx.widgetWidth
+      ctx.resizeAnchorWidgetWidth = currentWidgetWidth
       const resuming = ctx.galleryViewportSuspended
       if (resuming && ctx.pendingScrollRestore?.view !== ctx.browser.activeView) {
         ctx.pendingScrollRestore = {
@@ -3421,7 +3482,12 @@ function buildGalleryDom(node) {
       ctx.renderedRangeKey = ''
       scheduleRenderNode(node, { viewportOnly: true, forceVisibleRows: true })
       if (resuming) return
-      if (anchorId && previous && previous.width !== Math.floor(list.clientWidth || 0)) {
+      if (anchorId && previous && shouldReanchorGalleryResize(
+        previousWidgetWidth,
+        currentWidgetWidth,
+        previous.width,
+        Math.floor(list.clientWidth || 0)
+      )) {
         const view = ctx.browser.activeView
         const viewportEpoch = ctx.galleryViewportEpoch
         requestAnimationFrame(() => {
