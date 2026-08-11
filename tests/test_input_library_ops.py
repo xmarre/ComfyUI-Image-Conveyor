@@ -5,6 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path, PurePosixPath
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -128,6 +129,29 @@ class InputLibraryOperationsTest(unittest.TestCase):
         character = self.registry.ensure_for_presets(self.service.preset_store.list())[0]
         self.assertEqual(character["members"], ["characters/mara/a.png"])
 
+    def test_move_rolls_back_file_and_character_metadata_if_preset_write_fails(self):
+        source = self.write_image("source/a.png", b"payload")
+        preset = self.service.preset_store.create("Mara", slots(reference("source/a.png")))
+        self.registry.ensure_for_presets(self.service.preset_store.list())
+        self.registry.add_members(preset["id"], ["source/a.png"])
+
+        with mock.patch.object(
+            self.service.preset_store,
+            "_write_unlocked",
+            side_effect=OSError("preset storage locked"),
+        ):
+            with self.assertRaises(OSError):
+                ops.move_input_files(self.service, ["source/a.png"], "destination")
+
+        destination = self.input_root / "destination" / "a.png"
+        self.assertTrue(source.is_file())
+        self.assertEqual(source.read_bytes(), b"payload")
+        self.assertFalse(destination.exists())
+        saved = self.service.preset_store.list()[0]
+        self.assertEqual(saved["slots"][0]["annotated"], "source/a.png [input]")
+        character = self.registry.ensure_for_presets(self.service.preset_store.list())[0]
+        self.assertEqual(character["members"], ["source/a.png"])
+
     def test_move_protects_queued_paths_without_touching_them(self):
         source = self.write_image("source/a.png")
         result = ops.move_input_files(
@@ -179,6 +203,24 @@ class InputLibraryOperationsTest(unittest.TestCase):
         self.assertIsNone(self.service.preset_store.list()[0]["slots"][0])
         character = self.registry.ensure_for_presets(self.service.preset_store.list())[0]
         self.assertEqual(character["members"], [])
+
+    def test_delete_restores_file_if_preset_write_fails(self):
+        source = self.write_image("source/a.png", b"payload")
+        self.service.preset_store.create("Mara", slots(reference("source/a.png")))
+
+        with mock.patch.object(
+            self.service.preset_store,
+            "_write_unlocked",
+            side_effect=OSError("preset storage locked"),
+        ):
+            with self.assertRaises(OSError):
+                ops.delete_input_files(self.service, ["source/a.png"])
+
+        self.assertTrue(source.is_file())
+        self.assertEqual(source.read_bytes(), b"payload")
+        self.assertFalse(any(source.parent.glob(".image-conveyor-delete-*.tmp")))
+        saved = self.service.preset_store.list()[0]
+        self.assertEqual(saved["slots"][0]["annotated"], "source/a.png [input]")
 
     def test_delete_protects_queued_path(self):
         source = self.write_image("source/a.png")
