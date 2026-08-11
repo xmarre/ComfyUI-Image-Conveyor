@@ -1178,6 +1178,46 @@ class InputLibrary:
             self._prune_thumbnails()
         return target, etag
 
+    def image_properties(self, relative_path: str) -> Dict[str, Any]:
+        relative = normalize_relative_path(relative_path)
+        if Path(relative).suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            raise InvalidInputPath("Unsupported image source.")
+        source = resolve_under_root(self.input_root, relative, must_exist=True)
+        stat = os.stat(source)
+
+        from PIL import Image, UnidentifiedImageError
+
+        try:
+            with Image.open(source) as opened:
+                width, height = opened.size
+                try:
+                    orientation = opened.getexif().get(274)
+                except (AttributeError, OSError, ValueError):
+                    orientation = None
+                if orientation in {5, 6, 7, 8}:
+                    width, height = height, width
+                image_format = str(opened.format or Path(relative).suffix.lstrip(".")).upper()
+                mode = str(opened.mode or "")
+                frames = max(1, int(getattr(opened, "n_frames", 1) or 1))
+        except UnidentifiedImageError as exc:
+            raise InvalidThumbnail("The image source is not readable.") from exc
+        except OSError as exc:
+            if exc.errno is not None:
+                raise
+            raise InvalidThumbnail("The image source is not readable.") from exc
+
+        return {
+            "relative_path": relative,
+            "filename": PurePosixPath(relative).name,
+            "format": image_format,
+            "mode": mode,
+            "width": width,
+            "height": height,
+            "frames": frames,
+            "size": stat.st_size,
+            "mtime_ms": stat.st_mtime_ns // 1_000_000,
+        }
+
 
 _SERVICE_LOCK = threading.Lock()
 _SERVICE: Optional[InputLibrary] = None
@@ -1490,5 +1530,22 @@ def register_routes() -> None:
                 "Cache-Control": cache_control,
             },
         )
+
+    @routes.get("/image-conveyor/image-properties")
+    async def image_conveyor_image_properties(request):
+        service = get_service(folder_paths)
+        relative_path = request.rel_url.query.get("relative_path", "")
+        try:
+            properties = await asyncio.to_thread(service.image_properties, relative_path)
+        except FileNotFoundError:
+            return web.json_response({"error": "Image not found."}, status=404)
+        except InvalidInputPath as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except InvalidThumbnail as exc:
+            return web.json_response({"error": str(exc)}, status=415)
+        except Exception:
+            LOGGER.exception("Image Conveyor failed to inspect an image.")
+            return web.json_response({"error": "Unable to inspect the image."}, status=500)
+        return web.json_response(properties)
 
     _ROUTES_REGISTERED = True

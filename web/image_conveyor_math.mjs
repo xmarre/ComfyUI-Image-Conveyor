@@ -663,6 +663,20 @@ export function updateReferenceSlot(slots, index, value) {
   return normalized
 }
 
+export function moveReferenceSlot(slots, fromIndex, toIndex) {
+  const normalized = normalizeReferenceSlots(slots)
+  const from = Math.trunc(Number(fromIndex))
+  const to = Math.trunc(Number(toIndex))
+  if (
+    from < 0 || from >= REFERENCE_SLOT_COUNT ||
+    to < 0 || to >= REFERENCE_SLOT_COUNT ||
+    from === to || normalized[from] == null
+  ) return normalized
+  const [moved] = normalized.splice(from, 1)
+  normalized.splice(to, 0, moved)
+  return normalized
+}
+
 export function applyReferenceAssignments(state, startIndex, references) {
   const source = state && typeof state === 'object' ? state : {}
   const next = { ...source, reference_slots: normalizeReferenceSlots(source.reference_slots) }

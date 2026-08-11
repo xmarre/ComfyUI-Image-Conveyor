@@ -250,7 +250,16 @@ class ImageConveyorStateTest(unittest.TestCase):
             conveyor.ImageConveyor.RETURN_NAMES[:6],
         )
         self.assertEqual(
-            ("image_2", "image_3", "image_4", "image_5", "image_6", "image_7", "image_8", "image_9"),
+            (
+                "ref_image_1",
+                "ref_image_2",
+                "ref_image_3",
+                "ref_image_4",
+                "ref_image_5",
+                "ref_image_6",
+                "ref_image_7",
+                "ref_image_8",
+            ),
             conveyor.ImageConveyor.RETURN_NAMES[6:],
         )
         self.assertEqual(("IMAGE",) * 8, conveyor.ImageConveyor.RETURN_TYPES[6:])
@@ -289,6 +298,11 @@ class ImageConveyorStateTest(unittest.TestCase):
         self.assertEqual([None] * 5, list(result[9:]))
         self.assertEqual(1, result[4])
         self.assertEqual(["A.png [input]", "R1.png [input]", "R3.png [input]"], FakeLoadImage.calls)
+        output_by_name = dict(zip(conveyor.ImageConveyor.RETURN_NAMES, result))
+        self.assertEqual("image:A.png [input]", output_by_name["image"])
+        self.assertEqual("image:R1.png [input]", output_by_name["ref_image_1"])
+        self.assertIsNone(output_by_name["ref_image_2"])
+        self.assertEqual("image:R3.png [input]", output_by_name["ref_image_3"])
         delta = json.loads(conveyor.ImageConveyor().load_next(
             self.state(entries, output_mode="persistent_refs", reference_slots=refs)
         )["ui"]["batch_image_loader_delta"][0])

@@ -9,6 +9,7 @@ import {
   classifyReferenceDrag,
   effectiveQueueGroupSize,
   loadPresetSnapshot,
+  moveReferenceSlot,
   normalizeOutputMode,
   normalizeReferenceSlots,
   referenceShelfHit,
@@ -79,6 +80,19 @@ test('sparse assignment clamps to the fixed slot range', () => {
   assert.equal(next.reference_slots.length, 8)
   assert.deepEqual(next.reference_slots[0], reference('existing'))
   assert.deepEqual(next.reference_slots[7], reference('last'))
+})
+
+test('reference shelf drag-sort moves one populated slot and preserves sparse order', () => {
+  const slots = [reference('a'), reference('b'), null, reference('d')]
+  assert.deepEqual(
+    moveReferenceSlot(slots, 0, 2).slice(0, 4),
+    [reference('b'), null, reference('a'), reference('d')]
+  )
+  assert.deepEqual(
+    moveReferenceSlot(slots, 3, 0).slice(0, 4),
+    [reference('d'), reference('a'), reference('b'), null]
+  )
+  assert.deepEqual(moveReferenceSlot(slots, 2, 0), normalizeReferenceSlots(slots))
 })
 
 test('preset snapshots are detached normalized copies and dirty comparison is exact', () => {

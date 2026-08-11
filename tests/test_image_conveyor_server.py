@@ -649,6 +649,34 @@ class InputLibraryTest(unittest.TestCase):
         self.assertNotEqual(first_path, third_path)
         self.assertEqual({}, self.library._thumbnail_locks)
 
+    def test_image_properties_reports_display_dimensions_and_file_metadata(self):
+        if importlib.util.find_spec("PIL") is None:
+            self.skipTest("Pillow is not installed")
+        from PIL import Image
+
+        path = self.write_input("properties/portrait.png", b"")
+        Image.new("RGBA", (17, 29), (10, 20, 30, 128)).save(path)
+
+        properties = self.library.image_properties("properties/portrait.png")
+
+        self.assertEqual("properties/portrait.png", properties["relative_path"])
+        self.assertEqual("portrait.png", properties["filename"])
+        self.assertEqual("PNG", properties["format"])
+        self.assertEqual("RGBA", properties["mode"])
+        self.assertEqual((17, 29), (properties["width"], properties["height"]))
+        self.assertEqual(1, properties["frames"])
+        self.assertEqual(os.path.getsize(path), properties["size"])
+        self.assertGreater(properties["mtime_ms"], 0)
+
+    def test_image_properties_rejects_escape_and_unreadable_media(self):
+        if importlib.util.find_spec("PIL") is None:
+            self.skipTest("Pillow is not installed")
+        with self.assertRaises(server.InvalidInputPath):
+            self.library.image_properties("../outside.png")
+        self.write_input("broken.png", b"not an image")
+        with self.assertRaises(server.InvalidThumbnail):
+            self.library.image_properties("broken.png")
+
     def test_unreadable_thumbnail_source_is_classified_as_invalid_media(self):
         if importlib.util.find_spec("PIL") is None:
             self.skipTest("Pillow is not installed")

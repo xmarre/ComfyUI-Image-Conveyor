@@ -25,6 +25,7 @@ import {
   isConveyorGalleryShortcut,
   makeQueueReservationPayload,
   markReservedGroupQueued,
+  moveReferenceSlot,
   normalizeImagesPerExecution,
   normalizeOutputMode,
   normalizeReferenceSlot,
@@ -1873,6 +1874,14 @@ function ensureStyles() {
     .bil-lightbox img { max-width: 94vw; max-height: 90vh; object-fit: contain; box-shadow: 0 18px 60px rgba(0,0,0,.45); }
     .bil-lightbox-label { position: absolute; left: 24px; bottom: 18px; right: 70px; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .bil-lightbox-close { position: absolute; top: 18px; right: 20px; font-size: 24px; color: white; background: rgba(255,255,255,.12); border: 0; border-radius: 8px; width: 38px; height: 38px; cursor: pointer; }
+    .bil-image-menu { position: fixed; z-index: 100002; width: min(300px, calc(100vw - 16px)); padding: 7px; box-sizing: border-box; border: 1px solid rgba(255,255,255,.22); border-radius: 9px; background: #202124; color: #f0f0f0; box-shadow: 0 14px 40px rgba(0,0,0,.48); font: 12px/1.35 system-ui, sans-serif; }
+    .bil-image-menu-title { padding: 4px 7px 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 680; }
+    .bil-image-menu-properties { padding: 2px 7px 7px; color: rgba(255,255,255,.68); overflow-wrap: anywhere; }
+    .bil-image-menu-properties > div + div { margin-top: 2px; }
+    .bil-image-menu-separator { height: 1px; margin: 5px 3px; background: rgba(255,255,255,.12); }
+    .bil-image-menu button { display: block; width: 100%; border: 0; border-radius: 6px; padding: 6px 7px; background: transparent; color: inherit; text-align: left; font: inherit; cursor: pointer; }
+    .bil-image-menu button:hover, .bil-image-menu button:focus-visible { background: rgba(120,175,240,.18); outline: none; }
+    .bil-image-menu button.bil-danger { color: #ffaaaa; }
     @media (max-width: 600px) { .bil-browserbar { grid-template-columns: minmax(100px,1fr) auto auto; } .bil-browserbar .bil-size-select { display: none; } }
   `
   document.head.appendChild(style)
@@ -2393,6 +2402,195 @@ function openPreview(node, item) {
   ctx.lightbox.close.focus({ preventScroll: true })
 }
 
+function closeImageContextMenu(ctx) {
+  if (!ctx) return
+  if (ctx.imageContextMenuDismiss) {
+    document.removeEventListener('pointerdown', ctx.imageContextMenuDismiss.pointerdown, true)
+    document.removeEventListener('keydown', ctx.imageContextMenuDismiss.keydown, true)
+    window.removeEventListener('blur', ctx.imageContextMenuDismiss.blur)
+    ctx.imageContextMenuDismiss = null
+  }
+  ctx.imageContextMenu?.remove?.()
+  ctx.imageContextMenu = null
+}
+
+function localImageProperties(ctx, item) {
+  const file = item?.localFile
+  if (!(file instanceof File)) return Promise.reject(new Error('Local image metadata is unavailable.'))
+  const extension = String(file.name || '').split('.').at(-1)?.toUpperCase() || ''
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    image.onload = () => resolve({
+      relative_path: item.relative_path || file.name,
+      filename: file.name,
+      format: String(file.type || '').split('/').at(-1)?.toUpperCase() || extension,
+      mode: '',
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+      frames: 1,
+      size: file.size,
+      mtime_ms: file.lastModified
+    })
+    image.onerror = () => reject(new Error('Unable to read image properties.'))
+    image.src = localObjectUrl(ctx, item)
+  })
+}
+
+async function requestImageProperties(node, item) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) throw new Error('The node is no longer available.')
+  if (item?.localFile) return await localImageProperties(ctx, item)
+  const relativePath = getInputRelativePath(item)
+  if (!relativePath) throw new Error('Properties are only available for input images.')
+  const params = new URLSearchParams({ relative_path: relativePath })
+  const response = await api.fetchApi(`/image-conveyor/image-properties?${params.toString()}`)
+  return await readJsonResponse(response, 'Unable to read image properties')
+}
+
+function imagePropertyLines(properties, item) {
+  const summary = []
+  const width = Number(properties?.width)
+  const height = Number(properties?.height)
+  if (width > 0 && height > 0) summary.push(`${width} × ${height}`)
+  const format = String(properties?.format || '').trim()
+  if (format) summary.push(format)
+  const bytes = Number(properties?.size ?? item?.size ?? item?.localFile?.size)
+  if (Number.isFinite(bytes) && bytes >= 0) summary.push(formatByteCount(bytes))
+  const frames = Math.max(1, Number(properties?.frames) || 1)
+  if (frames > 1) summary.push(`${frames} frames`)
+
+  const lines = []
+  if (summary.length) lines.push(summary.join(' · '))
+  const modified = Number(properties?.mtime_ms ?? item?.localFile?.lastModified)
+  if (modified > 0) lines.push(`Modified ${new Date(modified).toLocaleString()}`)
+  const path = String(properties?.relative_path || getInputRelativePath(item) || item?.relative_path || '').trim()
+  if (path) lines.push(path)
+  return lines
+}
+
+function mutateConveyorContextItem(node, itemId, action) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return
+  const { state, uiState } = getRenderableState(node)
+  const item = state.items.find((entry) => entry.id === itemId)
+  if (!item) return
+  if (action === 'pending' || action === 'processed') {
+    item.status = action
+    if (action === 'processed') item.last_processed_at = Date.now()
+  } else if (action === 'remove') {
+    state.items = state.items.filter((entry) => entry.id !== itemId)
+    ctx.browser.conveyor.selected.delete(itemId)
+    uiState.selected_ids = uiState.selected_ids.filter((id) => id !== itemId)
+    delete uiState.source_paths[itemId]
+  }
+  updateState(node, state, uiState)
+}
+
+function showImageContextMenu(node, item, clientX, clientY, options = {}) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed || !item || item.kind === 'folder') return false
+  closeImageContextMenu(ctx)
+  closePresetPopover(ctx)
+
+  const menu = document.createElement('div')
+  menu.className = 'bil-image-menu'
+  menu.setAttribute('role', 'menu')
+  menu.addEventListener('contextmenu', (event) => event.preventDefault())
+  const title = document.createElement('div')
+  title.className = 'bil-image-menu-title'
+  title.textContent = item.filename || item.relative_path || getItemDisplayPath(item)
+  const properties = document.createElement('div')
+  properties.className = 'bil-image-menu-properties'
+  properties.textContent = 'Loading properties…'
+  menu.append(title, properties)
+
+  const addSeparator = () => {
+    const separator = document.createElement('div')
+    separator.className = 'bil-image-menu-separator'
+    separator.setAttribute('role', 'separator')
+    menu.appendChild(separator)
+  }
+  const addAction = (label, handler, { danger = false } = {}) => {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.setAttribute('role', 'menuitem')
+    button.textContent = label
+    if (danger) button.classList.add('bil-danger')
+    button.addEventListener('click', async () => {
+      try {
+        await handler()
+      } catch (error) {
+        window.alert(error?.message || 'The image action failed.')
+      } finally {
+        closeImageContextMenu(ctx)
+      }
+    })
+    menu.appendChild(button)
+    return button
+  }
+
+  addSeparator()
+  const openButton = addAction('Open full resolution', () => openPreview(node, item))
+  addAction('Copy image path', async () => {
+    const path = getInputRelativePath(item) || item.relative_path || getItemDisplayPath(item)
+    if (!path || !navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable.')
+    await navigator.clipboard.writeText(path)
+  })
+
+  const referenceIndex = Number.isInteger(options.referenceIndex) ? options.referenceIndex : null
+  if (referenceIndex != null) {
+    addSeparator()
+    addAction('Clear reference', () => clearReferenceSlot(node, referenceIndex), { danger: true })
+  } else if (options.view === 'conveyor') {
+    addSeparator()
+    addAction('Mark pending', () => mutateConveyorContextItem(node, options.itemId, 'pending'))
+    addAction('Mark processed', () => mutateConveyorContextItem(node, options.itemId, 'processed'))
+    addAction('Remove from Conveyor', () => mutateConveyorContextItem(node, options.itemId, 'remove'), { danger: true })
+  } else {
+    addSeparator()
+    addAction('Add to Conveyor', () => addLibraryEntries(node, [item]))
+  }
+
+  document.body.appendChild(menu)
+  const x = Math.max(8, Number(clientX) || 8)
+  const y = Math.max(8, Number(clientY) || 8)
+  menu.style.left = `${x}px`
+  menu.style.top = `${y}px`
+  const rect = menu.getBoundingClientRect()
+  if (rect.right > innerWidth - 8) menu.style.left = `${Math.max(8, innerWidth - rect.width - 8)}px`
+  if (rect.bottom > innerHeight - 8) menu.style.top = `${Math.max(8, innerHeight - rect.height - 8)}px`
+  ctx.imageContextMenu = menu
+
+  const pointerdown = (event) => {
+    if (!menu.contains(event.target)) closeImageContextMenu(ctx)
+  }
+  const keydown = (event) => {
+    if (event.key === 'Escape') closeImageContextMenu(ctx)
+  }
+  const blur = () => closeImageContextMenu(ctx)
+  ctx.imageContextMenuDismiss = { pointerdown, keydown, blur }
+  document.addEventListener('pointerdown', pointerdown, true)
+  document.addEventListener('keydown', keydown, true)
+  window.addEventListener('blur', blur)
+  openButton.focus({ preventScroll: true })
+
+  void requestImageProperties(node, item).then((result) => {
+    if (ctx.imageContextMenu !== menu || ctx.removed) return
+    const lines = imagePropertyLines(result, item)
+    properties.replaceChildren(...(lines.length ? lines : ['Properties unavailable']).map((line) => {
+      const row = document.createElement('div')
+      row.textContent = line
+      return row
+    }))
+    const nextRect = menu.getBoundingClientRect()
+    if (nextRect.bottom > innerHeight - 8) menu.style.top = `${Math.max(8, innerHeight - nextRect.height - 8)}px`
+  }).catch((error) => {
+    if (ctx.imageContextMenu !== menu || ctx.removed) return
+    properties.textContent = error?.message || 'Properties unavailable.'
+  })
+  return true
+}
+
 function clearCardDragTargets(ctx, except = null) {
   for (const slot of ctx.cardPool) {
     if (slot.card !== except) slot.card.classList.remove('bil-drag-target')
@@ -2643,7 +2841,15 @@ function createCardSlot(node, ctx) {
     }
     selectItemFromClick(node, slot.itemId, event)
   })
-  media.addEventListener('dblclick', () => openPreview(node, slot.item))
+  media.addEventListener('contextmenu', (event) => {
+    if (!slot.itemId || slot.item?.kind === 'folder') return
+    event.preventDefault()
+    event.stopPropagation()
+    showImageContextMenu(node, slot.item, event.clientX, event.clientY, {
+      view: ctx.browser.activeView,
+      itemId: slot.itemId
+    })
+  })
   const thumb = document.createElement('img')
   thumb.className = 'bil-thumb'
   thumb.loading = 'lazy'
@@ -3368,7 +3574,7 @@ function buildGalleryDom(node) {
   const imagesPerExecutionSelect = document.createElement('select')
   imagesPerExecutionSelect.className = 'bil-select bil-images-per-execution'
   imagesPerExecutionSelect.setAttribute('aria-label', 'Images per execution')
-  imagesPerExecutionSelect.title = 'Number of consecutive Conveyor images returned by each execution. 1 keeps the normal single-image behavior; 2-9 expose additional images through image_2 ... image_9.'
+  imagesPerExecutionSelect.title = 'Number of consecutive Conveyor images returned by each execution. 1 keeps the normal single-image behavior; 2-9 expose additional images through ref_image_1 ... ref_image_8.'
   for (let count = 1; count <= 9; count += 1) {
     const option = document.createElement('option')
     option.value = String(count)
@@ -3437,9 +3643,11 @@ function buildGalleryDom(node) {
     thumbnailUrlCache: new WeakMap(), localObjectUrls: new Map(), activePickerInput: null,
     referenceShelfLayout: null, referenceLayoutWidth: 0, referenceLayoutWidgetY: 0,
     referenceOutputGutter: 0, referenceOutputGutterKey: '', referenceDragHoverIndex: null,
+    referenceDragSourceIndex: null, referenceShelfPointerDrag: null,
     referenceThumbs: new Map(), presets: [],
     presetsLoaded: false, presetsPromise: null, presetRequestId: 0,
-    presetPopover: null, presetPopoverDismiss: null
+    presetPopover: null, presetPopoverDismiss: null,
+    imageContextMenu: null, imageContextMenuDismiss: null
   }
   const ctx = node.__bil
   ctx.lightbox = createLightbox(node)
@@ -4157,6 +4365,9 @@ function drawReferenceShelf(node, context) {
   const { state } = getRenderableState(node)
   if (state.output_mode !== OUTPUT_MODE_PERSISTENT) {
     ctx.referenceShelfLayout = null
+    ctx.referenceShelfPointerDrag = null
+    ctx.referenceDragSourceIndex = null
+    ctx.referenceDragHoverIndex = null
     return
   }
   const outputGutterKey = JSON.stringify(
@@ -4222,10 +4433,14 @@ function drawReferenceShelf(node, context) {
     const reference = state.reference_slots[index]
     const slot = layout.slots[index]
     roundedRect(context, slot.x, slot.y, slot.width, slot.height, 6)
-    context.fillStyle = reference ? 'rgba(0,0,0,.30)' : 'rgba(255,255,255,.035)'
+    context.fillStyle = ctx.referenceDragSourceIndex === index
+      ? 'rgba(75,140,220,.22)'
+      : reference ? 'rgba(0,0,0,.30)' : 'rgba(255,255,255,.035)'
     context.fill()
     context.strokeStyle = ctx.referenceDragHoverIndex === index
       ? 'rgba(110,180,255,.98)'
+      : ctx.referenceDragSourceIndex === index
+        ? 'rgba(110,180,255,.62)'
       : 'rgba(255,255,255,.15)'
     context.lineWidth = ctx.referenceDragHoverIndex === index ? 2 : 1
     context.stroke()
@@ -4280,6 +4495,72 @@ function referenceShelfEventHit(node, event, localPosition = null) {
   return point ? referenceShelfHit(ctx.referenceShelfLayout, point.x, point.y) : null
 }
 
+function beginReferenceShelfPointerDrag(node, event, localPosition, index) {
+  const ctx = node.__bil
+  const reference = ctx ? getRenderableState(node).state.reference_slots[index] : null
+  const point = eventNodePoint(node, event, localPosition)
+  if (!ctx || !reference || !point) return false
+  ctx.referenceShelfPointerDrag = {
+    pointerId: event?.pointerId ?? null,
+    fromIndex: index,
+    targetIndex: index,
+    startX: point.x,
+    startY: point.y,
+    active: false
+  }
+  ctx.referenceDragSourceIndex = index
+  ctx.referenceDragHoverIndex = null
+  node.setDirtyCanvas?.(true, false)
+  return true
+}
+
+function updateReferenceShelfPointerDrag(node, event, localPosition = null) {
+  const ctx = node.__bil
+  const drag = ctx?.referenceShelfPointerDrag
+  if (!drag || (drag.pointerId != null && event?.pointerId != null && drag.pointerId !== event.pointerId)) return false
+  if (Number.isFinite(event?.buttons) && (event.buttons & 1) === 0) {
+    finishReferenceShelfPointerDrag(node, event)
+    return true
+  }
+  const point = eventNodePoint(node, event, localPosition)
+  if (!point) return true
+  if (!drag.active && Math.hypot(point.x - drag.startX, point.y - drag.startY) >= MARQUEE_DRAG_THRESHOLD) {
+    drag.active = true
+  }
+  let targetIndex = null
+  if (drag.active) {
+    const hit = referenceShelfHit(ctx.referenceShelfLayout, point.x, point.y)
+    if (hit?.type === 'slot' || hit?.type === 'clear') targetIndex = hit.index
+  }
+  drag.targetIndex = targetIndex
+  if (ctx.referenceDragHoverIndex !== targetIndex) {
+    ctx.referenceDragHoverIndex = targetIndex
+    node.setDirtyCanvas?.(true, false)
+  }
+  event.preventDefault?.()
+  event.stopPropagation?.()
+  return true
+}
+
+function finishReferenceShelfPointerDrag(node, event = null) {
+  const ctx = node.__bil
+  const drag = ctx?.referenceShelfPointerDrag
+  if (!drag || (drag.pointerId != null && event?.pointerId != null && drag.pointerId !== event.pointerId)) return false
+  ctx.referenceShelfPointerDrag = null
+  ctx.referenceDragSourceIndex = null
+  ctx.referenceDragHoverIndex = null
+  if (drag.active && drag.targetIndex != null && drag.targetIndex !== drag.fromIndex) {
+    const { state, uiState } = getRenderableState(node)
+    state.reference_slots = moveReferenceSlot(state.reference_slots, drag.fromIndex, drag.targetIndex)
+    updateState(node, state, uiState)
+  } else {
+    node.setDirtyCanvas?.(true, false)
+  }
+  event?.preventDefault?.()
+  event?.stopPropagation?.()
+  return true
+}
+
 function initializeNode(node, widget) {
   if (node.__bilInitialized) return widget
   node.__bilInitialized = true
@@ -4314,10 +4595,19 @@ function initializeNode(node, widget) {
   node.onMouseDown = function (event, localPosition, graphCanvas) {
     const hit = referenceShelfEventHit(node, event, localPosition)
     if (hit) {
+      if (event.button === 2 && (hit.type === 'slot' || hit.type === 'clear')) {
+        const reference = getRenderableState(node).state.reference_slots[hit.index]
+        if (reference) {
+          showImageContextMenu(node, reference, event.clientX, event.clientY, { referenceIndex: hit.index })
+          event.preventDefault?.()
+          event.stopPropagation?.()
+          return true
+        }
+      }
+      if (event.button !== 0) return previousMouseDown?.call(this, event, localPosition, graphCanvas)
       if (hit.type === 'clear') clearReferenceSlot(node, hit.index)
       else if (hit.type === 'slot') {
-        const reference = getRenderableState(node).state.reference_slots[hit.index]
-        if (reference) openPreview(node, reference)
+        beginReferenceShelfPointerDrag(node, event, localPosition, hit.index)
       } else if (hit.type === 'save') {
         void saveActiveReferencePreset(node)
       } else {
@@ -4328,6 +4618,18 @@ function initializeNode(node, widget) {
       return true
     }
     return previousMouseDown?.call(this, event, localPosition, graphCanvas)
+  }
+
+  const previousMouseMove = node.onMouseMove
+  node.onMouseMove = function (event, localPosition, graphCanvas) {
+    if (updateReferenceShelfPointerDrag(node, event, localPosition)) return true
+    return previousMouseMove?.call(this, event, localPosition, graphCanvas)
+  }
+
+  const previousMouseUp = node.onMouseUp
+  node.onMouseUp = function (event, localPosition, graphCanvas) {
+    if (finishReferenceShelfPointerDrag(node, event)) return true
+    return previousMouseUp?.call(this, event, localPosition, graphCanvas)
   }
 
   const previousDragOver = node.onDragOver
@@ -4491,7 +4793,11 @@ function initializeNode(node, widget) {
     ctx.scrollSettleTimer = 0
     ctx.lightbox?.root?.remove?.()
     closePresetPopover(ctx)
+    closeImageContextMenu(ctx)
     if (activeReferenceDrag?.node === node) activeReferenceDrag = null
+    ctx.referenceShelfPointerDrag = null
+    ctx.referenceDragSourceIndex = null
+    ctx.referenceDragHoverIndex = null
     ctx.listResizeObserver?.disconnect?.()
     ctx.listResizeObserver = null
     ctx.clearExternalDragState?.()

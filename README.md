@@ -6,7 +6,7 @@ A sequential, visual image queue for ComfyUI with an integrated input-folder bro
 
 ## What it does
 
-Image Conveyor keeps a visible queue inside the graph and returns one ordered Conveyor image per prompt execution. New nodes use **Persistent references** mode: `image` advances through the Conveyor while the eight-slot **Reference Shelf** above the browser remains fixed and feeds `image_2` through `image_9`. The node starts with two permanent browser tabs:
+Image Conveyor keeps a visible queue inside the graph and returns one ordered Conveyor image per prompt execution. New nodes use **Persistent references** mode: `image` advances through the Conveyor while the eight-slot **Reference Shelf** above the browser remains fixed and feeds `ref_image_1` through `ref_image_8`. The node starts with two permanent browser tabs:
 
 - **Conveyor** is the ordered execution queue. Items retain their pending, queued, and processed states.
 - **Input Folder** browses the current ComfyUI `input/` directory recursively and adds existing images to the queue without uploading, copying, renaming, or serializing the folder listing into the workflow.
@@ -18,10 +18,10 @@ Selected local folders can be opened as additional, removable tabs. Every tab us
 The otherwise unused canvas area above the Conveyor/Input Folder browser contains eight persistent reference slots. The shelf uses the live pre-widget geometry created by ComfyUI's output stack; it does not increase the node's minimum/default height, move the browser down, or reduce the gallery viewport.
 
 - `image` is always the variable main Conveyor image.
-- **Ref 1** through **Ref 8** map exactly to `image_2` through `image_9`.
+- **Ref 1** through **Ref 8** map exactly to `ref_image_1` through `ref_image_8`.
 - Empty slots produce the same inactive `IMAGE` output used by an unused multi-image output.
 - References have no pending, queued, or processed state. They are never reserved or consumed and never affect `remaining_pending` or auto-queue counts.
-- Clicking a populated slot opens its full preview. The slot `×` clears only the assignment; it never deletes an image file or queue item.
+- Left-drag a populated slot to reorder the shelf. Right-click any shelf or browser thumbnail for the shared image menu, including full-resolution preview, image properties, path copying, and context-specific actions. The slot `×` clears only the assignment; it never deletes an image file or queue item.
 
 Assign a reference by dragging an image card onto a slot:
 
@@ -97,7 +97,7 @@ The main browser provides:
 - name/date sorting;
 - direct click selection, Ctrl/Cmd toggling, Shift range selection, and contextual bulk actions;
 - anchored drag-box selection from the gallery background or the gaps between cards, with edge auto-scroll;
-- a larger full-resolution preview on double-click or Enter;
+- a shared right-click image menu with full-resolution preview, concise properties, path copying, and context-specific actions;
 - arrow-key navigation, Home, End, PageUp, PageDown, Space selection, and Escape to close preview;
 - **Jump to next pending**;
 - drag reorder in unfiltered manual Conveyor order.
@@ -131,7 +131,7 @@ Each Conveyor item has one of three states:
 
 ### Persistent references
 
-This is the default for newly created nodes. One main Conveyor item is reserved and selected per execution regardless of the stored `images_per_execution` value. Only that item participates in queue status, consumption, `remaining_pending`, and auto-queue arithmetic. `image_2` through `image_9` come from the fixed Reference Shelf.
+This is the default for newly created nodes. One main Conveyor item is reserved and selected per execution regardless of the stored `images_per_execution` value. Only that item participates in queue status, consumption, `remaining_pending`, and auto-queue arithmetic. `ref_image_1` through `ref_image_8` come from the fixed Reference Shelf.
 
 ### Queue execution group
 
@@ -174,13 +174,13 @@ For a three-image execution group, wire:
 
 ```text
 Image Conveyor.image    -> downstream image/reference input 1
-Image Conveyor.image_2  -> downstream image/reference input 2
-Image Conveyor.image_3  -> downstream image/reference input 3
+Image Conveyor.ref_image_1  -> downstream image/reference input 2
+Image Conveyor.ref_image_2  -> downstream image/reference input 3
 ```
 
-In **Persistent references** mode, `image` is the selected main queue image and `image_2` through `image_9` are shelf slots 1 through 8. In **Queue execution group** mode, `image` is selected queue image #1 and `image_2` through `image_9` map to subsequent reserved entries. Outputs above the configured group count are inactive.
+In **Persistent references** mode, `image` is the selected main queue image and `ref_image_1` through `ref_image_8` are shelf slots 1 through 8. In **Queue execution group** mode, `image` is selected queue image #1 and those same additional sockets map to subsequent reserved entries. Outputs above the configured group count are inactive.
 
-MiniMax H3 Ref2VA is one practical use case: `image`, `image_2`, `image_3`, and so on can be connected to its separate reference-image inputs while Image Conveyor remains model-agnostic.
+MiniMax H3 Ref2VA is one practical use case: connect `image` to `ref_image_0`, then connect Image Conveyor's `ref_image_1`, `ref_image_2`, and so on to the matching MiniMax inputs.
 
 ## Canvas-wide drop capture
 
@@ -206,18 +206,20 @@ The node exposes these stable output slots:
 | 3 | `index` | Conveyor index for selected image #1 |
 | 4 | `remaining_pending` | Pending queue entries remaining under the current consume mode |
 | 5 | `source_path` | Best-effort source hint for selected image #1 |
-| 6 | `image_2` | Selected image #2 when active |
-| 7 | `image_3` | Selected image #3 when active |
-| 8 | `image_4` | Selected image #4 when active |
-| 9 | `image_5` | Selected image #5 when active |
-| 10 | `image_6` | Selected image #6 when active |
-| 11 | `image_7` | Selected image #7 when active |
-| 12 | `image_8` | Selected image #8 when active |
-| 13 | `image_9` | Selected image #9 when active |
+| 6 | `ref_image_1` | Shelf Ref 1, or selected group image #2 |
+| 7 | `ref_image_2` | Shelf Ref 2, or selected group image #3 |
+| 8 | `ref_image_3` | Shelf Ref 3, or selected group image #4 |
+| 9 | `ref_image_4` | Shelf Ref 4, or selected group image #5 |
+| 10 | `ref_image_5` | Shelf Ref 5, or selected group image #6 |
+| 11 | `ref_image_6` | Shelf Ref 6, or selected group image #7 |
+| 12 | `ref_image_7` | Shelf Ref 7, or selected group image #8 |
+| 13 | `ref_image_8` | Shelf Ref 8, or selected group image #9 |
 
 `path` is the annotated ComfyUI input path actually loaded. `source_path` is an optional best-effort source hint. Absolute native paths are reduced to filename-only before persistence so exported workflows do not leak arbitrary local paths.
 
 ## Compatibility
+
+After updating from a build without the Reference Shelf or with the older `image_2` … `image_9` socket labels, reload the ComfyUI frontend and recreate existing Image Conveyor nodes so ComfyUI rebuilds their frontend widget and output schema. Save or note the old node's queue before replacing it; recreating a node does not transfer its embedded Conveyor state automatically.
 
 The original six output slots remain at indices `0` through `5` in their existing order. The eight additional `IMAGE` outputs are appended at indices `6` through `13`, so saved links to the original outputs keep their indices.
 
