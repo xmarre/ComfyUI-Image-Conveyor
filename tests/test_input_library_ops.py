@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -79,6 +80,13 @@ class InputLibraryOperationsTest(unittest.TestCase):
     def test_registry_instances_share_the_same_lock_for_one_store(self):
         self.assertIs(self.registry._lock, ops._registry_for_service(self.service)._lock)
 
+    def test_registry_rejects_unsupported_version(self):
+        registry_path = Path(self.registry.path)
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(json.dumps({"version": ops.REGISTRY_VERSION + 1, "characters": {}}), encoding="utf-8")
+        with self.assertRaises(ops.InvalidLibraryOperation):
+            self.registry._load_unlocked()
+
     def test_character_folder_is_created_once_and_survives_rename_and_delete(self):
         preset = self.service.preset_store.create("Mara", slots())
         characters = self.registry.ensure_for_presets(self.service.preset_store.list())
@@ -104,7 +112,24 @@ class InputLibraryOperationsTest(unittest.TestCase):
         self.assertEqual(result["added"], 1)
         file_path.unlink()
         with self.assertRaises(FileNotFoundError):
+            self.registry.add_members(preset["id"], ["refs/a.png"])
+        with self.assertRaises(FileNotFoundError):
             self.registry.add_members(preset["id"], ["refs/missing.png"])
+
+    def test_character_relink_deduplicates_existing_member_and_counts_change_once(self):
+        self.write_image("refs/a.png")
+        self.write_image("refs/b.png")
+        preset = self.service.preset_store.create("Mara", slots())
+        self.registry.ensure_for_presets(self.service.preset_store.list())
+        self.registry.add_members(preset["id"], ["refs/a.png", "refs/b.png"])
+
+        changed = self.registry.relink_paths([
+            {"relative_path": "refs/a.png", "keep_path": "refs/b.png"},
+        ])
+
+        self.assertEqual(changed, 1)
+        character = self.registry.ensure_for_presets(self.service.preset_store.list())[0]
+        self.assertEqual(character["members"], ["refs/b.png"])
 
     def test_directory_listing_includes_empty_directories(self):
         (self.input_root / "characters" / "empty").mkdir(parents=True)
@@ -116,6 +141,18 @@ class InputLibraryOperationsTest(unittest.TestCase):
         self.assertIn("nested", directories)
         self.assertIn("nested/deeper", directories)
         self.assertNotIn(".hidden", directories)
+
+    def test_directory_listing_cache_is_reused_and_explicitly_invalidated(self):
+        (self.input_root / "one").mkdir()
+        first = ops.list_input_directories(str(self.input_root))
+        self.assertEqual(first, ["one"])
+
+        (self.input_root / "two").mkdir()
+        with mock.patch.object(ops.os, "scandir", side_effect=AssertionError("cache should be reused")):
+            self.assertEqual(ops.list_input_directories(str(self.input_root)), ["one"])
+
+        ops._invalidate_input_directory_cache(str(self.input_root))
+        self.assertEqual(ops.list_input_directories(str(self.input_root)), ["one", "two"])
 
     def test_move_relinks_saved_reference_and_character_membership(self):
         source = self.write_image("source/a.png")
@@ -155,7 +192,7 @@ class InputLibraryOperationsTest(unittest.TestCase):
         character = self.registry.ensure_for_presets(self.service.preset_store.list())[0]
         self.assertEqual(character["members"], ["source/a.png"])
 
-    def test_move_protects_queued_paths_without_touching_them(self):
+    def test_move_protects_queued_paths_without_creating_destination(self):
         source = self.write_image("source/a.png")
         result = ops.move_input_files(
             self.service,
@@ -166,7 +203,13 @@ class InputLibraryOperationsTest(unittest.TestCase):
         self.assertEqual(result["moved"], [])
         self.assertEqual(len(result["skipped"]), 1)
         self.assertTrue(source.is_file())
-        self.assertFalse((self.input_root / "destination" / "a.png").exists())
+        self.assertFalse((self.input_root / "destination").exists())
+
+    def test_move_missing_sources_does_not_create_destination(self):
+        result = ops.move_input_files(self.service, ["source/missing.png"], "destination")
+        self.assertEqual(result["moved"], [])
+        self.assertEqual(len(result["skipped"]), 1)
+        self.assertFalse((self.input_root / "destination").exists())
 
     def test_manual_move_collision_is_all_or_nothing(self):
         first = self.write_image("one/a.png", b"one")
@@ -224,6 +267,68 @@ class InputLibraryOperationsTest(unittest.TestCase):
         self.assertFalse(any(source.parent.glob(".image-conveyor-delete-*.tmp")))
         saved = self.service.preset_store.list()[0]
         self.assertEqual(saved["slots"][0]["annotated"], "source/a.png [input]")
+
+    def test_delete_unlink_failure_restores_file_and_preset_reference(self):
+        source = self.write_image("source/a.png", b"payload")
+        self.service.preset_store.create("Mara", slots(reference("source/a.png")))
+        real_unlink = os.unlink
+
+        def fail_staged_unlink(path):
+            if Path(path).name.startswith(".image-conveyor-delete-"):
+                raise OSError("file is busy")
+            return real_unlink(path)
+
+        with mock.patch.object(ops.os, "unlink", side_effect=fail_staged_unlink):
+            result = ops.delete_input_files(self.service, ["source/a.png"])
+
+        self.assertEqual(result["deleted"], [])
+        self.assertEqual(result["presets_cleared"], 0)
+        self.assertEqual(len(result["skipped"]), 1)
+        self.assertTrue(source.is_file())
+        saved = self.service.preset_store.list()[0]
+        self.assertEqual(saved["slots"][0]["annotated"], "source/a.png [input]")
+
+    def test_delete_restore_write_failure_does_not_skip_registry_cleanup(self):
+        first = self.write_image("source/a.png", b"a")
+        second = self.write_image("source/b.png", b"b")
+        preset = self.service.preset_store.create(
+            "Mara",
+            slots(reference("source/a.png"), reference("source/b.png")),
+        )
+        self.registry.ensure_for_presets(self.service.preset_store.list())
+        self.registry.add_members(preset["id"], ["source/a.png", "source/b.png"])
+        real_unlink = os.unlink
+        failed_staged_unlink = False
+
+        def fail_first_staged_unlink(path):
+            nonlocal failed_staged_unlink
+            if Path(path).name.startswith(".image-conveyor-delete-") and not failed_staged_unlink:
+                failed_staged_unlink = True
+                raise OSError("file is busy")
+            return real_unlink(path)
+
+        original_write = self.service.preset_store._write_unlocked
+        write_count = 0
+
+        def fail_restore_write(document):
+            nonlocal write_count
+            write_count += 1
+            if write_count == 2:
+                raise OSError("restore write failed")
+            return original_write(document)
+
+        with mock.patch.object(ops.os, "unlink", side_effect=fail_first_staged_unlink), mock.patch.object(
+            self.service.preset_store,
+            "_write_unlocked",
+            side_effect=fail_restore_write,
+        ), self.assertLogs(ops.LOGGER, level="CRITICAL"):
+            result = ops.delete_input_files(self.service, ["source/a.png", "source/b.png"])
+
+        self.assertTrue(first.is_file())
+        self.assertFalse(second.exists())
+        self.assertEqual([entry["relative_path"] for entry in result["deleted"]], ["source/b.png"])
+        character = self.registry.ensure_for_presets(self.service.preset_store.list())[0]
+        self.assertEqual(character["members"], ["source/a.png"])
 
     def test_delete_protects_queued_path(self):
         source = self.write_image("source/a.png")
