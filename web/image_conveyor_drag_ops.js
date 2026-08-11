@@ -9,12 +9,18 @@ const STATE_WIDGET = 'state_json'
 const UI_STATE_WIDGET = 'ui_state_json'
 const SERVER_INPUT_SOURCE_ID = '__image_conveyor_input__'
 const HOVER_OPEN_MS = 600
+const LOCAL_OBJECT_URL_SOFT_LIMIT = 96
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'tif', 'tiff', 'avif'])
 const patchedNodes = new Set()
 
 function clone(value) {
   if (typeof structuredClone === 'function') return structuredClone(value)
   return JSON.parse(JSON.stringify(value))
+}
+
+function makeId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
+  return `icx_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
 }
 
 function normalizePath(value) {
@@ -152,6 +158,23 @@ function pathToReference(relativePath) {
   }
 }
 
+function queueItemFromPath(relativePath) {
+  const path = normalizePath(relativePath)
+  if (!path) return null
+  return {
+    id: makeId(),
+    annotated: `${path} [input]`,
+    filename: pathName(path),
+    subfolder: parentPath(path),
+    source_path: path,
+    type: 'input',
+    status: 'pending',
+    added_at: Date.now(),
+    last_queued_at: 0,
+    last_processed_at: 0
+  }
+}
+
 function cardSlotAtTarget(ctx, target) {
   if (!(target instanceof Node)) return null
   return ctx.cardPool?.find((slot) => slot?.itemId && slot.card?.contains(target)) ?? null
@@ -193,8 +216,8 @@ function selectionItemsForDrag(node, sourceView, draggedItem, fallbackItems = []
     }
   }
 
-  // Preserve the visible UI ordering first, then recover selected virtualized/off-screen
-  // entries from the browser's backing data rather than silently dropping them.
+  // Visible ordering comes first. Browser backing data then recovers selected items that
+  // virtualization has moved outside the current DOM/card window.
   collect(ctx.visibleItems)
   collect(browser?.entries)
   collect(browser?.files)
@@ -217,13 +240,12 @@ function getQueuedInputPaths() {
   return paths
 }
 
-function clearMainDragState(node, drag = null) {
+function clearMainDragState(node) {
   const ctx = node.__bil
   if (!ctx) return
-  const sourceCard = drag?.sourceCard
-  if (sourceCard instanceof HTMLElement) {
-    try { sourceCard.dispatchEvent(new Event('dragend', { bubbles: true })) } catch {}
-  }
+  // Never dispatch a synthetic dragend from inside an active native drop sequence. Native
+  // dragend follows the drop and clears the main module's private drag token itself. Forcing
+  // dragend here creates re-entrant browser drag processing and is unnecessary.
   ctx.draggedId = null
   ctx.dragIntent = null
   if (ctx.dropIndicator) ctx.dropIndicator.hidden = true
@@ -344,6 +366,7 @@ function characterDestinationFromView(ctx, viewId, browser, element) {
   const folder = normalizeFolder(elements?.tab?.title)
   if (folder == null) return null
   return {
+    kind: 'folder',
     key: `character:${viewId}`,
     folder,
     characterId: String(browser?.characterId || ''),
@@ -354,8 +377,19 @@ function characterDestinationFromView(ctx, viewId, browser, element) {
 
 function destinationFromTab(ctx, target) {
   if (!(target instanceof Node)) return null
+  if (ctx.conveyorTab?.contains(target)) {
+    return {
+      kind: 'conveyor',
+      key: 'conveyor',
+      folder: '',
+      characterId: null,
+      element: ctx.conveyorTab,
+      open: () => ctx.conveyorTab?.click?.()
+    }
+  }
   if (ctx.inputTab?.contains(target)) {
     return {
+      kind: 'folder',
       key: 'input',
       folder: '',
       characterId: null,
@@ -376,6 +410,7 @@ function destinationFromTab(ctx, target) {
       const folder = normalizeFolder(browser.folderPath || '')
       if (folder == null) return null
       return {
+        kind: 'folder',
         key: viewId,
         folder,
         characterId: null,
@@ -393,6 +428,7 @@ function destinationFromFolderCard(ctx, target) {
   const folder = normalizeFolder(slot.item.folderPath)
   if (folder == null) return null
   return {
+    kind: 'folder',
     key: `folder-card:${folder}`,
     folder,
     characterId: null,
@@ -407,6 +443,7 @@ function destinationFromActiveLibraryArea(ctx, target) {
   if (viewId === 'conveyor') return null
   if (viewId === 'input') {
     return {
+      kind: 'folder',
       key: 'active:input',
       folder: '',
       characterId: null,
@@ -423,6 +460,7 @@ function destinationFromActiveLibraryArea(ctx, target) {
     const folder = normalizeFolder(browser.folderPath || '')
     if (folder == null) return null
     return {
+      kind: 'folder',
       key: `active:${viewId}`,
       folder,
       characterId: null,
@@ -473,17 +511,65 @@ function batchFromExternalFiles(event) {
   return files.length ? { sourceView: 'external', items: [], externalFiles: files } : null
 }
 
+async function sourcePathsForBatch(batch, defaultUploadFolder = '') {
+  const paths = []
+  const errors = []
+  for (const item of batch.items ?? []) {
+    if (item?.localFile instanceof File) {
+      const destination = normalizeFolder(item.relativeSubfolder ?? item.subfolder ?? defaultUploadFolder)
+      try {
+        paths.push(await uploadOne(item.localFile, destination == null ? defaultUploadFolder : destination))
+      } catch (error) {
+        errors.push(error)
+      }
+      continue
+    }
+    const path = itemInputPath(item)
+    if (path) paths.push(path)
+  }
+  for (const file of Array.from(batch.externalFiles ?? []).filter(isImageFile)) {
+    try {
+      paths.push(await uploadOne(file, defaultUploadFolder))
+    } catch (error) {
+      errors.push(error)
+    }
+  }
+  return { paths, errors }
+}
+
+async function addBatchToConveyor(node, batch) {
+  if (batch.sourceView === 'conveyor') {
+    node.__bil?.conveyorTab?.click?.()
+    return
+  }
+  const { paths, errors } = await sourcePathsForBatch(batch, '')
+  const state = readState(node)
+  const ui = readUiState(node)
+  let added = 0
+  for (const path of paths) {
+    const item = queueItemFromPath(path)
+    if (!item) continue
+    state.items.push(item)
+    ui.source_paths[item.id] = path
+    added += 1
+  }
+  if (added) commitState(node, state, ui)
+  node.__bil?.conveyorTab?.click?.()
+  if (errors.length) {
+    window.alert(`${errors.length} image${errors.length === 1 ? '' : 's'} failed to import into the Conveyor.`)
+  }
+}
+
 async function dropBatchIntoFolder(node, batch, destination) {
   const inputPaths = []
   const localFiles = []
   for (const item of batch.items ?? []) {
-    if (item?.localFile instanceof File) localFiles.push(item.localFile)
+    if (item?.localFile instanceof File) localFiles.push(item)
     else {
       const path = itemInputPath(item)
       if (path) inputPaths.push(path)
     }
   }
-  localFiles.push(...Array.from(batch.externalFiles ?? []).filter(isImageFile))
 
   const finalPaths = []
   let skipped = []
@@ -501,7 +587,14 @@ async function dropBatchIntoFolder(node, batch, destination) {
 
   const uploadErrors = []
   const uploadedPaths = []
-  for (const file of localFiles) {
+  for (const item of localFiles) {
+    try {
+      uploadedPaths.push(await uploadOne(item.localFile, destination.folder))
+    } catch (error) {
+      uploadErrors.push(error)
+    }
+  }
+  for (const file of Array.from(batch.externalFiles ?? []).filter(isImageFile)) {
     try {
       uploadedPaths.push(await uploadOne(file, destination.folder))
     } catch (error) {
@@ -509,6 +602,8 @@ async function dropBatchIntoFolder(node, batch, destination) {
     }
   }
   if (uploadedPaths.length) {
+    // resolve-upload may deduplicate to an existing canonical Input path outside the requested
+    // folder. Materialize that canonical file into the explicit drag destination.
     const copied = await copyInputPaths(uploadedPaths, destination.folder)
     finalPaths.push(...copied.map((entry) => normalizePath(entry.relative_path)).filter(Boolean))
   }
@@ -524,6 +619,11 @@ async function dropBatchIntoFolder(node, batch, destination) {
     if (uploadErrors.length) messages.push(`${uploadErrors.length} local image${uploadErrors.length === 1 ? '' : 's'} failed to import.`)
     window.alert(messages.join('\n'))
   }
+}
+
+async function dropBatchIntoDestination(node, batch, destination) {
+  if (destination.kind === 'conveyor') return await addBatchToConveyor(node, batch)
+  return await dropBatchIntoFolder(node, batch, destination)
 }
 
 function nodePoint(node, event) {
@@ -594,6 +694,41 @@ async function materializeCharacterDrop(node, startIndex, batch, externalFiles) 
   return true
 }
 
+async function assignPlainReferenceDrop(node, startIndex, batch) {
+  const references = []
+  const errors = []
+  for (const item of batch.items ?? []) {
+    if (item?.localFile instanceof File) {
+      const destination = normalizeFolder(item.relativeSubfolder ?? item.subfolder ?? '')
+      try {
+        const path = await uploadOne(item.localFile, destination == null ? '' : destination)
+        const reference = pathToReference(path)
+        if (reference) references.push(reference)
+      } catch (error) {
+        errors.push(error)
+      }
+      continue
+    }
+    const reference = pathToReference(itemInputPath(item))
+    if (reference) references.push(reference)
+  }
+  if (!references.length) {
+    if (errors.length) window.alert(`${errors.length} image${errors.length === 1 ? '' : 's'} failed to import as references.`)
+    return false
+  }
+  const state = readState(node)
+  const slots = normalizeReferenceSlots(state.reference_slots)
+  for (let offset = 0; offset < references.length; offset += 1) {
+    const index = Number(startIndex) + offset
+    if (index < 0 || index >= slots.length) break
+    slots[index] = references[offset]
+  }
+  state.reference_slots = slots
+  commitState(node, state)
+  if (errors.length) window.alert(`${errors.length} image${errors.length === 1 ? '' : 's'} failed to import; successful references were kept.`)
+  return true
+}
+
 function handleMultiReorderDrop(node, event, batch) {
   const ctx = node.__bil
   if (batch.sourceView !== 'conveyor' || (batch.items?.length ?? 0) < 2) return false
@@ -625,8 +760,43 @@ function handleMultiReorderDrop(node, event, batch) {
       commitState(node, state)
     }
   }
-  clearMainDragState(node, batch)
+  clearMainDragState(node)
   return true
+}
+
+function installIdempotentTextContentGuard(element) {
+  if (!(element instanceof Node) || element.__icxStableTextContent) return
+  const descriptor = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent')
+  if (!descriptor?.get || !descriptor?.set) return
+  try {
+    Object.defineProperty(element, 'textContent', {
+      configurable: true,
+      enumerable: false,
+      get() { return descriptor.get.call(this) },
+      set(value) {
+        const next = value == null ? '' : String(value)
+        if (descriptor.get.call(this) === next) return
+        descriptor.set.call(this, value)
+      }
+    })
+    element.__icxStableTextContent = true
+  } catch {
+    // Browser may reject an instance override. Correctness does not depend on the guard.
+  }
+}
+
+function pruneUnusedLocalObjectUrls(ctx) {
+  const urls = ctx?.localObjectUrls
+  if (!(urls instanceof Map) || urls.size <= LOCAL_OBJECT_URL_SOFT_LIMIT) return
+  const inUse = new Set((ctx.cardPool ?? []).map((slot) => slot.previewUrl).filter(Boolean))
+  const lightboxUrl = ctx.lightbox?.image?.getAttribute?.('src')
+  if (lightboxUrl) inUse.add(lightboxUrl)
+  for (const [file, entry] of urls) {
+    if (urls.size <= LOCAL_OBJECT_URL_SOFT_LIMIT) break
+    if (!entry?.url || inUse.has(entry.url)) continue
+    try { URL.revokeObjectURL(entry.url) } catch {}
+    urls.delete(file)
+  }
 }
 
 function installStyles() {
@@ -659,7 +829,13 @@ function installNode(node) {
   ext.batchDragV2 = true
   ext.batchDrag = null
   ext.batchHover = null
+  ext.localUrlPruneFrame = 0
   patchedNodes.add(node)
+
+  // The library overlay's draw hook checks these labels every canvas draw. Avoid replacing
+  // identical text nodes continuously; only real label changes mutate the DOM.
+  installIdempotentTextContentGuard(ext.modeButton)
+  installIdempotentTextContentGuard(ctx.deleteSelectedBtn)
 
   ext.batchWindowDragStart = (event) => {
     const target = event.target
@@ -689,7 +865,7 @@ function installNode(node) {
     if (!destination) { clearHoverTarget(ext); return }
     event.preventDefault()
     event.stopPropagation()
-    if (event.dataTransfer) event.dataTransfer.dropEffect = batch.sourceView === 'external' ? 'copy' : 'move'
+    if (event.dataTransfer) event.dataTransfer.dropEffect = destination.kind === 'conveyor' || batch.sourceView === 'external' ? 'copy' : 'move'
     setHoverTarget(ext, destination)
   }
 
@@ -709,10 +885,10 @@ function installNode(node) {
     event.stopImmediatePropagation?.()
     clearHoverTarget(ext)
     const captured = { ...batch, items: Array.from(batch.items ?? []) }
-    clearMainDragState(node, batch)
-    void dropBatchIntoFolder(node, captured, destination).catch((error) => {
-      console.error('Image Conveyor: folder batch drop failed.', error)
-      window.alert(error?.message || 'Unable to move the selected images into the folder.')
+    clearMainDragState(node)
+    void dropBatchIntoDestination(node, captured, destination).catch((error) => {
+      console.error('Image Conveyor: batch drop failed.', error)
+      window.alert(error?.message || 'Unable to apply the selected image drop.')
     })
   }
 
@@ -721,13 +897,23 @@ function installNode(node) {
     ext.batchDrag = null
   }
 
-  // Window capture deliberately precedes the older document/root drop handlers. Folder
-  // targets are owned here so an OS-file drop cannot be consumed by the legacy single-drop
-  // path before physical materialization/collision handling runs.
+  // Window capture deliberately precedes the older document/root drop handlers. Folder and
+  // Conveyor tab targets are owned here so a batch cannot collapse to the legacy single-item
+  // path before the selection-aware operation runs.
   window.addEventListener('dragstart', ext.batchWindowDragStart, true)
   window.addEventListener('dragover', ext.batchWindowDragOver, true)
   window.addEventListener('drop', ext.batchWindowDrop, true)
   window.addEventListener('dragend', ext.batchWindowDragEnd, true)
+
+  ext.stabilityScrollHandler = () => {
+    if (ext.localUrlPruneFrame) return
+    ext.localUrlPruneFrame = requestAnimationFrame(() => {
+      ext.localUrlPruneFrame = 0
+      if (ctx.removed) return
+      pruneUnusedLocalObjectUrls(ctx)
+    })
+  }
+  ctx.list?.addEventListener('scroll', ext.stabilityScrollHandler, { passive: true })
 
   const previousDragDrop = node.onDragDrop
   node.onDragDrop = async function (event) {
@@ -736,14 +922,28 @@ function installNode(node) {
     const presetId = String(current.active_reference_preset_id || '')
     const batch = batchFromInternalDrag(ctx)
     const files = Array.from(event.dataTransfer?.files ?? []).filter(isImageFile)
-    if (hit?.type === 'slot' && presetId && ((batch?.items?.length ?? 0) || files.length)) {
+    if (hit?.type === 'slot' && batch?.items?.length) {
       event.preventDefault?.()
       event.stopPropagation?.()
       ctx.referenceDragHoverIndex = null
-      const captured = batch ? { ...batch, items: Array.from(batch.items) } : { items: [], sourceView: 'external' }
-      clearMainDragState(node, batch)
+      const captured = { ...batch, items: Array.from(batch.items) }
+      clearMainDragState(node)
       try {
-        return await materializeCharacterDrop(node, hit.index, captured, files)
+        if (presetId) return await materializeCharacterDrop(node, hit.index, captured, [])
+        return await assignPlainReferenceDrop(node, hit.index, captured)
+      } catch (error) {
+        console.error('Image Conveyor: reference batch drop failed.', error)
+        window.alert(error?.message || 'Unable to apply the selected reference images.')
+        return false
+      }
+    }
+    if (hit?.type === 'slot' && presetId && files.length) {
+      event.preventDefault?.()
+      event.stopPropagation?.()
+      ctx.referenceDragHoverIndex = null
+      clearMainDragState(node)
+      try {
+        return await materializeCharacterDrop(node, hit.index, { items: [], sourceView: 'external' }, files)
       } catch (error) {
         console.error('Image Conveyor: character materialization failed.', error)
         window.alert(error?.message || 'Unable to copy the selected images into the active character folder.')
@@ -761,6 +961,9 @@ function installNode(node) {
     window.removeEventListener('dragover', ext.batchWindowDragOver, true)
     window.removeEventListener('drop', ext.batchWindowDrop, true)
     window.removeEventListener('dragend', ext.batchWindowDragEnd, true)
+    ctx.list?.removeEventListener('scroll', ext.stabilityScrollHandler)
+    if (ext.localUrlPruneFrame) cancelAnimationFrame(ext.localUrlPruneFrame)
+    ext.localUrlPruneFrame = 0
     return previousRemoved?.apply(this, args)
   }
   return true
