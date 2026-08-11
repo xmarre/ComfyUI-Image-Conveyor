@@ -9,7 +9,6 @@ const STATE_WIDGET = 'state_json'
 const UI_STATE_WIDGET = 'ui_state_json'
 const SERVER_INPUT_SOURCE_ID = '__image_conveyor_input__'
 const HOVER_OPEN_MS = 600
-const LOCAL_OBJECT_URL_SOFT_LIMIT = 96
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'tif', 'tiff', 'avif'])
 const patchedNodes = new Set()
 
@@ -184,10 +183,6 @@ function browserForView(ctx, view) {
   return ctx.browser?.[view] ?? ctx.browser?.folderViews?.get(view) ?? null
 }
 
-function activeBrowser(ctx) {
-  return browserForView(ctx, ctx.browser.activeView)
-}
-
 function selectionItemsForDrag(node, sourceView, draggedItem, fallbackItems = []) {
   const ctx = node.__bil
   const browser = browserForView(ctx, sourceView)
@@ -303,13 +298,18 @@ function refreshInputs() {
   for (const node of patchedNodes) node.__bil?.refreshBtn?.click?.()
 }
 
-async function uploadOne(file, destinationFolder) {
+function createUploadSession() {
+  return { needsSnapshotRefresh: true }
+}
+
+async function uploadOne(file, destinationFolder, session = null) {
   const body = new FormData()
   body.append('image', file)
   body.append('type', 'input')
   body.append('subfolder', destinationFolder)
-  body.append('refresh_snapshot', 'true')
+  if (!session || session.needsSnapshotRefresh) body.append('refresh_snapshot', 'true')
   const payload = await jsonRequest('/image-conveyor/resolve-upload', { method: 'POST', body })
+  if (session) session.needsSnapshotRefresh = false
   const path = normalizePath(payload?.relative_path || `${payload?.subfolder ? `${payload.subfolder}/` : ''}${payload?.name || ''}`)
   if (!path) throw new Error(`Invalid upload response for '${file.name}'.`)
   return path
@@ -514,11 +514,12 @@ function batchFromExternalFiles(event) {
 async function sourcePathsForBatch(batch, defaultUploadFolder = '') {
   const paths = []
   const errors = []
+  const session = createUploadSession()
   for (const item of batch.items ?? []) {
     if (item?.localFile instanceof File) {
       const destination = normalizeFolder(item.relativeSubfolder ?? item.subfolder ?? defaultUploadFolder)
       try {
-        paths.push(await uploadOne(item.localFile, destination == null ? defaultUploadFolder : destination))
+        paths.push(await uploadOne(item.localFile, destination == null ? defaultUploadFolder : destination, session))
       } catch (error) {
         errors.push(error)
       }
@@ -529,7 +530,7 @@ async function sourcePathsForBatch(batch, defaultUploadFolder = '') {
   }
   for (const file of Array.from(batch.externalFiles ?? []).filter(isImageFile)) {
     try {
-      paths.push(await uploadOne(file, defaultUploadFolder))
+      paths.push(await uploadOne(file, defaultUploadFolder, session))
     } catch (error) {
       errors.push(error)
     }
@@ -587,16 +588,17 @@ async function dropBatchIntoFolder(node, batch, destination) {
 
   const uploadErrors = []
   const uploadedPaths = []
+  const session = createUploadSession()
   for (const item of localFiles) {
     try {
-      uploadedPaths.push(await uploadOne(item.localFile, destination.folder))
+      uploadedPaths.push(await uploadOne(item.localFile, destination.folder, session))
     } catch (error) {
       uploadErrors.push(error)
     }
   }
   for (const file of Array.from(batch.externalFiles ?? []).filter(isImageFile)) {
     try {
-      uploadedPaths.push(await uploadOne(file, destination.folder))
+      uploadedPaths.push(await uploadOne(file, destination.folder, session))
     } catch (error) {
       uploadErrors.push(error)
     }
@@ -649,16 +651,17 @@ async function materializeCharacterDrop(node, startIndex, batch, externalFiles) 
 
   const sourcePaths = []
   const uploadErrors = []
+  const session = createUploadSession()
   for (const item of batch?.items ?? []) {
     if (item?.localFile instanceof File) {
-      try { sourcePaths.push(await uploadOne(item.localFile, character.folder)) } catch (error) { uploadErrors.push(error) }
+      try { sourcePaths.push(await uploadOne(item.localFile, character.folder, session)) } catch (error) { uploadErrors.push(error) }
     } else {
       const path = itemInputPath(item)
       if (path) sourcePaths.push(path)
     }
   }
   for (const file of Array.from(externalFiles ?? []).filter(isImageFile)) {
-    try { sourcePaths.push(await uploadOne(file, character.folder)) } catch (error) { uploadErrors.push(error) }
+    try { sourcePaths.push(await uploadOne(file, character.folder, session)) } catch (error) { uploadErrors.push(error) }
   }
   if (!sourcePaths.length) {
     if (uploadErrors.length) window.alert(`${uploadErrors.length} image${uploadErrors.length === 1 ? '' : 's'} failed to import.`)
@@ -697,11 +700,12 @@ async function materializeCharacterDrop(node, startIndex, batch, externalFiles) 
 async function assignPlainReferenceDrop(node, startIndex, batch) {
   const references = []
   const errors = []
+  const session = createUploadSession()
   for (const item of batch.items ?? []) {
     if (item?.localFile instanceof File) {
       const destination = normalizeFolder(item.relativeSubfolder ?? item.subfolder ?? '')
       try {
-        const path = await uploadOne(item.localFile, destination == null ? '' : destination)
+        const path = await uploadOne(item.localFile, destination == null ? '' : destination, session)
         const reference = pathToReference(path)
         if (reference) references.push(reference)
       } catch (error) {
@@ -764,41 +768,6 @@ function handleMultiReorderDrop(node, event, batch) {
   return true
 }
 
-function installIdempotentTextContentGuard(element) {
-  if (!(element instanceof Node) || element.__icxStableTextContent) return
-  const descriptor = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent')
-  if (!descriptor?.get || !descriptor?.set) return
-  try {
-    Object.defineProperty(element, 'textContent', {
-      configurable: true,
-      enumerable: false,
-      get() { return descriptor.get.call(this) },
-      set(value) {
-        const next = value == null ? '' : String(value)
-        if (descriptor.get.call(this) === next) return
-        descriptor.set.call(this, value)
-      }
-    })
-    element.__icxStableTextContent = true
-  } catch {
-    // Browser may reject an instance override. Correctness does not depend on the guard.
-  }
-}
-
-function pruneUnusedLocalObjectUrls(ctx) {
-  const urls = ctx?.localObjectUrls
-  if (!(urls instanceof Map) || urls.size <= LOCAL_OBJECT_URL_SOFT_LIMIT) return
-  const inUse = new Set((ctx.cardPool ?? []).map((slot) => slot.previewUrl).filter(Boolean))
-  const lightboxUrl = ctx.lightbox?.image?.getAttribute?.('src')
-  if (lightboxUrl) inUse.add(lightboxUrl)
-  for (const [file, entry] of urls) {
-    if (urls.size <= LOCAL_OBJECT_URL_SOFT_LIMIT) break
-    if (!entry?.url || inUse.has(entry.url)) continue
-    try { URL.revokeObjectURL(entry.url) } catch {}
-    urls.delete(file)
-  }
-}
-
 function installStyles() {
   if (document.getElementById('image-conveyor-batch-drag-style')) return
   const style = document.createElement('style')
@@ -829,13 +798,7 @@ function installNode(node) {
   ext.batchDragV2 = true
   ext.batchDrag = null
   ext.batchHover = null
-  ext.localUrlPruneFrame = 0
   patchedNodes.add(node)
-
-  // The library overlay's draw hook checks these labels every canvas draw. Avoid replacing
-  // identical text nodes continuously; only real label changes mutate the DOM.
-  installIdempotentTextContentGuard(ext.modeButton)
-  installIdempotentTextContentGuard(ctx.deleteSelectedBtn)
 
   ext.batchWindowDragStart = (event) => {
     const target = event.target
@@ -905,16 +868,6 @@ function installNode(node) {
   window.addEventListener('drop', ext.batchWindowDrop, true)
   window.addEventListener('dragend', ext.batchWindowDragEnd, true)
 
-  ext.stabilityScrollHandler = () => {
-    if (ext.localUrlPruneFrame) return
-    ext.localUrlPruneFrame = requestAnimationFrame(() => {
-      ext.localUrlPruneFrame = 0
-      if (ctx.removed) return
-      pruneUnusedLocalObjectUrls(ctx)
-    })
-  }
-  ctx.list?.addEventListener('scroll', ext.stabilityScrollHandler, { passive: true })
-
   const previousDragDrop = node.onDragDrop
   node.onDragDrop = async function (event) {
     const hit = shelfHit(node, event)
@@ -961,9 +914,6 @@ function installNode(node) {
     window.removeEventListener('dragover', ext.batchWindowDragOver, true)
     window.removeEventListener('drop', ext.batchWindowDrop, true)
     window.removeEventListener('dragend', ext.batchWindowDragEnd, true)
-    ctx.list?.removeEventListener('scroll', ext.stabilityScrollHandler)
-    if (ext.localUrlPruneFrame) cancelAnimationFrame(ext.localUrlPruneFrame)
-    ext.localUrlPruneFrame = 0
     return previousRemoved?.apply(this, args)
   }
   return true
