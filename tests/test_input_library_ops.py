@@ -76,6 +76,9 @@ class InputLibraryOperationsTest(unittest.TestCase):
         path.write_bytes(payload)
         return path
 
+    def test_registry_instances_share_the_same_lock_for_one_store(self):
+        self.assertIs(self.registry._lock, ops._registry_for_service(self.service)._lock)
+
     def test_character_folder_is_created_once_and_survives_rename_and_delete(self):
         preset = self.service.preset_store.create("Mara", slots())
         characters = self.registry.ensure_for_presets(self.service.preset_store.list())
