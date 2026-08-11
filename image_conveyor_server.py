@@ -44,6 +44,10 @@ class InvalidPreset(ValueError):
     pass
 
 
+class PresetNotFound(LookupError):
+    pass
+
+
 def normalize_relative_path(value: Any, *, allow_empty: bool = False) -> str:
     raw = str(value or "").strip().replace("\\", "/")
     if not raw:
@@ -162,8 +166,6 @@ class PresetStore:
             LOGGER.exception("Image Conveyor could not quarantine malformed preset storage.")
 
     def _load_unlocked(self) -> Dict[str, Any]:
-        if not os.path.isfile(self.path):
-            return self._empty_document()
         try:
             with open(self.path, "r", encoding="utf-8") as handle:
                 raw = json.load(handle)
@@ -178,7 +180,12 @@ class PresetStore:
             if len(ids) != len(presets) or len(names) != len(presets):
                 raise InvalidPreset("The preset document contains duplicate IDs or names.")
             return {"version": self.VERSION, "presets": presets}
-        except (OSError, UnicodeError, json.JSONDecodeError, InvalidPreset, ValueError, TypeError):
+        except FileNotFoundError:
+            return self._empty_document()
+        except OSError:
+            LOGGER.warning("Image Conveyor could not read preset storage.", exc_info=True)
+            raise
+        except (UnicodeError, json.JSONDecodeError, InvalidPreset, ValueError, TypeError):
             LOGGER.warning("Image Conveyor preset storage was malformed and has been quarantined.", exc_info=True)
             self._quarantine()
             self._recovery_pending = True
@@ -242,7 +249,7 @@ class PresetStore:
             normalized_id = self._normalize_id(preset_id)
             preset = next((entry for entry in document["presets"] if entry["id"] == normalized_id), None)
             if preset is None:
-                raise KeyError(normalized_id)
+                raise PresetNotFound(normalized_id)
             if name is not None:
                 normalized_name = self._normalize_name(name)
                 if any(
@@ -1050,13 +1057,19 @@ class InputLibrary:
                     # The preset document is durable. Its atomic update must
                     # succeed while every validated destination is locked and
                     # before the first unlink in this digest group.
-                    presets_relinked += self.preset_store.relink_paths([
-                        {
-                            "relative_path": current.relative_path,
-                            "keep_path": keep_path,
-                        }
-                        for _lexical_path, current, _expected_identity in validated
-                    ])
+                    try:
+                        presets_relinked += self.preset_store.relink_paths([
+                            {
+                                "relative_path": current.relative_path,
+                                "keep_path": keep_path,
+                            }
+                            for _lexical_path, current, _expected_identity in validated
+                        ])
+                    except OSError as exc:
+                        reason = f"Unable to relink reference presets: {exc}"
+                        for _lexical_path, current, _expected_identity in validated:
+                            skipped.append({"relative_path": current.relative_path, "reason": reason})
+                        continue
 
                     for lexical_path, current, expected_identity in validated:
                         relative_path = current.relative_path
@@ -1412,7 +1425,7 @@ def register_routes() -> None:
                 **kwargs,
             )
             return web.json_response({"preset": preset})
-        except KeyError:
+        except PresetNotFound:
             return web.json_response({"error": "Reference preset not found."}, status=404)
         except (InvalidPreset, InvalidInputPath, json.JSONDecodeError, ValueError) as exc:
             return web.json_response({"error": str(exc)}, status=400)

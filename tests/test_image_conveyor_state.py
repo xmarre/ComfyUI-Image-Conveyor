@@ -294,6 +294,27 @@ class ImageConveyorStateTest(unittest.TestCase):
         )["ui"]["batch_image_loader_delta"][0])
         self.assertEqual(["A"], [entry["id"] for entry in delta["processed_items"]])
 
+    def test_persistent_repeated_reference_paths_decode_once_per_execution(self):
+        entries = [item("A")]
+        reference = {
+            "annotated": "R.png [input]",
+            "filename": "R.png",
+            "subfolder": "",
+            "type": "input",
+        }
+        result = conveyor.ImageConveyor().load_next(
+            self.state(
+                entries,
+                output_mode="persistent_refs",
+                reference_slots=[reference, reference, None, reference],
+            )
+        )["result"]
+
+        self.assertEqual(["A.png [input]", "R.png [input]"], FakeLoadImage.calls)
+        self.assertEqual(result[6], result[7])
+        self.assertIsNone(result[8])
+        self.assertEqual(result[6], result[9])
+
     def test_persistent_reference_missing_validation_identifies_slot(self):
         main = item("A")
         self.materialize(main)

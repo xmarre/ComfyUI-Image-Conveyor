@@ -394,6 +394,21 @@ def _unresolved_change_hash(state: Dict[str, Any], reason: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+def _hash_annotated_file(hasher: Any, annotated: str) -> bool:
+    """Update a digest with an annotated file; return False if it is missing."""
+    try:
+        path = folder_paths.get_annotated_filepath(annotated)
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 class ImageConveyor:
     CATEGORY = "image"
     FUNCTION = "load_next"
@@ -498,15 +513,7 @@ class ImageConveyor:
             hasher.update(item["id"].encode("utf-8"))
             hasher.update(b"|")
             hasher.update(item["annotated"].encode("utf-8"))
-            try:
-                path = folder_paths.get_annotated_filepath(item["annotated"])
-                with open(path, "rb") as handle:
-                    while True:
-                        chunk = handle.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        hasher.update(chunk)
-            except FileNotFoundError:
+            if not _hash_annotated_file(hasher, item["annotated"]):
                 return _unresolved_change_hash(
                     state,
                     f"missing|slot={slot}|index={index}|id={item['id']}|annotated={item['annotated']}",
@@ -518,15 +525,7 @@ class ImageConveyor:
                     continue
                 hasher.update(f"|reference_slot={slot}|".encode("utf-8"))
                 hasher.update(reference["annotated"].encode("utf-8"))
-                try:
-                    path = folder_paths.get_annotated_filepath(reference["annotated"])
-                    with open(path, "rb") as handle:
-                        while True:
-                            chunk = handle.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            hasher.update(chunk)
-                except FileNotFoundError:
+                if not _hash_annotated_file(hasher, reference["annotated"]):
                     return _unresolved_change_hash(
                         state,
                         f"missing-reference|slot={slot}|annotated={reference['annotated']}",
@@ -606,12 +605,16 @@ class ImageConveyor:
 
         if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
             additional_images = []
+            reference_cache: Dict[str, Any] = {}
             for reference in state["reference_slots"]:
                 if reference is None:
                     additional_images.append(None)
                 else:
-                    image, _mask = loader.load_image(reference["annotated"])
-                    additional_images.append(image)
+                    annotated_reference = reference["annotated"]
+                    if annotated_reference not in reference_cache:
+                        image, _mask = loader.load_image(annotated_reference)
+                        reference_cache[annotated_reference] = image
+                    additional_images.append(reference_cache[annotated_reference])
         else:
             additional_images = loaded_images[1:] + [None] * (
                 _MAX_IMAGES_PER_EXECUTION - len(loaded_images)

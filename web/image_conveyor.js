@@ -1582,6 +1582,7 @@ async function importReferenceOnly(node, files, startIndex) {
       : `${errors.length} reference images failed to import.`
     ctx.browser.input.error = message
     console.error('Image Conveyor: reference-only import failed for some images.', ...errors.map(({ error }) => error))
+    scheduleRenderNode(node)
   }
   return assigned > 0
 }
@@ -3435,9 +3436,10 @@ function buildGalleryDom(node) {
     queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map(),
     thumbnailUrlCache: new WeakMap(), localObjectUrls: new Map(), activePickerInput: null,
     referenceShelfLayout: null, referenceLayoutWidth: 0, referenceLayoutWidgetY: 0,
-    referenceOutputGutter: 0, referenceDragHoverIndex: null,
+    referenceOutputGutter: 0, referenceOutputGutterKey: '', referenceDragHoverIndex: null,
     referenceThumbs: new Map(), presets: [],
-    presetsLoaded: false, presetsPromise: null, presetRequestId: 0, presetPopover: null
+    presetsLoaded: false, presetsPromise: null, presetRequestId: 0,
+    presetPopover: null, presetPopoverDismiss: null
   }
   const ctx = node.__bil
   ctx.lightbox = createLightbox(node)
@@ -3898,7 +3900,12 @@ async function loadReferencePresets(node, { force = false } = {}) {
   const requestId = ++ctx.presetRequestId
   const request = presetRequest().then((payload) => {
     if (node.__bil !== ctx || ctx.removed || requestId !== ctx.presetRequestId) return ctx.presets
-    ctx.presets = Array.isArray(payload?.presets) ? payload.presets : []
+    ctx.presets = Array.isArray(payload?.presets)
+      ? payload.presets.map((preset) => ({
+          ...preset,
+          slots: normalizeReferenceSlots(preset?.slots)
+        }))
+      : []
     ctx.presetsLoaded = true
     node.setDirtyCanvas?.(true, true)
     return ctx.presets
@@ -3947,10 +3954,12 @@ function loadPresetIntoNode(node, preset) {
 
 async function saveActiveReferencePreset(node) {
   const ctx = node.__bil
-  await loadReferencePresets(node)
-  const state = ctx.state ?? getRenderableState(node).state
-  const active = activeReferencePreset(ctx, state)
+  if (!ctx || ctx.removed) return
   try {
+    await loadReferencePresets(node)
+    if (node.__bil !== ctx || ctx.removed) return
+    const state = ctx.state ?? getRenderableState(node).state
+    const active = activeReferencePreset(ctx, state)
     let preset
     if (active) {
       preset = await updateReferencePreset(node, active.id, {
@@ -3961,16 +3970,23 @@ async function saveActiveReferencePreset(node) {
       if (!name?.trim()) return
       preset = await createReferencePreset(node, name, state.reference_slots)
     }
+    if (node.__bil !== ctx || ctx.removed) return
     if (!preset) return
     const latest = getRenderableState(node)
     latest.state.active_reference_preset_id = preset.id
     updateState(node, latest.state, latest.uiState)
   } catch (error) {
+    if (node.__bil !== ctx || ctx.removed) return
     window.alert(error?.message || 'Unable to save the character preset.')
   }
 }
 
 function closePresetPopover(ctx) {
+  if (ctx?.presetPopoverDismiss) {
+    document.removeEventListener('pointerdown', ctx.presetPopoverDismiss.pointerdown, true)
+    document.removeEventListener('keydown', ctx.presetPopoverDismiss.keydown, true)
+    ctx.presetPopoverDismiss = null
+  }
   ctx?.presetPopover?.remove?.()
   if (ctx) ctx.presetPopover = null
 }
@@ -3985,7 +4001,7 @@ async function showPresetPopover(node, clientX, clientY) {
     window.alert(error?.message || 'Unable to load character presets.')
     return
   }
-  if (ctx.removed) return
+  if (node.__bil !== ctx || ctx.removed) return
   const popover = document.createElement('div')
   popover.className = 'bil-reference-preset-popover'
   Object.assign(popover.style, {
@@ -4092,6 +4108,15 @@ async function showPresetPopover(node, clientX, clientY) {
   if (rect.right > innerWidth - 8) popover.style.left = `${Math.max(8, innerWidth - rect.width - 8)}px`
   if (rect.bottom > innerHeight - 8) popover.style.top = `${Math.max(8, innerHeight - rect.height - 8)}px`
   ctx.presetPopover = popover
+  const pointerdown = (event) => {
+    if (!popover.contains(event.target)) closePresetPopover(ctx)
+  }
+  const keydown = (event) => {
+    if (event.key === 'Escape') closePresetPopover(ctx)
+  }
+  ctx.presetPopoverDismiss = { pointerdown, keydown }
+  document.addEventListener('pointerdown', pointerdown, true)
+  document.addEventListener('keydown', keydown, true)
   select.focus({ preventScroll: true })
 }
 
@@ -4134,7 +4159,10 @@ function drawReferenceShelf(node, context) {
     ctx.referenceShelfLayout = null
     return
   }
-  if (!ctx.referenceOutputGutter) {
+  const outputGutterKey = JSON.stringify(
+    (node.outputs ?? []).map((output) => String(output?.label || output?.name || ''))
+  )
+  if (ctx.referenceOutputGutterKey !== outputGutterKey) {
     ctx.referenceOutputGutter = 72
     for (const output of node.outputs ?? []) {
       ctx.referenceOutputGutter = Math.max(
@@ -4142,6 +4170,8 @@ function drawReferenceShelf(node, context) {
         context.measureText(String(output?.label || output?.name || '')).width + 30
       )
     }
+    ctx.referenceOutputGutterKey = outputGutterKey
+    ctx.referenceShelfLayout = null
   }
   const widgetY = getFiniteNumber(node.__bilWidget?.y, node.__bilWidget?.last_y)
   const nodeWidth = getFiniteNumber(node.size?.[0])
@@ -4306,13 +4336,14 @@ function initializeNode(node, widget) {
     if (hit?.type === 'slot' && (activeReferenceDrag || hasExternalFileDrag(event))) {
       event.preventDefault?.()
       if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
-      if (node.__bil.referenceDragHoverIndex !== hit.index) {
-        node.__bil.referenceDragHoverIndex = hit.index
+      const dragCtx = node.__bil
+      if (dragCtx?.referenceDragHoverIndex !== hit.index) {
+        if (dragCtx) dragCtx.referenceDragHoverIndex = hit.index
         node.setDirtyCanvas?.(true, false)
       }
       return true
     }
-    if (node.__bil.referenceDragHoverIndex != null) {
+    if (node.__bil?.referenceDragHoverIndex != null) {
       node.__bil.referenceDragHoverIndex = null
       node.setDirtyCanvas?.(true, false)
     }
@@ -4333,7 +4364,7 @@ function initializeNode(node, widget) {
       event.stopPropagation?.()
       const drag = activeReferenceDrag
       activeReferenceDrag = null
-      node.__bil.referenceDragHoverIndex = null
+      if (node.__bil) node.__bil.referenceDragHoverIndex = null
       node.setDirtyCanvas?.(true, false)
       if (drag) return await assignReferenceDrag(node, drag, hit.index)
       if (hasExternalFileDrag(event)) {
@@ -4460,6 +4491,7 @@ function initializeNode(node, widget) {
     ctx.scrollSettleTimer = 0
     ctx.lightbox?.root?.remove?.()
     closePresetPopover(ctx)
+    if (activeReferenceDrag?.node === node) activeReferenceDrag = null
     ctx.listResizeObserver?.disconnect?.()
     ctx.listResizeObserver = null
     ctx.clearExternalDragState?.()

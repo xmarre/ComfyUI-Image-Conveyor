@@ -53,6 +53,13 @@ test('reference slot normalization rejects path escapes and unsupported storage'
   assert.deepEqual(slots, Array(8).fill(null))
 })
 
+test('reference slot normalization rejects dotless extension lookalikes', () => {
+  assert.deepEqual(
+    normalizeReferenceSlots([{ annotated: 'refs/png [input]' }]),
+    Array(8).fill(null)
+  )
+})
+
 test('reference-only assignment does not append, remove, or reorder Conveyor items', () => {
   const items = [{ id: 'A' }, { id: 'B' }]
   const state = { items, reference_slots: Array(8).fill(null) }
@@ -81,7 +88,7 @@ test('preset snapshots are detached normalized copies and dirty comparison is ex
   assert.equal(referenceSlotsEqual(loaded.slots, preset.slots), true)
   loaded.slots[0].annotated = 'refs/changed.png [input]'
   assert.equal(referenceSlotsEqual(loaded.slots, preset.slots), false)
-  assert.equal(preset.slots[0].filename, 'a.png')
+  assert.equal(preset.slots[0].annotated, 'refs/a.png [input]')
 })
 
 test('duplicate cleanup relinks sparse live reference slots without touching others', () => {
@@ -134,4 +141,26 @@ test('4x2 shelf layout and hit testing stay within measured pre-widget geometry'
     { type: 'clear', index: 0 }
   )
   assert.equal(referenceShelfHit(layout, layout.right + 1, layout.bottom + 1), null)
+})
+
+test('shelf header hit regions map to save, menu, and preset actions', () => {
+  const layout = calculateReferenceShelfLayout(520, 290, 112, 30)
+  const menuWidth = Math.min(54, layout.width * 0.18)
+  const saveWidth = Math.min(52, layout.width * 0.18)
+  const headerY = layout.top + layout.headerHeight / 2
+  assert.deepEqual(referenceShelfHit(layout, layout.right - 1, headerY), { type: 'menu' })
+  assert.deepEqual(
+    referenceShelfHit(layout, layout.right - menuWidth - 1, headerY),
+    { type: 'save' }
+  )
+  assert.deepEqual(
+    referenceShelfHit(layout, layout.right - menuWidth - saveWidth - 1, headerY),
+    { type: 'preset' }
+  )
+})
+
+test('a narrow node produces an unusable shelf layout with no hits', () => {
+  const layout = calculateReferenceShelfLayout(200, 120, 112, 30)
+  assert.equal(layout.usable, false)
+  assert.equal(referenceShelfHit(layout, layout.left + 1, layout.top + 1), null)
 })

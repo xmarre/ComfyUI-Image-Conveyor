@@ -631,7 +631,9 @@ export function normalizeReferenceSlot(value) {
   if (!annotated.endsWith(' [input]') || type !== 'input') return null
   const relativePath = annotated.slice(0, -' [input]'.length).trim().replaceAll('\\', '/')
   const parts = relativePath.split('/')
-  const extension = parts.at(-1)?.split('.').at(-1)?.toLowerCase() ?? ''
+  const lastPart = parts.at(-1) ?? ''
+  const dotIndex = lastPart.lastIndexOf('.')
+  const extension = dotIndex > 0 ? lastPart.slice(dotIndex + 1).toLowerCase() : ''
   if (
     !relativePath || relativePath.startsWith('/') || /^[a-zA-Z]:/.test(relativePath) ||
     parts.some((part) => !part || part === '.' || part === '..') ||

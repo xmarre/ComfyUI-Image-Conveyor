@@ -362,6 +362,9 @@ class InputLibraryTest(unittest.TestCase):
         self.assertFalse(self.library.preset_store.delete(alpha["id"]))
         self.assertEqual(["Gamma"], [preset["name"] for preset in self.library.preset_store.list()])
 
+        with self.assertRaises(server.PresetNotFound):
+            self.library.preset_store.update(alpha["id"], name="Missing")
+
     def test_reference_preset_rejects_missing_traversal_and_absolute_paths(self):
         invalid = (
             "missing.png [input]",
@@ -385,6 +388,21 @@ class InputLibraryTest(unittest.TestCase):
         quarantined = list(Path(path).parent.glob("reference-presets.json.corrupt-*"))
         self.assertEqual(1, len(quarantined))
         self.assertEqual("{broken", quarantined[0].read_text(encoding="utf-8"))
+
+    def test_transient_preset_read_error_does_not_quarantine_storage(self):
+        self.write_input("ref.png", b"ref")
+        slots = [None] * 8
+        slots[0] = {"annotated": "ref.png [input]", "type": "input"}
+        self.library.preset_store.create("Durable", slots)
+        path = self.library.preset_store.path
+
+        with mock.patch("builtins.open", side_effect=PermissionError("sharing violation")):
+            with self.assertRaisesRegex(PermissionError, "sharing violation"):
+                self.library.preset_store.list()
+
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual([], list(Path(path).parent.glob("reference-presets.json.corrupt-*")))
+        self.assertEqual(["Durable"], [preset["name"] for preset in self.library.preset_store.list()])
 
     def test_preset_atomic_write_leaves_no_temporary_file(self):
         self.write_input("ref.png", b"ref")
@@ -420,10 +438,46 @@ class InputLibraryTest(unittest.TestCase):
         self.library.preset_store.create("Character", slots)
         report = self.library.find_managed_duplicates()
         with mock.patch.object(self.library.preset_store, "_write_unlocked", side_effect=OSError("disk full")):
-            with self.assertRaisesRegex(OSError, "disk full"):
-                self.library.delete_managed_duplicates(report["groups"])
+            result = self.library.delete_managed_duplicates(report["groups"])
 
         self.assertTrue(os.path.exists(duplicate))
+        self.assertEqual([], result["deleted"])
+        self.assertEqual("image_conveyor/copy.png", result["skipped"][0]["relative_path"])
+        self.assertIn("disk full", result["skipped"][0]["reason"])
+
+    def test_duplicate_cleanup_reports_completed_groups_after_later_relink_failure(self):
+        self.write_input("first-original.png", b"first")
+        first_duplicate = self.write_input("image_conveyor/first-copy.png", b"first")
+        self.write_input("second-original.png", b"second")
+        second_duplicate = self.write_input("image_conveyor/second-copy.png", b"second")
+        slots = [None] * 8
+        slots[0] = {"annotated": "image_conveyor/first-copy.png [input]", "type": "input"}
+        slots[1] = {"annotated": "image_conveyor/second-copy.png [input]", "type": "input"}
+        self.library.preset_store.create("Character", slots)
+        report = self.library.find_managed_duplicates()
+        original_write = self.library.preset_store._write_unlocked
+        writes = 0
+
+        def fail_second_write(document):
+            nonlocal writes
+            writes += 1
+            if writes == 2:
+                raise OSError("disk full")
+            original_write(document)
+
+        with mock.patch.object(self.library.preset_store, "_write_unlocked", side_effect=fail_second_write):
+            result = self.library.delete_managed_duplicates(report["groups"])
+
+        self.assertEqual(1, len(result["deleted"]))
+        self.assertEqual(1, len(result["skipped"]))
+        self.assertIn("disk full", result["skipped"][0]["reason"])
+        self.assertEqual(1, sum(os.path.exists(path) for path in (first_duplicate, second_duplicate)))
+        deleted_path = result["deleted"][0]["relative_path"]
+        preset = self.library.preset_store.list()[0]
+        self.assertNotIn(
+            f"{deleted_path} [input]",
+            {slot["annotated"] for slot in preset["slots"] if slot is not None},
+        )
 
     def test_duplicate_cleanup_is_blocked_after_malformed_preset_recovery(self):
         self.write_input("original.png", b"same")
