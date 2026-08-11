@@ -44,9 +44,10 @@ jobs:
         run: |
           node --check web/image_conveyor.js
           node --check web/image_conveyor_math.mjs
+          node --check web/image_conveyor_library_ops.js
 
       - name: Check Python syntax
-        run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py
+        run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py image_conveyor_library_ops.py
 
       - name: Check whitespace errors
         shell: bash
