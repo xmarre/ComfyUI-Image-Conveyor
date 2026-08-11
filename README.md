@@ -21,7 +21,7 @@ The otherwise unused canvas area above the Conveyor/Input Folder browser contain
 - **Ref 1** through **Ref 8** map exactly to `ref_image_1` through `ref_image_8`.
 - Empty slots produce the same inactive `IMAGE` output used by an unused multi-image output.
 - References have no pending, queued, or processed state. They are never reserved or consumed and never affect `remaining_pending` or auto-queue counts.
-- Left-drag a populated slot to reorder the shelf. Right-click any shelf or browser thumbnail for the shared image menu, including full-resolution preview, image properties, path copying, and context-specific actions. The slot `×` clears only the assignment; it never deletes an image file or queue item.
+- Left-drag a populated slot to reorder the shelf. Right-click any shelf or browser thumbnail for the shared image menu, including an original-file image preview, image properties, path copying, and context-specific actions. The preview scales down to fit the available screen while retaining the source image detail; use Left/Right Arrow to move through the populated shelf slots or the current browser view. The slot `×` clears only the assignment; it never deletes an image file or queue item.
 
 Assign a reference by dragging an image card onto a slot:
 
@@ -97,7 +97,8 @@ The main browser provides:
 - name/date sorting;
 - direct click selection, Ctrl/Cmd toggling, Shift range selection, and contextual bulk actions;
 - anchored drag-box selection from the gallery background or the gaps between cards, with edge auto-scroll;
-- a shared right-click image menu with full-resolution preview, concise properties, path copying, and context-specific actions;
+- a shared right-click image menu with an original-file preview scaled to the available screen, concise properties, path copying, and context-specific actions;
+- Left/Right Arrow navigation inside the preview, scoped to the populated Reference Shelf or the current filtered/sorted browser view;
 - arrow-key navigation, Home, End, PageUp, PageDown, Space selection, and Escape to close preview;
 - **Jump to next pending**;
 - drag reorder in unfiltered manual Conveyor order.
@@ -107,7 +108,7 @@ Search and filters change the browser presentation only. Applying a Conveyor sor
 ## Performance behavior
 
 - The gallery is virtualized by logical rows. Its live card count tracks the viewport plus a small overscan, rather than the total collection size.
-- Only visible and near-visible cards request cached, bounded WebP thumbnails. Full-resolution images load only for explicit preview.
+- Only visible and near-visible cards request cached, bounded WebP thumbnails. Original image files load only for explicit preview and are scaled down to the available screen when needed.
 - Local folder tabs create browser object URLs lazily for visible cards, cap the URL cache, and defer new decodes during high-speed scrolling.
 - Input Folder enumeration and the one-per-import-batch reconciliation use lightweight `os.scandir()` metadata in a worker thread and a short-lived snapshot cache.
 - Opening and navigating a local folder tab performs no upload, content hashing, or server-side filesystem write.
@@ -115,7 +116,7 @@ Search and filters change the browser presentation only. Applying a Conveyor sor
 - Input Folder and local-folder browsing datasets are runtime-only and never enlarge workflow JSON.
 - Queue mutations still commit the compatible version-1 queue schema.
 - Multi-image execution loads and hashes only the selected group, with a maximum of nine images. It does not scan image contents across the rest of the Conveyor.
-- The Reference Shelf has a fixed cost of eight slots. It does not iterate the Conveyor or Input Folder, request presets during scroll/render frames, serialize on hover/pan/scroll, or load full-resolution shelf images for thumbnails.
+- The Reference Shelf has a fixed cost of eight slots. It does not iterate the Conveyor or Input Folder, request presets during scroll/render frames, serialize on hover/pan/scroll, or load original image files for thumbnails.
 
 The backend exposes input-only routes for recursive listing, exact upload resolution, managed duplicate cleanup, and thumbnails. Relative paths are containment-checked against ComfyUI's actual input directory; traversal, absolute paths, and symlink escapes are rejected.
 

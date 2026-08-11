@@ -88,6 +88,25 @@ export function planCardSlotReuse(previousItemIds, nextItemIds) {
   return assignments
 }
 
+export function createPreviewNavigation(entries, currentId) {
+  const images = (Array.isArray(entries) ? entries : []).filter((entry) => (
+    entry?.item && entry.item.kind !== 'folder' && entry.id != null
+  ))
+  const identity = String(currentId ?? '')
+  return {
+    entries: images,
+    index: images.findIndex((entry) => String(entry.id) === identity)
+  }
+}
+
+export function stepPreviewNavigationIndex(index, direction, length) {
+  const count = Math.max(0, Math.floor(Number(length) || 0))
+  if (!count) return -1
+  const current = Math.max(0, Math.min(count - 1, Math.floor(Number(index) || 0)))
+  const step = Number(direction) < 0 ? -1 : Number(direction) > 0 ? 1 : 0
+  return Math.max(0, Math.min(count - 1, current + step))
+}
+
 export function isHighVelocityScroll(deltaPixels, elapsedMs, rowStride) {
   const distance = Math.abs(Number(deltaPixels) || 0)
   const elapsed = Math.max(8, Number(elapsedMs) || 8)

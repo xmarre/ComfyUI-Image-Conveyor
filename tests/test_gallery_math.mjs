@@ -8,6 +8,7 @@ import {
   calculateVisibleCardRange,
   clientPointToScrollContent,
   chooseViewAfterClose,
+  createPreviewNavigation,
   dispatchKeyboundCommandFallback,
   findKeyboundCommand,
   groupDirectoryPickerFiles,
@@ -21,7 +22,8 @@ import {
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
-  restoreGraphCanvasFocus
+  restoreGraphCanvasFocus,
+  stepPreviewNavigationIndex
 } from '../web/image_conveyor_math.mjs'
 
 test('responsive metrics add columns as width grows', () => {
@@ -38,6 +40,30 @@ test('hidden gallery viewports are excluded from virtual layout', () => {
   assert.equal(isGalleryViewportMeasurable(0, 700), false)
   assert.equal(isGalleryViewportMeasurable(720, 0), false)
   assert.equal(isGalleryViewportMeasurable(Number.NaN, 700), false)
+})
+
+test('image preview navigation keeps presented order and skips folder cards', () => {
+  const first = { filename: 'first.png' }
+  const second = { filename: 'second.png' }
+  const navigation = createPreviewNavigation([
+    { id: 'first', item: first },
+    { id: 'folder', item: { kind: 'folder', filename: 'Nested' } },
+    { id: 'second', item: second }
+  ], 'second')
+
+  assert.deepEqual(navigation.entries, [
+    { id: 'first', item: first },
+    { id: 'second', item: second }
+  ])
+  assert.equal(navigation.index, 1)
+})
+
+test('image preview navigation stops at collection boundaries', () => {
+  assert.equal(stepPreviewNavigationIndex(1, -1, 4), 0)
+  assert.equal(stepPreviewNavigationIndex(1, 1, 4), 2)
+  assert.equal(stepPreviewNavigationIndex(0, -1, 4), 0)
+  assert.equal(stepPreviewNavigationIndex(3, 1, 4), 3)
+  assert.equal(stepPreviewNavigationIndex(0, 1, 0), -1)
 })
 
 test('marquee hit testing follows virtual card geometry and ignores gaps', () => {

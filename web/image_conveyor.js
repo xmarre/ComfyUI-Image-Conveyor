@@ -17,6 +17,7 @@ import {
   chooseViewAfterClose,
   clientPointToScrollContent,
   completeExecutionGroupCount,
+  createPreviewNavigation,
   dispatchKeyboundCommandFallback,
   groupDirectoryPickerFiles,
   isDragLeavingDocument,
@@ -44,7 +45,8 @@ import {
   referenceShelfHit,
   relinkReferenceSlots,
   shouldReanchorGalleryResize,
-  isConveyorDeleteShortcut
+  isConveyorDeleteShortcut,
+  stepPreviewNavigationIndex
 } from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
@@ -2374,33 +2376,114 @@ function createLightbox(node) {
   close.textContent = '×'
   close.setAttribute('aria-label', 'Close preview')
   lightbox.append(image, label, close)
+  const navigation = { entries: [], index: -1, collection: '' }
+  const renderCurrent = () => {
+    const entry = navigation.entries[navigation.index]
+    const ctx = node.__bil
+    if (!entry?.item || !ctx || ctx.removed) return false
+    const item = entry.item
+    const itemLabel = item.filename || item.relative_path || getItemDisplayPath(item)
+    image.src = filePreviewUrl(item, ctx)
+    image.alt = itemLabel
+    const position = navigation.entries.length > 1
+      ? `${navigation.index + 1} of ${navigation.entries.length}`
+      : ''
+    const context = [navigation.collection, position].filter(Boolean).join(' · ')
+    label.textContent = `${itemLabel}${context ? ` · ${context}` : ''}${navigation.entries.length > 1 ? ' · ←/→ navigate' : ''}`
+    label.title = label.textContent
+    if (item.sourceId) lightbox.dataset.sourceId = item.sourceId
+    else delete lightbox.dataset.sourceId
+    return true
+  }
+  const navigate = (direction) => {
+    const next = stepPreviewNavigationIndex(
+      navigation.index,
+      direction,
+      navigation.entries.length
+    )
+    if (next < 0 || next === navigation.index) return false
+    navigation.index = next
+    return renderCurrent()
+  }
   const hide = () => {
     lightbox.hidden = true
     image.removeAttribute('src')
+    label.textContent = ''
+    label.removeAttribute('title')
+    navigation.entries = []
+    navigation.index = -1
+    navigation.collection = ''
     delete lightbox.dataset.sourceId
     restoreGraphCanvasFocus(lightbox, app.canvas?.canvas)
   }
   close.addEventListener('click', hide)
   lightbox.addEventListener('click', (event) => { if (event.target === lightbox) hide() })
   lightbox.addEventListener('keydown', (event) => {
-    if (event.key !== 'Escape' || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      consumeGalleryKeyboardEvent(event)
+      navigate(event.key === 'ArrowLeft' ? -1 : 1)
+      return
+    }
+    if (event.key !== 'Escape') return
     consumeGalleryKeyboardEvent(event)
     hide()
   })
   document.body.appendChild(lightbox)
-  return { root: lightbox, image, label, close, hide }
+  const show = (nextNavigation) => {
+    navigation.entries = Array.isArray(nextNavigation?.entries) ? nextNavigation.entries : []
+    navigation.index = Number.isInteger(nextNavigation?.index) ? nextNavigation.index : -1
+    navigation.collection = String(nextNavigation?.collection || '')
+    if (!renderCurrent()) return false
+    lightbox.hidden = false
+    close.focus({ preventScroll: true })
+    return true
+  }
+  return { root: lightbox, image, label, close, hide, navigate, show }
 }
 
-function openPreview(node, item) {
+function previewCollectionLabel(ctx, view) {
+  if (view === 'conveyor') return 'Conveyor'
+  if (view === 'input') return 'Input Folder'
+  const browser = browserForView(ctx, view)
+  const source = browser ? ctx.browser.folderSources.get(browser.sourceId) : null
+  if (!source) return 'Folder'
+  return browser.folderPath ? `${source.name}/${browser.folderPath}` : source.name
+}
+
+function previewNavigationFor(node, item, options = {}) {
+  const ctx = node.__bil
+  const referenceIndex = Number.isInteger(options.referenceIndex) ? options.referenceIndex : null
+  if (referenceIndex != null) {
+    const slots = getRenderableState(node).state.reference_slots
+    const currentId = `reference:${referenceIndex}`
+    const result = createPreviewNavigation(
+      slots.map((reference, index) => ({ id: `reference:${index}`, item: reference })),
+      currentId
+    )
+    if (result.index >= 0) return { ...result, collection: 'Reference Shelf' }
+  }
+
+  const view = String(options.view || '')
+  if (view && view === ctx.browser.activeView) {
+    const currentId = options.itemId ?? getViewItemId(ctx, item, view)
+    const result = createPreviewNavigation(
+      (ctx.visibleItems || []).map((entry) => ({
+        id: getViewItemId(ctx, entry, view),
+        item: entry
+      })),
+      currentId
+    )
+    if (result.index >= 0) return { ...result, collection: previewCollectionLabel(ctx, view) }
+  }
+
+  return { entries: [{ id: 'current', item }], index: 0, collection: '' }
+}
+
+function openPreview(node, item, options = {}) {
   const ctx = node.__bil
   if (!ctx?.lightbox || !item || item.kind === 'folder') return
-  const label = item.filename || item.relative_path || getItemDisplayPath(item)
-  ctx.lightbox.image.src = filePreviewUrl(item, ctx)
-  ctx.lightbox.image.alt = label
-  ctx.lightbox.label.textContent = label
-  if (item.sourceId) ctx.lightbox.root.dataset.sourceId = item.sourceId
-  ctx.lightbox.root.hidden = false
-  ctx.lightbox.close.focus({ preventScroll: true })
+  ctx.lightbox.show(previewNavigationFor(node, item, options))
 }
 
 function closeImageContextMenu(ctx) {
@@ -2532,7 +2615,7 @@ function showImageContextMenu(node, item, clientX, clientY, options = {}) {
   }
 
   addSeparator()
-  const openButton = addAction('Open full resolution', () => openPreview(node, item))
+  const openButton = addAction('Open image preview', () => openPreview(node, item, options))
   addAction('Copy image path', async () => {
     const path = getInputRelativePath(item) || item.relative_path || getItemDisplayPath(item)
     if (!path || !navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable.')
@@ -3539,7 +3622,10 @@ function handleGalleryKeyDown(node, event) {
     case 'Enter':
       consumeGalleryKeyboardEvent(event)
       if (items[index].kind === 'folder') openFolderView(node, items[index].sourceId, items[index].folderPath)
-      else openPreview(node, items[index])
+      else openPreview(node, items[index], {
+        view: ctx.browser.activeView,
+        itemId: itemId(items[index])
+      })
       return true
     case ' ': {
       consumeGalleryKeyboardEvent(event)
