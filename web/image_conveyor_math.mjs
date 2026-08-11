@@ -126,6 +126,31 @@ export function restoreGraphCanvasFocus(previousOwner, canvas) {
   return !canvas.ownerDocument || canvas.ownerDocument.activeElement === canvas
 }
 
+export function isElementTreeVisible(
+  element,
+  getStyle = (current) => globalThis.getComputedStyle?.(current)
+) {
+  if (!element) return false
+  for (let current = element; current;) {
+    if (current.hidden || current.getAttribute?.('aria-hidden') === 'true') return false
+    const style = getStyle?.(current)
+    if (
+      style?.display === 'none' ||
+      style?.visibility === 'hidden' ||
+      style?.visibility === 'collapse'
+    ) return false
+    current = current.parentElement ?? current.getRootNode?.()?.host ?? null
+  }
+  return true
+}
+
+export function hasVisibleModalCandidate(
+  candidates,
+  getStyle = (element) => globalThis.getComputedStyle?.(element)
+) {
+  return Array.from(candidates ?? []).some((element) => isElementTreeVisible(element, getStyle))
+}
+
 const TEXT_INPUT_RESERVED_SHORTCUTS = new Set([
   'Ctrl+a', 'Ctrl+c', 'Ctrl+v', 'Ctrl+x', 'Ctrl+z', 'Ctrl+y', 'Ctrl+p',
   'Enter', 'Shift+Enter', 'Ctrl+Backspace', 'Ctrl+Delete',

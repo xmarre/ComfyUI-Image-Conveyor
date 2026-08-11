@@ -14,6 +14,7 @@ import {
   dispatchKeyboundCommandFallback,
   findKeyboundCommand,
   groupDirectoryPickerFiles,
+  hasVisibleModalCandidate,
   isDragLeavingDocument,
   isGalleryViewportMeasurable,
   isHighVelocityScroll,
@@ -21,6 +22,7 @@ import {
   isConveyorGalleryShortcut,
   isReservedTextInputShortcut,
   keyboardComboSignature,
+  isElementTreeVisible,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
@@ -339,6 +341,28 @@ test('fallback honors live reassignment, canvas scope, text editing, and modal s
     manager,
     { target: canvas, documentRef, modalOpen: true }
   ), false)
+})
+
+test('hidden Manager dialog descendants do not keep shortcut fallback modal-locked', () => {
+  const body = { style: { display: 'block', visibility: 'visible' }, parentElement: null }
+  const hiddenMask = {
+    style: { display: 'none', visibility: 'visible' },
+    parentElement: body,
+    getAttribute: () => null
+  }
+  const managerDialog = {
+    style: { display: 'flex', visibility: 'visible' },
+    parentElement: hiddenMask,
+    getAttribute: (name) => name === 'aria-modal' ? 'true' : null
+  }
+  const getStyle = (element) => element.style
+
+  assert.equal(isElementTreeVisible(managerDialog, getStyle), false)
+  assert.equal(hasVisibleModalCandidate([managerDialog, hiddenMask], getStyle), false)
+
+  hiddenMask.style.display = 'flex'
+  assert.equal(isElementTreeVisible(managerDialog, getStyle), true)
+  assert.equal(hasVisibleModalCandidate([managerDialog, hiddenMask], getStyle), true)
 })
 
 test('window listener ordering executes each live command once', () => {

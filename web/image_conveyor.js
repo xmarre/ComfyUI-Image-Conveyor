@@ -20,6 +20,7 @@ import {
   createPreviewNavigation,
   dispatchKeyboundCommandFallback,
   groupDirectoryPickerFiles,
+  hasVisibleModalCandidate,
   isDragLeavingDocument,
   isGalleryViewportMeasurable,
   isHighVelocityScroll,
@@ -48,7 +49,7 @@ import {
   snapshotReferenceOutputConnections,
   isConveyorDeleteShortcut,
   stepPreviewNavigationIndex
-} from './image_conveyor_math.mjs?v=66901c46d51fcf35'
+} from './image_conveyor_math.mjs?v=64d0259bdfdbb853'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -167,16 +168,9 @@ const keyboardCoordinator = {
 }
 
 function hasVisibleModal() {
-  const candidates = document.querySelectorAll(
-    'dialog[open], [aria-modal="true"], .p-dialog-mask, .comfy-modal'
+  return hasVisibleModalCandidate(
+    document.querySelectorAll('dialog[open], [aria-modal="true"], .p-dialog-mask, .comfy-modal')
   )
-  for (const element of candidates) {
-    if (element.hidden || element.getAttribute?.('aria-hidden') === 'true') continue
-    const style = globalThis.getComputedStyle?.(element)
-    if (style?.display === 'none' || style?.visibility === 'hidden') continue
-    return true
-  }
-  return false
 }
 
 function structuredCloneCompat(value) {
