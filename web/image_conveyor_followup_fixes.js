@@ -1,6 +1,19 @@
 import { app } from '../../scripts/app.js'
 import { api } from '../../scripts/api.js'
-import { normalizeReferenceSlots, referenceShelfHit } from './image_conveyor_math.mjs'
+import { normalizeReferenceSlots } from './image_conveyor_math.mjs'
+import {
+  buildRelocationMapping,
+  clone,
+  dedupeEntries,
+  indexLibraryEntries,
+  itemId,
+  itemPath,
+  normalizePath,
+  parentPath,
+  pathName,
+  pathReference,
+  updatedEntry
+} from './image_conveyor_followup_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.FollowupFixes'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -10,55 +23,9 @@ const SERVER_INPUT_SOURCE_ID = '__image_conveyor_input__'
 const nodes = new Set()
 let relocationSequence = 0
 let relocationSyncPromise = null
+let relocationSyncRequested = 0
+let relocationSyncCompleted = 0
 let migrationPromise = null
-
-function clone(value) {
-  if (typeof structuredClone === 'function') return structuredClone(value)
-  return JSON.parse(JSON.stringify(value))
-}
-
-function normalizePath(value) {
-  const raw = String(value ?? '').trim().replace(/\\/g, '/')
-  if (!raw || raw.startsWith('/') || /^[a-zA-Z]:/.test(raw)) return ''
-  const parts = raw.split('/').filter(Boolean)
-  if (!parts.length || parts.some((part) => part === '.' || part === '..')) return ''
-  return parts.join('/')
-}
-
-function parentPath(path) {
-  const value = normalizePath(path)
-  const index = value.lastIndexOf('/')
-  return index < 0 ? '' : value.slice(0, index)
-}
-
-function pathName(path) {
-  const value = normalizePath(path)
-  const index = value.lastIndexOf('/')
-  return index < 0 ? value : value.slice(index + 1)
-}
-
-function itemPath(item) {
-  if (!item || item.kind === 'folder' || item.localFile) return ''
-  const explicit = normalizePath(item.relative_path)
-  if (explicit) return explicit
-  const annotated = String(item.annotated ?? '')
-  return normalizePath(annotated.replace(/ \[(input|output|temp)\]$/, ''))
-}
-
-function itemId(item) {
-  return String(item?.key ?? item?.relative_path ?? item?.id ?? '')
-}
-
-function pathReference(path) {
-  const normalized = normalizePath(path)
-  if (!normalized) return null
-  return {
-    annotated: `${normalized} [input]`,
-    filename: pathName(normalized),
-    subfolder: parentPath(normalized),
-    type: 'input'
-  }
-}
 
 function widget(node, name) {
   return (node.widgets ?? []).find((entry) => entry?.name === name) ?? null
@@ -155,29 +122,6 @@ function queuedPaths() {
   return result
 }
 
-function updatedEntry(entry, keepPath) {
-  const next = { ...entry }
-  next.relative_path = keepPath
-  next.filename = pathName(keepPath)
-  next.subfolder = parentPath(keepPath)
-  if (next.annotated) next.annotated = `${keepPath} [input]`
-  if (next.source_path) next.source_path = keepPath
-  return next
-}
-
-function dedupeEntries(entries) {
-  const result = []
-  const seen = new Set()
-  for (const entry of Array.isArray(entries) ? entries : []) {
-    if (!entry || entry.kind === 'folder') { result.push(entry); continue }
-    const key = itemPath(entry) || itemId(entry)
-    if (key && seen.has(key)) continue
-    if (key) seen.add(key)
-    result.push(entry)
-  }
-  return result
-}
-
 function patchLibraryCaches(mapping) {
   for (const node of nodes) {
     const ctx = node.__bil
@@ -189,11 +133,11 @@ function patchLibraryCaches(mapping) {
       return keep ? updatedEntry(entry, keep) : entry
     }))
     ext.allFiles = rewrite(ext.allFiles)
+    const indexes = indexLibraryEntries(ext.allFiles)
 
     if (ext.inputMode === 'folders') {
       const folders = (ctx.browser.input.files ?? []).filter((entry) => entry?.kind === 'folder')
-      const files = ext.allFiles.filter((entry) => entry?.kind !== 'folder' && parentPath(itemPath(entry)) === '')
-      ext.displayFiles = dedupeEntries([...folders, ...files])
+      ext.displayFiles = dedupeEntries([...folders, ...(indexes.byParent.get('') ?? [])])
     } else {
       ext.displayFiles = ext.allFiles
     }
@@ -203,17 +147,20 @@ function patchLibraryCaches(mapping) {
       if (browser.sourceKind === 'server-input' || browser.sourceId === SERVER_INPUT_SOURCE_ID) {
         const folder = String(browser.folderPath || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
         const folders = (browser.entries ?? []).filter((entry) => entry?.kind === 'folder')
-        const files = ext.allFiles.filter((entry) => entry?.kind !== 'folder' && parentPath(itemPath(entry)) === folder)
-        browser.entries = dedupeEntries([...folders, ...files])
+        browser.entries = dedupeEntries([...folders, ...(indexes.byParent.get(folder) ?? [])])
       } else if (browser.sourceKind === 'character') {
         const folder = String(ctx.folderTabElements?.get(viewId)?.tab?.title || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
         const logical = rewrite(browser.entries)
-        const physical = folder ? ext.allFiles.filter((entry) => itemPath(entry).startsWith(`${folder}/`)) : []
+        const physical = folder ? (indexes.byCharacterFolder.get(folder) ?? []) : []
         browser.entries = dedupeEntries([...logical, ...physical])
       }
       if (browser.selected instanceof Set) {
         const valid = new Set((browser.entries ?? browser.files ?? []).map(itemId))
-        browser.selected = new Set(Array.from(browser.selected).map((id) => mapping.get(id) || id).filter((id) => valid.has(id)))
+        browser.selected = new Set(
+          Array.from(browser.selected)
+            .map((id) => mapping.get(id) || id)
+            .filter((id) => valid.has(id))
+        )
       }
     }
     ext.dataRevision = (ext.dataRevision || 0) + 1
@@ -223,12 +170,7 @@ function patchLibraryCaches(mapping) {
 }
 
 function applyMappings(entries) {
-  const mapping = new Map()
-  for (const entry of entries ?? []) {
-    const oldPath = normalizePath(entry?.relative_path)
-    const keepPath = normalizePath(entry?.keep_path)
-    if (oldPath && keepPath && oldPath !== keepPath) mapping.set(oldPath, keepPath)
-  }
+  const mapping = buildRelocationMapping(entries)
   if (!mapping.size) return 0
 
   let changedCount = 0
@@ -268,8 +210,12 @@ function applyMappings(entries) {
 
 async function refreshPresetCaches() {
   let payload
-  try { payload = await jsonRequest('/image-conveyor/reference-presets') }
-  catch (error) { console.warn('Image Conveyor: unable to refresh saved character references.', error); return }
+  try {
+    payload = await jsonRequest('/image-conveyor/reference-presets')
+  } catch (error) {
+    console.warn('Image Conveyor: unable to refresh saved character references.', error)
+    return
+  }
   for (const node of nodes) {
     const ctx = node.__bil
     if (!ctx || ctx.removed) continue
@@ -282,33 +228,63 @@ async function refreshPresetCaches() {
   }
 }
 
-async function syncRelocations() {
-  if (relocationSyncPromise) return relocationSyncPromise
-  relocationSyncPromise = (async () => {
-    const payload = await jsonRequest(`/image-conveyor/relocations?after=${relocationSequence}`)
-    relocationSequence = Math.max(relocationSequence, Number(payload?.sequence || 0))
-    const moved = Array.isArray(payload?.moved) ? payload.moved : []
-    if (moved.length) {
-      applyMappings(moved)
-      await refreshPresetCaches()
+async function runRelocationSyncOnce() {
+  const payload = await jsonRequest(`/image-conveyor/relocations?after=${relocationSequence}`)
+  relocationSequence = Math.max(relocationSequence, Number(payload?.sequence || 0))
+  const moved = Array.isArray(payload?.moved) ? payload.moved : []
+  if (moved.length) {
+    applyMappings(moved)
+    await refreshPresetCaches()
+  }
+  return moved
+}
+
+async function ensureRelocationGeneration(targetGeneration) {
+  const aggregate = []
+  while (relocationSyncCompleted < targetGeneration) {
+    if (!relocationSyncPromise) {
+      const runGeneration = relocationSyncRequested
+      relocationSyncPromise = runRelocationSyncOnce()
+        .catch((error) => {
+          console.warn('Image Conveyor: relocation synchronization failed.', error)
+          return []
+        })
+        .finally(() => {
+          relocationSyncCompleted = Math.max(relocationSyncCompleted, runGeneration)
+          relocationSyncPromise = null
+        })
     }
-    return moved
-  })().catch((error) => {
-    console.warn('Image Conveyor: relocation synchronization failed.', error)
-    return []
-  }).finally(() => { relocationSyncPromise = null })
-  return relocationSyncPromise
+    aggregate.push(...await relocationSyncPromise)
+  }
+  return aggregate
+}
+
+async function syncRelocations() {
+  const targetGeneration = ++relocationSyncRequested
+  return await ensureRelocationGeneration(targetGeneration)
+}
+
+function setMigrationDeferred(deferred) {
+  for (const node of nodes) {
+    const ext = node.__bil?.icx
+    if (!ext) continue
+    ext.followupMigrationDeferred = Boolean(deferred)
+  }
 }
 
 async function migrateCharacters() {
   if (migrationPromise) return migrationPromise
   migrationPromise = (async () => {
     const aggregate = []
+    let deferred = false
+    const protectedPaths = Array.from(queuedPaths())
     const payload = await jsonRequest('/image-conveyor/character-folders/migrate', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ protected_paths: Array.from(queuedPaths()) })
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ protected_paths: protectedPaths })
     })
     if (payload?.moved?.length) aggregate.push(...payload.moved)
+    if (payload?.skipped?.length) deferred = true
 
     const live = new Map()
     for (const node of nodes) {
@@ -316,7 +292,10 @@ async function migrateCharacters() {
       const presetId = String(state.active_reference_preset_id || '')
       if (!presetId) continue
       let paths = live.get(presetId)
-      if (!paths) { paths = new Set(); live.set(presetId, paths) }
+      if (!paths) {
+        paths = new Set()
+        live.set(presetId, paths)
+      }
       for (const slot of normalizeReferenceSlots(state.reference_slots)) {
         const path = itemPath(slot)
         if (path) paths.add(path)
@@ -324,47 +303,53 @@ async function migrateCharacters() {
     }
     for (const [presetId, paths] of live) {
       if (!paths.size) continue
-      const result = await jsonRequest(`/image-conveyor/character-folders/${encodeURIComponent(presetId)}/materialize`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ relative_paths: Array.from(paths), protected_paths: Array.from(queuedPaths()) })
-      })
-      if (result?.moved?.length) aggregate.push(...result.moved)
+      try {
+        const result = await jsonRequest(
+          `/image-conveyor/character-folders/${encodeURIComponent(presetId)}/materialize`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              relative_paths: Array.from(paths),
+              protected_paths: protectedPaths
+            })
+          }
+        )
+        if (result?.moved?.length) aggregate.push(...result.moved)
+        if (result?.skipped?.length) deferred = true
+      } catch (error) {
+        deferred = true
+        console.warn(`Image Conveyor: unable to migrate live references for character '${presetId}'.`, error)
+      }
     }
     if (aggregate.length) applyMappings(aggregate)
     await syncRelocations()
     await refreshPresetCaches()
+    setMigrationDeferred(deferred)
     for (const node of nodes) node.__bil?.refreshBtn?.click?.()
     return payload
   })().catch((error) => {
     console.warn('Image Conveyor: character-folder migration failed.', error)
+    setMigrationDeferred(true)
     return null
-  }).finally(() => { migrationPromise = null })
+  }).finally(() => {
+    migrationPromise = null
+  })
   return migrationPromise
-}
-
-function nodePoint(node, event) {
-  try { app.canvas?.adjustMouseEvent?.(event) } catch {}
-  const x = Number(event?.canvasX)
-  const y = Number(event?.canvasY)
-  if (!Number.isFinite(x) || !Number.isFinite(y)) return null
-  return { x: x - Number(node.pos?.[0] || 0), y: y - Number(node.pos?.[1] || 0) }
-}
-
-function shelfHit(node, event) {
-  const ctx = node.__bil
-  const point = ctx?.referenceShelfLayout ? nodePoint(node, event) : null
-  return point ? referenceShelfHit(ctx.referenceShelfLayout, point.x, point.y) : null
 }
 
 function installNode(node) {
   const ctx = node.__bil
-  if (!ctx?.icx?.batchDragV2 || ctx.icx.followupFixes || ctx.removed) return false
+  if (!ctx?.icx || ctx.icx.followupFixes || ctx.removed) return false
   const ext = ctx.icx
   ext.followupFixes = true
   ext.followupInputVersion = ctx.inputVersion
   ext.followupMigrationSignature = ''
+  ext.followupMigrationDeferred = false
   nodes.add(node)
 
+  // requestRender (batch drag) and requestMainRender (library operations) dispatch
+  // synthetic search input events only to request a render; those must not reset scroll.
   ext.followupSearchGuard = (event) => {
     if (event.isTrusted || event.target !== ctx.searchInput) return
     if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) return
@@ -387,45 +372,13 @@ function installNode(node) {
   }
   ctx.list?.addEventListener('pointerdown', ext.followupScrollbarGuard, true)
 
-  ext.followupRefresh = () => queueMicrotask(() => void syncRelocations())
-  ctx.refreshBtn?.addEventListener('click', ext.followupRefresh)
-
-  const previousDrop = node.onDragDrop
-  node.onDragDrop = async function (event) {
-    const hit = shelfHit(node, event)
-    const state = readState(node)
-    const presetId = String(state.active_reference_preset_id || '')
-    const drag = ctx.icx?.batchDrag ?? ctx.icx?.cardDrag
-    const internalPaths = Array.from(drag?.items ?? []).map(itemPath).filter(Boolean)
-    const protectedSet = queuedPaths()
-    if (hit?.type === 'slot' && presetId && internalPaths.some((path) => protectedSet.has(path))) {
-      event.preventDefault?.()
-      event.stopPropagation?.()
-      const result = await jsonRequest(`/image-conveyor/character-folders/${encodeURIComponent(presetId)}/materialize`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ relative_paths: internalPaths, protected_paths: Array.from(protectedSet) })
-      })
-      if (result?.moved?.length) applyMappings(result.moved)
-      const refs = (result?.files ?? []).map((entry) => pathReference(entry.relative_path)).filter(Boolean)
-      if (refs.length) {
-        const next = readState(node)
-        const slots = normalizeReferenceSlots(next.reference_slots)
-        refs.forEach((ref, offset) => {
-          const index = hit.index + offset
-          if (index < slots.length) slots[index] = ref
-        })
-        next.reference_slots = slots
-        writeState(node, next)
-      }
-      await syncRelocations()
-      ctx.refreshBtn?.click?.()
-      if (result?.skipped?.length) {
-        window.alert(`${result.skipped.length} queued reference image${result.skipped.length === 1 ? ' was' : 's were'} left in place.`)
-      }
-      return true
-    }
-    return await previousDrop?.call(this, event)
+  ext.followupRefresh = () => {
+    queueMicrotask(() => {
+      void syncRelocations()
+      void migrateCharacters()
+    })
   }
+  ctx.refreshBtn?.addEventListener('click', ext.followupRefresh)
 
   const previousDraw = node.onDrawForeground
   node.onDrawForeground = function (...args) {
@@ -435,12 +388,17 @@ function installNode(node) {
       renderPreservingScroll(node)
     }
     const state = readState(node)
-    const saved = (ctx.presets ?? []).map((preset) => `${preset.id}:${(preset.slots ?? []).map((slot) => slot?.annotated || '').join(',')}`).join('|')
+    const saved = (ctx.presets ?? [])
+      .map((preset) => `${preset.id}:${(preset.slots ?? []).map((slot) => slot?.annotated || '').join(',')}`)
+      .join('|')
     const live = `${state.active_reference_preset_id || ''}:${normalizeReferenceSlots(state.reference_slots).map((slot) => slot?.annotated || '').join(',')}`
-    const queued = Array.from(queuedPaths()).sort().join(',')
-    const signature = `${saved}|live=${live}|queued=${queued}`
+    const signature = `${saved}|live=${live}`
     if (signature !== ext.followupMigrationSignature) {
       ext.followupMigrationSignature = signature
+      void migrateCharacters()
+    } else if (ext.followupMigrationDeferred && queuedPaths().size === 0) {
+      // A protected migration is retried once when the queue drains, not on every queue-state repaint.
+      ext.followupMigrationDeferred = false
       void migrateCharacters()
     }
     return result
