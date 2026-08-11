@@ -233,6 +233,51 @@ def copy_input_files(
     }
 
 
+def _replace_character_members_with_materialized_paths(
+    registry,
+    preset_id: str,
+    source_paths: Sequence[str],
+    target_paths: Sequence[str],
+) -> Dict[str, Any]:
+    """Replace logical source memberships with their physical character-folder paths atomically."""
+    if len(source_paths) != len(target_paths):
+        raise InvalidLibraryOperation("Character materialization produced an inconsistent path mapping.")
+    normalized_id = registry._normalize_preset_id(preset_id)
+    mapping = dict(zip(source_paths, target_paths))
+    with registry._lock:
+        document = registry._load_unlocked()
+        entry = document["characters"].get(normalized_id)
+        if entry is None:
+            raise InvalidLibraryOperation("Character folder not found. Refresh character presets and try again.")
+
+        for target_path in target_paths:
+            _regular_input_file(registry.input_root, target_path)
+
+        before = list(entry.get("members", []))
+        next_members = []
+        seen = set()
+        for member in before:
+            replacement = mapping.get(member, member)
+            if replacement in seen:
+                continue
+            seen.add(replacement)
+            next_members.append(replacement)
+        for target_path in target_paths:
+            if target_path in seen:
+                continue
+            seen.add(target_path)
+            next_members.append(target_path)
+
+        if next_members != before:
+            entry["members"] = next_members
+            registry._write_unlocked(document)
+        return {
+            "preset_id": normalized_id,
+            "folder": entry["folder"],
+            "members": list(next_members),
+        }
+
+
 def materialize_character_files(
     service,
     preset_id: Any,
@@ -247,16 +292,22 @@ def materialize_character_files(
     if character is None:
         raise InvalidLibraryOperation("Character folder not found. Refresh character presets and try again.")
 
+    source_paths = _normalize_path_batch(relative_paths)
     membership_result = None
 
-    def finalize(paths: List[str]):
+    def finalize(target_paths: List[str]):
         nonlocal membership_result
-        membership_result = registry.add_members(normalized_id, paths)
+        membership_result = _replace_character_members_with_materialized_paths(
+            registry,
+            normalized_id,
+            source_paths,
+            target_paths,
+        )
         return membership_result
 
     result = copy_input_files(
         service,
-        relative_paths,
+        source_paths,
         character["folder"],
         finalize=finalize,
     )
