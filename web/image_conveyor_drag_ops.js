@@ -315,15 +315,18 @@ async function uploadOne(file, destinationFolder, session = null) {
   return path
 }
 
-async function copyInputPaths(paths, destinationFolder) {
+async function relocateResolvedInputPaths(paths, destinationFolder) {
   const normalized = Array.from(new Set(paths.map(normalizePath).filter(Boolean)))
-  if (!normalized.length) return []
-  const payload = await jsonRequest('/image-conveyor/input-files/copy', {
+  if (!normalized.length) return { files: [], skipped: [] }
+  return await jsonRequest('/image-conveyor/input-files/copy', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ relative_paths: normalized, destination_subfolder: destinationFolder })
+    body: JSON.stringify({
+      relative_paths: normalized,
+      destination_subfolder: destinationFolder,
+      protected_paths: Array.from(getQueuedInputPaths())
+    })
   })
-  return Array.isArray(payload?.files) ? payload.files : []
 }
 
 async function moveInputPaths(paths, destinationFolder) {
@@ -605,9 +608,10 @@ async function dropBatchIntoFolder(node, batch, destination) {
   }
   if (uploadedPaths.length) {
     // resolve-upload may deduplicate to an existing canonical Input path outside the requested
-    // folder. Materialize that canonical file into the explicit drag destination.
-    const copied = await copyInputPaths(uploadedPaths, destination.folder)
-    finalPaths.push(...copied.map((entry) => normalizePath(entry.relative_path)).filter(Boolean))
+    // folder. Canonical relocation moves that one physical file into the requested destination.
+    const relocated = await relocateResolvedInputPaths(uploadedPaths, destination.folder)
+    finalPaths.push(...(relocated?.files ?? []).map((entry) => normalizePath(entry.relative_path)).filter(Boolean))
+    skipped.push(...(Array.isArray(relocated?.skipped) ? relocated.skipped : []))
   }
 
   if (destination.characterId && finalPaths.length) {
@@ -673,12 +677,19 @@ async function materializeCharacterDrop(node, startIndex, batch, externalFiles) 
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ relative_paths: sourcePaths })
+      body: JSON.stringify({
+        relative_paths: sourcePaths,
+        protected_paths: Array.from(getQueuedInputPaths())
+      })
     }
   )
+  const skipped = Array.isArray(payload?.skipped) ? payload.skipped : []
   const references = (Array.isArray(payload?.files) ? payload.files : [])
     .map((entry) => pathToReference(entry.relative_path))
     .filter(Boolean)
+  if (skipped.length) {
+    window.alert(`${skipped.length} queued reference image${skipped.length === 1 ? ' was' : 's were'} left in place and not reassigned.`)
+  }
   if (!references.length) return false
 
   const next = readState(node)
@@ -899,7 +910,7 @@ function installNode(node) {
         return await materializeCharacterDrop(node, hit.index, { items: [], sourceView: 'external' }, files)
       } catch (error) {
         console.error('Image Conveyor: character materialization failed.', error)
-        window.alert(error?.message || 'Unable to copy the selected images into the active character folder.')
+        window.alert(error?.message || 'Unable to move the selected images into the active character folder.')
         return false
       }
     }
