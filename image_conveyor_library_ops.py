@@ -27,8 +27,13 @@ CHARACTER_FOLDER_ROOT = "image_conveyor_characters"
 REGISTRY_VERSION = 1
 MAX_BATCH_ITEMS = 10000
 _COPY_CHUNK_SIZE = 1024 * 1024
+_DIRECTORY_CACHE_TTL_SECONDS = 2.0
 _REGISTRY_LOCKS_GUARD = threading.Lock()
 _REGISTRY_LOCKS: Dict[str, threading.RLock] = {}
+_DIRECTORY_CACHE_LOCK = threading.Lock()
+_DIRECTORY_CACHE: Dict[str, Tuple[float, Tuple[str, ...]]] = {}
+_LIBRARY_ROUTES_REGISTERED = False
+_LIBRARY_ROUTES_MARKER = "_image_conveyor_library_routes_registered"
 
 
 class InvalidLibraryOperation(ValueError):
@@ -287,6 +292,36 @@ def _normalize_protected_paths(values: Any) -> set:
     return set(_normalize_path_batch(values))
 
 
+def _validate_directory(input_root: str, relative_folder: str) -> str:
+    folder = _normalize_subfolder(relative_folder)
+    root = os.path.realpath(input_root)
+    if not folder:
+        return root
+    current = root
+    segments = folder.split("/")
+    for index, segment in enumerate(segments):
+        candidate = os.path.join(current, segment)
+        try:
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            lexical = os.path.abspath(os.path.join(candidate, *segments[index + 1:]))
+            try:
+                if os.path.commonpath((root, lexical)) != root:
+                    raise InvalidInputPath("The destination folder escapes the ComfyUI input directory.")
+            except ValueError as exc:
+                raise InvalidInputPath("The destination folder escapes the ComfyUI input directory.") from exc
+            return lexical
+        if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISDIR(info.st_mode):
+            raise InvalidInputPath("The destination folder contains a symlink or non-directory component.")
+        current = candidate
+    try:
+        if os.path.commonpath((root, os.path.realpath(current))) != root:
+            raise InvalidInputPath("The destination folder escapes the ComfyUI input directory.")
+    except ValueError as exc:
+        raise InvalidInputPath("The destination folder escapes the ComfyUI input directory.") from exc
+    return current
+
+
 def _ensure_directory(input_root: str, relative_folder: str) -> str:
     folder = _normalize_subfolder(relative_folder)
     root = os.path.realpath(input_root)
@@ -460,6 +495,17 @@ def _restore_failed_preset_slots(
     return next_document
 
 
+def _invalidate_input_directory_cache(input_root: str) -> None:
+    root = os.path.realpath(input_root)
+    with _DIRECTORY_CACHE_LOCK:
+        _DIRECTORY_CACHE.pop(root, None)
+
+
+def _invalidate_library_snapshot(service) -> None:
+    service.invalidate_snapshot()
+    _invalidate_input_directory_cache(service.input_root)
+
+
 def move_input_files(
     service,
     relative_paths: Sequence[Any],
@@ -470,7 +516,6 @@ def move_input_files(
     paths = _normalize_path_batch(relative_paths)
     destination_folder = _normalize_subfolder(destination_subfolder)
     protected = _normalize_protected_paths(protected_paths)
-    _ensure_directory(service.input_root, destination_folder)
 
     skipped = [
         {"relative_path": path, "reason": "The file is reserved by a queued Conveyor item."}
@@ -483,26 +528,51 @@ def move_input_files(
     presets_relinked = 0
     registry_relinked = 0
 
+    if not candidates:
+        return {
+            "moved": mappings,
+            "skipped": skipped,
+            "presets_relinked": presets_relinked,
+            "character_members_relinked": registry_relinked,
+        }
+
     with ExitStack() as locks:
         lock_keys = {f"dir:{destination_folder.casefold()}"}
         lock_keys.update(path.casefold() for path in candidates)
         for key in sorted(lock_keys):
             locks.enter_context(service._key_lock(service._destination_locks, key))
 
-        destination_directory = _ensure_directory(service.input_root, destination_folder)
-        plan = []
-        reserved_targets = set()
+        validated = []
         for relative_path in candidates:
             try:
                 source, source_stat = _regular_input_file(service.input_root, relative_path)
             except FileNotFoundError:
                 skipped.append({"relative_path": relative_path, "reason": "The file disappeared before the move."})
                 continue
-            filename = PurePosixPath(relative_path).name
-            direct_target = f"{destination_folder}/{filename}" if destination_folder else filename
+            direct_target = (
+                f"{destination_folder}/{PurePosixPath(relative_path).name}"
+                if destination_folder
+                else PurePosixPath(relative_path).name
+            )
             if direct_target == relative_path:
                 skipped.append({"relative_path": relative_path, "reason": "The file is already in that folder."})
                 continue
+            validated.append((relative_path, source, source_stat))
+
+        if not validated:
+            return {
+                "moved": mappings,
+                "skipped": skipped,
+                "presets_relinked": presets_relinked,
+                "character_members_relinked": registry_relinked,
+            }
+
+        _validate_directory(service.input_root, destination_folder)
+        plan = []
+        reserved_targets = set()
+        for relative_path, source, source_stat in validated:
+            filename = PurePosixPath(relative_path).name
+            direct_target = f"{destination_folder}/{filename}" if destination_folder else filename
 
             if collision_safe:
                 target_relative = _candidate_path(
@@ -524,6 +594,7 @@ def move_input_files(
             target = os.path.abspath(os.path.join(service.input_root, *target_relative.split("/")))
             plan.append((relative_path, source, source_stat, target_relative, target))
 
+        destination_directory = _ensure_directory(service.input_root, destination_folder)
         try:
             for old_relative, source, expected, new_relative, target in plan:
                 current = os.lstat(source)
@@ -568,7 +639,7 @@ def move_input_files(
             raise
 
     if mappings:
-        service.invalidate_snapshot()
+        _invalidate_library_snapshot(service)
     return {
         "moved": mappings,
         "skipped": skipped,
@@ -596,7 +667,14 @@ def delete_input_files(
     store = service.preset_store
 
     with ExitStack() as locks:
-        for key in sorted(path.casefold() for path in candidates):
+        lock_keys = set()
+        for path in candidates:
+            lock_keys.add(path.casefold())
+            parent = str(PurePosixPath(path).parent)
+            if parent == ".":
+                parent = ""
+            lock_keys.add(f"dir:{parent.casefold()}")
+        for key in sorted(lock_keys):
             locks.enter_context(service._key_lock(service._destination_locks, key))
 
         validated = []
@@ -673,13 +751,25 @@ def delete_input_files(
                         )
 
             if failed_paths and presets_cleared:
-                restored_document = _restore_failed_preset_slots(
-                    store,
-                    cleared_document,
-                    document_before,
-                    failed_paths,
-                )
-                store._write_unlocked(restored_document)
+                try:
+                    restored_document = _restore_failed_preset_slots(
+                        store,
+                        cleared_document,
+                        document_before,
+                        failed_paths,
+                    )
+                    store._write_unlocked(restored_document)
+                    _remaining_document, presets_cleared = _preset_document_with_cleared_paths(
+                        store,
+                        document_before,
+                        {entry["relative_path"] for entry in deleted},
+                    )
+                except Exception:
+                    LOGGER.critical(
+                        "Image Conveyor could not restore preset slots for files that failed to delete: %s",
+                        ", ".join(sorted(failed_paths)),
+                        exc_info=True,
+                    )
 
     deleted_paths = [entry["relative_path"] for entry in deleted]
     members_removed = 0
@@ -688,7 +778,7 @@ def delete_input_files(
             members_removed = _registry_for_service(service).remove_paths(deleted_paths)
         except Exception:
             LOGGER.exception("Image Conveyor could not prune deleted files from character-library metadata.")
-        service.invalidate_snapshot()
+        _invalidate_library_snapshot(service)
     return {
         "deleted": deleted,
         "skipped": skipped,
@@ -700,37 +790,52 @@ def delete_input_files(
 
 def list_input_directories(input_root: str) -> List[str]:
     root = os.path.realpath(input_root)
-    directories = []
-    stack = [(root, "")]
-    while stack:
-        directory, relative = stack.pop()
-        try:
-            entries = list(os.scandir(directory))
-        except (FileNotFoundError, PermissionError, OSError):
-            continue
-        entries.sort(key=lambda entry: entry.name.casefold(), reverse=True)
-        for entry in entries:
-            if entry.name.startswith("."):
-                continue
+    now = time.monotonic()
+    with _DIRECTORY_CACHE_LOCK:
+        cached = _DIRECTORY_CACHE.get(root)
+        if cached is not None and now - cached[0] < _DIRECTORY_CACHE_TTL_SECONDS:
+            return list(cached[1])
+
+        directories = []
+        stack = [(root, "")]
+        while stack:
+            directory, relative = stack.pop()
             try:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
+                entries = list(os.scandir(directory))
             except OSError:
                 continue
-            child = f"{relative}/{entry.name}" if relative else entry.name
-            child = child.replace("\\", "/")
-            directories.append(child)
-            stack.append((entry.path, child))
-    directories.sort(key=lambda value: (value.casefold(), value))
-    return directories
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                child = f"{relative}/{entry.name}" if relative else entry.name
+                child = child.replace("\\", "/")
+                directories.append(child)
+                stack.append((entry.path, child))
+        directories.sort(key=lambda value: (value.casefold(), value))
+        snapshot = tuple(directories)
+        _DIRECTORY_CACHE[root] = (time.monotonic(), snapshot)
+        return list(snapshot)
 
 
 def register_library_routes() -> None:
-    import folder_paths
-    from aiohttp import web
-    from server import PromptServer
+    global _LIBRARY_ROUTES_REGISTERED
+    if _LIBRARY_ROUTES_REGISTERED:
+        return
 
-    routes = PromptServer.instance.routes
+    import folder_paths
+    import server as comfy_server
+    from aiohttp import web
+
+    if getattr(comfy_server, _LIBRARY_ROUTES_MARKER, False):
+        _LIBRARY_ROUTES_REGISTERED = True
+        return
+
+    routes = comfy_server.PromptServer.instance.routes
 
     @routes.get("/image-conveyor/input-directories")
     async def image_conveyor_input_directories(_request):
@@ -791,6 +896,7 @@ def register_library_routes() -> None:
             presets = await asyncio.to_thread(service.preset_store.list)
             registry = _registry_for_service(service)
             characters = await asyncio.to_thread(registry.ensure_for_presets, presets)
+            _invalidate_input_directory_cache(service.input_root)
             return web.json_response({"characters": characters})
         except (InvalidLibraryOperation, InvalidInputPath, InvalidPreset, ValueError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
@@ -818,3 +924,6 @@ def register_library_routes() -> None:
         except Exception:
             LOGGER.exception("Image Conveyor failed to update character library membership.")
             return web.json_response({"error": "Unable to update the character library."}, status=500)
+
+    setattr(comfy_server, _LIBRARY_ROUTES_MARKER, True)
+    _LIBRARY_ROUTES_REGISTERED = True
