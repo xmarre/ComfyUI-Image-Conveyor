@@ -39,15 +39,18 @@ jobs:
           node --test tests/test_gallery_math.mjs
           node --test tests/test_queue_groups.mjs
           node --test tests/test_reference_shelf.mjs
+          node --test tests/test_drag_math.mjs
 
       - name: Check JavaScript syntax
         run: |
           node --check web/image_conveyor.js
           node --check web/image_conveyor_math.mjs
           node --check web/image_conveyor_library_ops.js
+          node --check web/image_conveyor_drag_ops.js
+          node --check web/image_conveyor_drag_math.mjs
 
       - name: Check Python syntax
-        run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py image_conveyor_library_ops.py
+        run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py image_conveyor_library_ops.py image_conveyor_drag_ops.py
 
       - name: Check whitespace errors
         shell: bash
