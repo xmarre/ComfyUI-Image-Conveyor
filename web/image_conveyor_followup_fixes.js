@@ -348,15 +348,21 @@ function installNode(node) {
   ext.followupMigrationDeferred = false
   nodes.add(node)
 
-  // requestRender (batch drag) and requestMainRender (library operations) dispatch
-  // synthetic search input events only to request a render; those must not reset scroll.
+  // Extension layers use a synthetic search event as their request for an authoritative
+  // full gallery render. Preserve the active scroll anchor, but let the main input handler
+  // run so it recomputes visibleItems and binds newly inserted cards/thumbnails.
   ext.followupSearchGuard = (event) => {
     if (event.isTrusted || event.target !== ctx.searchInput) return
-    if (ctx.pendingScrollRestore?.view === ctx.browser.activeView) return
-    event.stopImmediatePropagation()
+    const view = ctx.browser.activeView
     const browser = activeBrowser(ctx)
-    if (browser) browser.query = String(ctx.searchInput.value || '')
-    renderPreservingScroll(node)
+    const existingRestore = ctx.pendingScrollRestore?.view === view
+      ? ctx.pendingScrollRestore
+      : null
+    const scrollTop = Number(
+      existingRestore?.scrollTop ?? ctx.list?.scrollTop ?? browser?.scrollTop ?? 0
+    )
+    if (browser) browser.scrollTop = scrollTop
+    ctx.pendingScrollRestore = { view, scrollTop }
   }
   ctx.searchInput?.addEventListener('input', ext.followupSearchGuard, true)
 
