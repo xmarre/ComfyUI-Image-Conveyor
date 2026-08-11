@@ -40,6 +40,7 @@ import {
   effectiveQueueGroupSize,
   classifyReferenceDrag,
   loadPresetSnapshot,
+  referencePresetDisplay,
   referenceShelfHit,
   relinkReferenceSlots,
   shouldReanchorGalleryResize,
@@ -2412,6 +2413,7 @@ function closeImageContextMenu(ctx) {
   }
   ctx.imageContextMenu?.remove?.()
   ctx.imageContextMenu = null
+  ctx.imageContextMenuSource = null
 }
 
 function localImageProperties(ctx, item) {
@@ -2560,6 +2562,11 @@ function showImageContextMenu(node, item, clientX, clientY, options = {}) {
   if (rect.right > innerWidth - 8) menu.style.left = `${Math.max(8, innerWidth - rect.width - 8)}px`
   if (rect.bottom > innerHeight - 8) menu.style.top = `${Math.max(8, innerHeight - rect.height - 8)}px`
   ctx.imageContextMenu = menu
+  ctx.imageContextMenuSource = {
+    item,
+    itemId: options.itemId ?? null,
+    referenceIndex: Number.isInteger(options.referenceIndex) ? options.referenceIndex : null
+  }
 
   const pointerdown = (event) => {
     if (!menu.contains(event.target)) closeImageContextMenu(ctx)
@@ -2589,6 +2596,110 @@ function showImageContextMenu(node, item, clientX, clientY, options = {}) {
     properties.textContent = error?.message || 'Properties unavailable.'
   })
   return true
+}
+
+function consumeImageContextPointer(event) {
+  event?.preventDefault?.()
+  event?.stopPropagation?.()
+  event?.stopImmediatePropagation?.()
+}
+
+const imageContextMenuCoordinator = {
+  nodes: new Set(),
+  windowPointerDownHandler: null,
+  hookedCanvas: null,
+  previousCanvasOnMouse: null,
+  canvasOnMouseHandler: null,
+
+  registerNode(node) {
+    this.nodes.add(node)
+    this.attachWindowCapture()
+    this.ensureCanvasHook()
+  },
+
+  unregisterNode(node) {
+    this.nodes.delete(node)
+    if (this.nodes.size) return
+    if (this.windowPointerDownHandler) {
+      window.removeEventListener('pointerdown', this.windowPointerDownHandler, true)
+      this.windowPointerDownHandler = null
+    }
+    if (this.hookedCanvas?.onMouse === this.canvasOnMouseHandler) {
+      this.hookedCanvas.onMouse = this.previousCanvasOnMouse
+    }
+    this.hookedCanvas = null
+    this.previousCanvasOnMouse = null
+    this.canvasOnMouseHandler = null
+  },
+
+  attachWindowCapture() {
+    if (this.windowPointerDownHandler) return
+    this.windowPointerDownHandler = (event) => this.handleDomPointerDown(event)
+    window.addEventListener('pointerdown', this.windowPointerDownHandler, true)
+  },
+
+  ensureCanvasHook() {
+    const graphCanvas = app.canvas
+    if (!graphCanvas || graphCanvas === this.hookedCanvas) return
+    if (this.hookedCanvas?.onMouse === this.canvasOnMouseHandler) {
+      this.hookedCanvas.onMouse = this.previousCanvasOnMouse
+    }
+    this.hookedCanvas = graphCanvas
+    const previousCanvasOnMouse = graphCanvas.onMouse
+    this.previousCanvasOnMouse = previousCanvasOnMouse
+    const coordinator = this
+    this.canvasOnMouseHandler = function (event) {
+      if (coordinator.handleCanvasPointerDown(event)) return true
+      return previousCanvasOnMouse?.call(this, event)
+    }
+    graphCanvas.onMouse = this.canvasOnMouseHandler
+  },
+
+  handleDomPointerDown(event) {
+    if (event?.button !== 2) return false
+    const target = eventOrigin(event)
+    if (!(target instanceof Element)) return false
+    for (const node of this.nodes) {
+      const ctx = node?.__bil
+      if (!ctx || ctx.removed || !ctx.root?.contains(target)) continue
+      const slot = ctx.cardPool.find((entry) => (
+        entry.itemId &&
+        entry.item?.kind !== 'folder' &&
+        entry.media?.contains(target)
+      ))
+      if (!slot) return false
+      const item = slot.item
+      const itemId = slot.itemId
+      const view = ctx.browser.activeView
+      const clientX = event.clientX
+      const clientY = event.clientY
+      consumeImageContextPointer(event)
+      queueMicrotask(() => {
+        if (
+          node.__bil !== ctx || ctx.removed ||
+          slot.item !== item || slot.itemId !== itemId
+        ) return
+        showImageContextMenu(node, item, clientX, clientY, { view, itemId })
+      })
+      return true
+    }
+    return false
+  },
+
+  handleCanvasPointerDown(event) {
+    if (event?.button !== 2) return false
+    const node = getCanvasNodeAtEvent(event)
+    if (!node || !this.nodes.has(node)) return false
+    const hit = referenceShelfEventHit(node, event)
+    if (hit?.type !== 'slot' && hit?.type !== 'clear') return false
+    const reference = getRenderableState(node).state.reference_slots[hit.index]
+    if (!reference) return false
+    if (!showImageContextMenu(node, reference, event.clientX, event.clientY, {
+      referenceIndex: hit.index
+    })) return false
+    consumeImageContextPointer(event)
+    return true
+  }
 }
 
 function clearCardDragTargets(ctx, except = null) {
@@ -2843,12 +2954,16 @@ function createCardSlot(node, ctx) {
   })
   media.addEventListener('contextmenu', (event) => {
     if (!slot.itemId || slot.item?.kind === 'folder') return
-    event.preventDefault()
-    event.stopPropagation()
-    showImageContextMenu(node, slot.item, event.clientX, event.clientY, {
-      view: ctx.browser.activeView,
-      itemId: slot.itemId
-    })
+    consumeImageContextPointer(event)
+    if (
+      ctx.imageContextMenuSource?.item !== slot.item ||
+      ctx.imageContextMenuSource?.itemId !== slot.itemId
+    ) {
+      showImageContextMenu(node, slot.item, event.clientX, event.clientY, {
+        view: ctx.browser.activeView,
+        itemId: slot.itemId
+      })
+    }
   })
   const thumb = document.createElement('img')
   thumb.className = 'bil-thumb'
@@ -3647,7 +3762,7 @@ function buildGalleryDom(node) {
     referenceThumbs: new Map(), presets: [],
     presetsLoaded: false, presetsPromise: null, presetRequestId: 0,
     presetPopover: null, presetPopoverDismiss: null,
-    imageContextMenu: null, imageContextMenuDismiss: null
+    imageContextMenu: null, imageContextMenuDismiss: null, imageContextMenuSource: null
   }
   const ctx = node.__bil
   ctx.lightbox = createLightbox(node)
@@ -4129,6 +4244,18 @@ function activeReferencePreset(ctx, state) {
   return ctx.presets.find((preset) => preset?.id === id) ?? null
 }
 
+function hydrateReferencePresetName(node, state) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed || !String(state?.active_reference_preset_id ?? '').trim()) return
+  queueMicrotask(() => {
+    if (node.__bil !== ctx || ctx.removed) return
+    void loadReferencePresets(node).catch((error) => {
+      if (node.__bil !== ctx || ctx.removed) return
+      console.warn('Image Conveyor: unable to load reference preset names.', error)
+    })
+  })
+}
+
 async function createReferencePreset(node, name, slots) {
   const payload = await presetRequest('', {
     method: 'POST',
@@ -4402,17 +4529,12 @@ function drawReferenceShelf(node, context) {
   }
   const layout = ctx.referenceShelfLayout
   if (!layout.usable) return
-  const active = activeReferencePreset(ctx, state)
-  let dirty = false
-  if (active) {
-    for (let index = 0; index < REFERENCE_SLOT_COUNT; index += 1) {
-      if (state.reference_slots[index]?.annotated !== active.slots[index]?.annotated) {
-        dirty = true
-        break
-      }
-    }
-  }
-  const characterLabel = active ? `${active.name}${dirty ? ' *' : ''}` : 'Unsaved references'
+  const characterLabel = referencePresetDisplay(
+    ctx.presets,
+    ctx.presetsLoaded,
+    state.active_reference_preset_id,
+    state.reference_slots
+  ).label
   context.save()
   context.font = '12px sans-serif'
   context.textBaseline = 'middle'
@@ -4586,6 +4708,7 @@ function initializeNode(node, widget) {
   attachQueueLifecycle(node)
   autoQueueCoordinator.registerNode(node)
   canvasDropCoordinator.registerNode(node)
+  imageContextMenuCoordinator.registerNode(node)
 
   chainNodeCallback(node, 'onDrawForeground', function (context) {
     drawReferenceShelf(node, context)
@@ -4730,6 +4853,7 @@ function initializeNode(node, widget) {
       markNodeDirty(node)
     }
     cacheRenderableState(node, snapshot.state, snapshot.uiState)
+    hydrateReferencePresetName(node, snapshot.state)
     queueMicrotask(() => scheduleRenderNode(node))
   })
 
@@ -4741,6 +4865,7 @@ function initializeNode(node, widget) {
   chainNodeCallback(node, 'onRemoved', function () {
     autoQueueCoordinator.unregisterNode(node)
     canvasDropCoordinator.unregisterNode(node)
+    imageContextMenuCoordinator.unregisterNode(node)
     keyboardCoordinator.unregisterNode(node)
     const ctx = node.__bil
     if (!ctx) return
@@ -4830,13 +4955,7 @@ function initializeNode(node, widget) {
     markNodeDirty(node)
   }
   cacheRenderableState(node, snapshot.state, snapshot.uiState)
-  if (snapshot.state.active_reference_preset_id) {
-    queueMicrotask(() => {
-      void loadReferencePresets(node).catch((error) => {
-        console.warn('Image Conveyor: unable to load reference preset names.', error)
-      })
-    })
-  }
+  hydrateReferencePresetName(node, snapshot.state)
   queueMicrotask(() => scheduleRenderNode(node))
   keyboardCoordinator.registerNode(node)
   return widget

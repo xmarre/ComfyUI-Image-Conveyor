@@ -702,6 +702,34 @@ export function referenceSlotsEqual(left, right) {
   ))
 }
 
+export function referencePresetDisplay(presets, presetsLoaded, activePresetId, currentSlots) {
+  const id = String(activePresetId ?? '').trim()
+  const active = (Array.isArray(presets) ? presets : [])
+    .find((preset) => String(preset?.id ?? '') === id) ?? null
+  if (!active) {
+    return {
+      active: null,
+      dirty: false,
+      label: id && !presetsLoaded ? 'Loading character…' : 'Unsaved references'
+    }
+  }
+
+  const slots = Array.isArray(currentSlots) ? currentSlots : []
+  const presetSlots = Array.isArray(active.slots) ? active.slots : []
+  let dirty = false
+  for (let index = 0; index < REFERENCE_SLOT_COUNT; index += 1) {
+    if (slots[index]?.annotated !== presetSlots[index]?.annotated) {
+      dirty = true
+      break
+    }
+  }
+  return {
+    active,
+    dirty,
+    label: `${active.name}${dirty ? ' *' : ''}`
+  }
+}
+
 export function relinkReferenceSlots(slots, replacements) {
   const normalized = normalizeReferenceSlots(slots)
   const mapping = new Map()

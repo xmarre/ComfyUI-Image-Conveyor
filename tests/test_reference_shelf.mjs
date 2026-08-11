@@ -12,6 +12,7 @@ import {
   moveReferenceSlot,
   normalizeOutputMode,
   normalizeReferenceSlots,
+  referencePresetDisplay,
   referenceShelfHit,
   referenceSlotsEqual,
   relinkReferenceSlots
@@ -103,6 +104,27 @@ test('preset snapshots are detached normalized copies and dirty comparison is ex
   loaded.slots[0].annotated = 'refs/changed.png [input]'
   assert.equal(referenceSlotsEqual(loaded.slots, preset.slots), false)
   assert.equal(preset.slots[0].annotated, 'refs/a.png [input]')
+})
+
+test('saved preset labels distinguish startup hydration from unsaved references', () => {
+  const slots = normalizeReferenceSlots([reference('a')])
+  assert.deepEqual(referencePresetDisplay([], false, 'preset-id', slots), {
+    active: null,
+    dirty: false,
+    label: 'Loading character…'
+  })
+  assert.equal(referencePresetDisplay([], false, '', slots).label, 'Unsaved references')
+
+  const preset = { id: 'preset-id', name: 'Mara', slots }
+  assert.deepEqual(referencePresetDisplay([preset], true, 'preset-id', slots), {
+    active: preset,
+    dirty: false,
+    label: 'Mara'
+  })
+  assert.equal(
+    referencePresetDisplay([preset], true, 'preset-id', [reference('changed')]).label,
+    'Mara *'
+  )
 })
 
 test('duplicate cleanup relinks sparse live reference slots without touching others', () => {
