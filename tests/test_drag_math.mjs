@@ -36,8 +36,30 @@ test('inserting a selected block into its existing span is a no-op', () => {
   assert.deepEqual(ids(result.items), ['a', 'b', 'c', 'd'])
 })
 
+test('returns unchanged results for empty, unknown, full, or non-array selections', () => {
+  const source = items('a', 'b', 'c')
+  assert.equal(reorderSelectedItems(source, [], 1).changed, false)
+  assert.equal(reorderSelectedItems(source, ['z'], 1).changed, false)
+  assert.equal(reorderSelectedItems(source, ['a', 'b', 'c'], 0).changed, false)
+  assert.deepEqual(ids(reorderSelectedItems(null, ['a'], 0).items), [])
+})
+
+test('clamps negative and out-of-range insertion indexes', () => {
+  const source = items('a', 'b', 'c')
+  assert.deepEqual(ids(reorderSelectedItems(source, ['c'], -5).items), ['c', 'a', 'b'])
+  assert.deepEqual(ids(reorderSelectedItems(source, ['a'], 99).items), ['b', 'c', 'a'])
+})
+
 test('card intent mirrors single-item forward/backward semantics', () => {
   const source = items('a', 'b', 'c', 'd')
   assert.equal(cardIntentInsertionIndex(source, 'b', 'd'), 4)
   assert.equal(cardIntentInsertionIndex(source, 'd', 'b'), 1)
+})
+
+test('card intent rejects identical or unknown ids', () => {
+  const source = items('a', 'b')
+  assert.equal(cardIntentInsertionIndex(source, 'a', 'a'), -1)
+  assert.equal(cardIntentInsertionIndex(source, 'a', 'z'), -1)
+  assert.equal(cardIntentInsertionIndex(source, 'z', 'a'), -1)
+  assert.equal(cardIntentInsertionIndex(null, 'a', 'b'), -1)
 })
