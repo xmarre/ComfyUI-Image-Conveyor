@@ -480,7 +480,13 @@ async function loadInputDirectories(node) {
 }
 
 async function syncCharacterFolders(force = false) {
-  if (characterSyncPromise && !force) return characterSyncPromise
+  if (characterSyncPromise) {
+    if (!force) return characterSyncPromise
+    return characterSyncPromise.then(
+      () => syncCharacterFolders(false),
+      () => syncCharacterFolders(false)
+    )
+  }
   const request = jsonRequest('/image-conveyor/character-folders').then((payload) => {
     const next = new Map()
     for (const character of Array.isArray(payload?.characters) ? payload.characters : []) {
@@ -705,7 +711,8 @@ async function moveSelectedInput(node) {
   const currentFolder = character?.folder ?? (browser?.sourceKind === 'server-input' ? browser.folderPath : '') ?? ''
   const destination = window.prompt(
     `Move ${paths.length} selected input image${paths.length === 1 ? '' : 's'} to which input subfolder?\n\n` +
-    'Use an existing folder path or type a new one. Leave empty to move to the input root.',
+    'Use an existing folder path or type a new one. Leave empty to move to the input root.\n\n' +
+    'Moving changes the ComfyUI input-relative path. Open Image Conveyor entries and saved character references are relinked automatically; closed workflow files may still contain the old path.',
     currentFolder
   )
   if (destination == null) return
@@ -889,6 +896,7 @@ function gatherCardDrag(node, slot) {
     node,
     view,
     items: items.filter(Boolean),
+    sourceCard: slot.card,
     sourceIsServerInput: isServerLibraryView(ctx, view),
     startedAt: Date.now()
   }
@@ -917,6 +925,16 @@ function handleCardDragStart(node, event) {
 function clearCardDrag(node) {
   const ext = node.__bil?.icx
   if (ext) ext.cardDrag = null
+}
+
+function releaseMainCardDrag(drag) {
+  const sourceCard = drag?.sourceCard
+  if (!(sourceCard instanceof HTMLElement)) return
+  try {
+    sourceCard.dispatchEvent(new Event('dragend', { bubbles: true }))
+  } catch {
+    // The browser will still emit its native dragend event when available.
+  }
 }
 
 function nodePoint(node, event) {
@@ -1247,6 +1265,7 @@ function installNodeEnhancement(node) {
     event.stopPropagation()
     event.stopImmediatePropagation?.()
     clearCardDrag(node)
+    releaseMainCardDrag(drag)
     void moveInputPaths(node, paths, target.item.folderPath).then((result) => {
       const skipped = result?.skipped?.length ?? 0
       if (skipped) window.alert(`${skipped} image${skipped === 1 ? ' was' : 's were'} not moved: ${result.skipped[0]?.reason || 'filesystem changed'}`)
@@ -1345,6 +1364,7 @@ function installNodeEnhancement(node) {
         && drag.items[0]?.localFile instanceof File
         && !state.active_reference_preset_id
       if (oneLocalWithoutCharacter) return await previousDragDrop?.call(this, event)
+      releaseMainCardDrag(drag)
       return await assignReferences(node, hit.index, drag.items, [])
     }
     if (hit?.type === 'slot') {
@@ -1376,6 +1396,7 @@ function installNodeEnhancement(node) {
   enhancedNodes.add(node)
   rebuildInputViews(node)
   updateEnhancedControls(node)
+  requestMainRender(node)
   void syncCharacterFolders().catch((error) => console.warn('Image Conveyor: character-folder initialization failed.', error))
   return true
 }
