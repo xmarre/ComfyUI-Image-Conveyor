@@ -47,7 +47,7 @@ import {
   shouldReanchorGalleryResize,
   isConveyorDeleteShortcut,
   stepPreviewNavigationIndex
-} from './image_conveyor_math.mjs'
+} from './image_conveyor_math.mjs?v=ad0ed464cebafbf2'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])

@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import {
   calculateGalleryMetrics,
@@ -25,6 +27,20 @@ import {
   restoreGraphCanvasFocus,
   stepPreviewNavigationIndex
 } from '../web/image_conveyor_math.mjs'
+
+test('production helper import is cache-keyed to the helper contents', async () => {
+  const helperUrl = new URL('../web/image_conveyor_math.mjs', import.meta.url)
+  const extensionUrl = new URL('../web/image_conveyor.js', import.meta.url)
+  const [helper, extension] = await Promise.all([
+    readFile(helperUrl),
+    readFile(extensionUrl, 'utf8')
+  ])
+  const cacheKey = createHash('sha256').update(helper).digest('hex').slice(0, 16)
+  assert.match(
+    extension,
+    new RegExp(`from ['"]\\./image_conveyor_math\\.mjs\\?v=${cacheKey}['"]`)
+  )
+})
 
 test('responsive metrics add columns as width grows', () => {
   const medium = calculateGalleryMetrics(520, 172, 10)
