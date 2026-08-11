@@ -57,6 +57,10 @@ function itemInputPath(item) {
   return normalizePath(annotatedPath(item.annotated))
 }
 
+function itemViewId(item) {
+  return String(item?.key ?? item?.relative_path ?? item?.id ?? '')
+}
+
 function isImageFile(file) {
   if (!(file instanceof File)) return false
   if (String(file.type || '').startsWith('image/')) return true
@@ -153,8 +157,51 @@ function cardSlotAtTarget(ctx, target) {
   return ctx.cardPool?.find((slot) => slot?.itemId && slot.card?.contains(target)) ?? null
 }
 
+function browserForView(ctx, view) {
+  return ctx.browser?.[view] ?? ctx.browser?.folderViews?.get(view) ?? null
+}
+
 function activeBrowser(ctx) {
-  return ctx.browser?.[ctx.browser.activeView] ?? ctx.browser?.folderViews?.get(ctx.browser.activeView) ?? null
+  return browserForView(ctx, ctx.browser.activeView)
+}
+
+function selectionItemsForDrag(node, sourceView, draggedItem, fallbackItems = []) {
+  const ctx = node.__bil
+  const browser = browserForView(ctx, sourceView)
+  const selected = browser?.selected instanceof Set
+    ? browser.selected
+    : new Set(Array.from(browser?.selected ?? []))
+  const draggedId = itemViewId(draggedItem)
+  if (!draggedId || !selected.has(draggedId) || selected.size < 2) {
+    return Array.from(fallbackItems?.length ? fallbackItems : [draggedItem]).filter(Boolean)
+  }
+
+  if (sourceView === 'conveyor') {
+    const selectedItems = readState(node).items.filter((item) => selected.has(itemViewId(item)))
+    return selectedItems.length ? selectedItems : Array.from(fallbackItems).filter(Boolean)
+  }
+
+  const result = []
+  const seen = new Set()
+  const collect = (entries) => {
+    for (const item of Array.isArray(entries) ? entries : []) {
+      if (!item || item.kind === 'folder') continue
+      const id = itemViewId(item)
+      if (!id || !selected.has(id) || seen.has(id)) continue
+      seen.add(id)
+      result.push(item)
+    }
+  }
+
+  // Preserve the visible UI ordering first, then recover selected virtualized/off-screen
+  // entries from the browser's backing data rather than silently dropping them.
+  collect(ctx.visibleItems)
+  collect(browser?.entries)
+  collect(browser?.files)
+  if (sourceView === 'input') collect(ctx.icx?.allFiles)
+  collect(fallbackItems)
+  if (!seen.has(draggedId) && draggedItem) result.push(draggedItem)
+  return result
 }
 
 function getQueuedInputPaths() {
@@ -292,6 +339,19 @@ async function getCharacter(presetId) {
   ) ?? null
 }
 
+function characterDestinationFromView(ctx, viewId, browser, element) {
+  const elements = ctx.folderTabElements?.get(viewId)
+  const folder = normalizeFolder(elements?.tab?.title)
+  if (folder == null) return null
+  return {
+    key: `character:${viewId}`,
+    folder,
+    characterId: String(browser?.characterId || ''),
+    element,
+    open: null
+  }
+}
+
 function destinationFromTab(ctx, target) {
   if (!(target instanceof Node)) return null
   if (ctx.inputTab?.contains(target)) {
@@ -308,15 +368,9 @@ function destinationFromTab(ctx, target) {
     const browser = ctx.browser.folderViews.get(viewId)
     if (!browser) return null
     if (browser.sourceKind === 'character') {
-      const folder = normalizeFolder(elements.tab.title)
-      if (folder == null) return null
-      return {
-        key: viewId,
-        folder,
-        characterId: String(browser.characterId || ''),
-        element: elements.tab,
-        open: () => elements.tab.click()
-      }
+      const destination = characterDestinationFromView(ctx, viewId, browser, elements.tab)
+      if (destination) destination.open = () => elements.tab.click()
+      return destination
     }
     if (browser.sourceKind === 'server-input' || browser.sourceId === SERVER_INPUT_SOURCE_ID) {
       const folder = normalizeFolder(browser.folderPath || '')
@@ -347,8 +401,42 @@ function destinationFromFolderCard(ctx, target) {
   }
 }
 
+function destinationFromActiveLibraryArea(ctx, target) {
+  if (!(target instanceof Node) || !ctx.list?.contains(target)) return null
+  const viewId = ctx.browser.activeView
+  if (viewId === 'conveyor') return null
+  if (viewId === 'input') {
+    return {
+      key: 'active:input',
+      folder: '',
+      characterId: null,
+      element: ctx.list,
+      open: null
+    }
+  }
+  const browser = ctx.browser.folderViews.get(viewId)
+  if (!browser) return null
+  if (browser.sourceKind === 'character') {
+    return characterDestinationFromView(ctx, viewId, browser, ctx.list)
+  }
+  if (browser.sourceKind === 'server-input' || browser.sourceId === SERVER_INPUT_SOURCE_ID) {
+    const folder = normalizeFolder(browser.folderPath || '')
+    if (folder == null) return null
+    return {
+      key: `active:${viewId}`,
+      folder,
+      characterId: null,
+      element: ctx.list,
+      open: null
+    }
+  }
+  return null
+}
+
 function destinationAt(ctx, target) {
-  return destinationFromTab(ctx, target) ?? destinationFromFolderCard(ctx, target)
+  return destinationFromTab(ctx, target)
+    ?? destinationFromFolderCard(ctx, target)
+    ?? destinationFromActiveLibraryArea(ctx, target)
 }
 
 function clearHoverTarget(ext) {
@@ -361,10 +449,12 @@ function setHoverTarget(ext, destination) {
   if (ext.batchHover?.key === destination.key) return
   clearHoverTarget(ext)
   destination.element?.classList.add('icx-batch-drop-target')
-  const timer = setTimeout(() => {
-    if (ext.batchHover?.key !== destination.key) return
-    destination.open?.()
-  }, HOVER_OPEN_MS)
+  const timer = destination.open
+    ? setTimeout(() => {
+        if (ext.batchHover?.key !== destination.key) return
+        destination.open?.()
+      }, HOVER_OPEN_MS)
+    : null
   ext.batchHover = { ...destination, timer }
 }
 
@@ -522,6 +612,11 @@ function handleMultiReorderDrop(node, event, batch) {
   } else if (intent && Number.isFinite(Number(intent.insertionIndex))) {
     insertionIndex = Number(intent.insertionIndex)
   }
+  if (insertionIndex < 0) {
+    const target = cardSlotAtTarget(ctx, event.target)
+    const targetId = String(target?.item?.id || '')
+    if (targetId) insertionIndex = cardIntentInsertionIndex(state.items, batch.draggedId || ctx.draggedId, targetId)
+  }
 
   if (insertionIndex >= 0) {
     const reordered = reorderSelectedItems(state.items, selectedIds, insertionIndex)
@@ -566,23 +661,28 @@ function installNode(node) {
   ext.batchHover = null
   patchedNodes.add(node)
 
-  ext.batchDocumentDragStart = (event) => {
+  ext.batchWindowDragStart = (event) => {
     const target = event.target
     if (!(target instanceof Node) || !ctx.root?.contains(target)) return
+    const sourceView = ctx.browser.activeView
+    const slot = cardSlotAtTarget(ctx, target)
+    const draggedItem = slot?.item ?? null
     queueMicrotask(() => {
       if (node.__bil !== ctx || ctx.removed) return
       const drag = ext.cardDrag
-      if (!drag?.items?.length) return
+      if (!drag?.items?.length && !draggedItem) return
+      const items = selectionItemsForDrag(node, sourceView, draggedItem, drag?.items ?? [])
+      if (!items.length) return
       ext.batchDrag = {
-        ...drag,
-        sourceView: drag.view ?? ctx.browser.activeView,
-        items: Array.from(drag.items),
-        draggedId: ctx.draggedId || String(drag.items[0]?.id || '')
+        ...(drag ?? {}),
+        sourceView,
+        items,
+        draggedId: itemViewId(draggedItem) || ctx.draggedId || itemViewId(items[0])
       }
     })
   }
 
-  ext.batchDocumentDragOver = (event) => {
+  ext.batchWindowDragOver = (event) => {
     const batch = batchFromInternalDrag(ctx) ?? batchFromExternalFiles(event)
     if (!batch) { clearHoverTarget(ext); return }
     const destination = destinationAt(ctx, event.target)
@@ -593,7 +693,7 @@ function installNode(node) {
     setHoverTarget(ext, destination)
   }
 
-  ext.batchDocumentDrop = (event) => {
+  ext.batchWindowDrop = (event) => {
     const batch = batchFromInternalDrag(ctx) ?? batchFromExternalFiles(event)
     if (!batch) return
 
@@ -616,15 +716,18 @@ function installNode(node) {
     })
   }
 
-  ext.batchDocumentDragEnd = () => {
+  ext.batchWindowDragEnd = () => {
     clearHoverTarget(ext)
     ext.batchDrag = null
   }
 
-  document.addEventListener('dragstart', ext.batchDocumentDragStart, true)
-  document.addEventListener('dragover', ext.batchDocumentDragOver, true)
-  document.addEventListener('drop', ext.batchDocumentDrop, true)
-  document.addEventListener('dragend', ext.batchDocumentDragEnd, true)
+  // Window capture deliberately precedes the older document/root drop handlers. Folder
+  // targets are owned here so an OS-file drop cannot be consumed by the legacy single-drop
+  // path before physical materialization/collision handling runs.
+  window.addEventListener('dragstart', ext.batchWindowDragStart, true)
+  window.addEventListener('dragover', ext.batchWindowDragOver, true)
+  window.addEventListener('drop', ext.batchWindowDrop, true)
+  window.addEventListener('dragend', ext.batchWindowDragEnd, true)
 
   const previousDragDrop = node.onDragDrop
   node.onDragDrop = async function (event) {
@@ -654,10 +757,10 @@ function installNode(node) {
   node.onRemoved = function (...args) {
     clearHoverTarget(ext)
     patchedNodes.delete(node)
-    document.removeEventListener('dragstart', ext.batchDocumentDragStart, true)
-    document.removeEventListener('dragover', ext.batchDocumentDragOver, true)
-    document.removeEventListener('drop', ext.batchDocumentDrop, true)
-    document.removeEventListener('dragend', ext.batchDocumentDragEnd, true)
+    window.removeEventListener('dragstart', ext.batchWindowDragStart, true)
+    window.removeEventListener('dragover', ext.batchWindowDragOver, true)
+    window.removeEventListener('drop', ext.batchWindowDrop, true)
+    window.removeEventListener('dragend', ext.batchWindowDragEnd, true)
     return previousRemoved?.apply(this, args)
   }
   return true
