@@ -643,6 +643,26 @@ export function effectiveQueueGroupSize(outputMode, imagesPerExecution) {
     : 1
 }
 
+export function connectedReferenceOutputSlots(outputs, firstOutputIndex = 6) {
+  const source = Array.isArray(outputs) ? outputs : []
+  const slots = []
+  for (let index = 0; index < REFERENCE_SLOT_COUNT; index += 1) {
+    const links = source[firstOutputIndex + index]?.links
+    if (Array.isArray(links) && links.length > 0) slots.push(index + 1)
+  }
+  return slots
+}
+
+export function snapshotReferenceOutputConnections(payload, outputMode, outputs) {
+  if (!payload || normalizeOutputMode(outputMode, 1, true) !== OUTPUT_MODE_PERSISTENT) {
+    return payload
+  }
+  return {
+    ...payload,
+    reference_output_slots: connectedReferenceOutputSlots(outputs)
+  }
+}
+
 export function normalizeReferenceSlot(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const annotated = String(value.annotated ?? '').trim()

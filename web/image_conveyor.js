@@ -45,9 +45,10 @@ import {
   referenceShelfHit,
   relinkReferenceSlots,
   shouldReanchorGalleryResize,
+  snapshotReferenceOutputConnections,
   isConveyorDeleteShortcut,
   stepPreviewNavigationIndex
-} from './image_conveyor_math.mjs?v=ad0ed464cebafbf2'
+} from './image_conveyor_math.mjs?v=66901c46d51fcf35'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -1918,10 +1919,12 @@ function attachQueueLifecycle(node) {
     const { state } = getCurrentState(node)
     const count = effectiveQueueGroupSize(state.output_mode, state.images_per_execution)
     const group = findNextLoadGroup(state)
-    updateQueueWidget(
-      node,
-      group.length === count ? makeQueueReservationPayload(group) : null
+    const payload = snapshotReferenceOutputConnections(
+      group.length === count ? makeQueueReservationPayload(group) : null,
+      state.output_mode,
+      node.outputs
     )
+    updateQueueWidget(node, payload)
   }
 
   queueWidget.afterQueued = () => {
@@ -3758,6 +3761,7 @@ function buildGalleryDom(node) {
   const outputModeSelect = document.createElement('select')
   outputModeSelect.className = 'bil-select'
   outputModeSelect.setAttribute('aria-label', 'Additional image output mode')
+  outputModeSelect.title = 'Persistent references always advances one Conveyor image and uses only populated shelf slots whose reference outputs are connected.'
   ;[
     [OUTPUT_MODE_PERSISTENT, 'Persistent references'],
     [OUTPUT_MODE_QUEUE_GROUP, 'Queue execution group']

@@ -134,6 +134,8 @@ Each Conveyor item has one of three states:
 
 This is the default for newly created nodes. One main Conveyor item is reserved and selected per execution regardless of the stored `images_per_execution` value. Only that item participates in queue status, consumption, `remaining_pending`, and auto-queue arithmetic. `ref_image_1` through `ref_image_8` come from the fixed Reference Shelf.
 
+At queue time the node snapshots the exact connected reference-output sockets. Only populated shelf slots whose matching `ref_image_*` output is connected are validated, content-hashed, and decoded. Connected empty slots remain inactive (`None`), so optional/autogrow consumers such as MiniMax H3 simply skip them; eight connected reference outputs are safe with only four populated shelf slots. Unconnected shelf entries remain saved and visible without adding execution or cache work. Prompts created by an older frontend without a connection snapshot retain the previous all-populated-slots behavior for compatibility.
+
 ### Queue execution group
 
 This preserves the multi-image queue-group behavior introduced in v1.2. **Images per execution** controls the size of one ordered execution group:

@@ -60,6 +60,14 @@ def grouped_payload(*entries):
     })
 
 
+def persistent_payload(entry, connected_slots):
+    return json.dumps({
+        "id": entry["id"],
+        "annotated": entry["annotated"],
+        "reference_output_slots": connected_slots,
+    })
+
+
 class ImageConveyorStateTest(unittest.TestCase):
     def setUp(self):
         FILE_PATHS.clear()
@@ -113,6 +121,21 @@ class ImageConveyorStateTest(unittest.TestCase):
         state = conveyor._normalize_state(self.state(entries, images_per_execution=9, output_mode="persistent_refs"))
         selected = conveyor._select_group(state, "")
         self.assertEqual(["A"], [entry["id"] for _, entry in selected])
+
+    def test_persistent_reference_connection_snapshot_is_strict_and_legacy_compatible(self):
+        state = conveyor._normalize_state(self.state([item("A")], output_mode="persistent_refs"))
+        self.assertEqual(tuple(range(1, 9)), conveyor._active_reference_slots(state, ""))
+        self.assertEqual((1, 4, 8), conveyor._active_reference_slots(
+            state, persistent_payload(item("A"), [1, 4, 8])
+        ))
+        self.assertEqual((), conveyor._active_reference_slots(
+            state, persistent_payload(item("A"), [])
+        ))
+        for invalid in ([0], [9], [2, 2], [2, 1], [True], ["1"]):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                RuntimeError, "reference output connection snapshot is invalid"
+            ):
+                conveyor._active_reference_slots(state, persistent_payload(item("A"), invalid))
 
     def test_reference_slots_normalize_to_fixed_sparse_eight(self):
         reference = {"annotated": "refs/one.png [input]", "filename": "one.png", "subfolder": "refs", "type": "input"}
@@ -329,6 +352,60 @@ class ImageConveyorStateTest(unittest.TestCase):
         self.assertIsNone(result[8])
         self.assertEqual(result[6], result[9])
 
+    def test_persistent_loads_only_connected_populated_reference_outputs(self):
+        main = item("A")
+        refs = [
+            {"annotated": f"R{index}.png [input]", "filename": f"R{index}.png", "subfolder": "", "type": "input"}
+            if index <= 4 else None
+            for index in range(1, 9)
+        ]
+        result = conveyor.ImageConveyor().load_next(
+            self.state(
+                [main, item("B")],
+                images_per_execution=9,
+                output_mode="persistent_refs",
+                reference_slots=refs,
+            ),
+            queue_item_json=persistent_payload(main, list(range(1, 9))),
+        )["result"]
+
+        self.assertEqual("image:A.png [input]", result[0])
+        self.assertEqual(
+            [f"image:R{index}.png [input]" for index in range(1, 5)],
+            list(result[6:10]),
+        )
+        self.assertEqual([None] * 4, list(result[10:14]))
+        self.assertEqual(
+            ["A.png [input]", "R1.png [input]", "R2.png [input]", "R3.png [input]", "R4.png [input]"],
+            FakeLoadImage.calls,
+        )
+        delta = json.loads(conveyor.ImageConveyor().load_next(
+            self.state(
+                [main, item("B")],
+                images_per_execution=9,
+                output_mode="persistent_refs",
+                reference_slots=refs,
+            ),
+            queue_item_json=persistent_payload(main, list(range(1, 9))),
+        )["ui"]["batch_image_loader_delta"][0])
+        self.assertEqual(["A"], [entry["id"] for entry in delta["processed_items"]])
+
+    def test_unconnected_populated_references_are_not_decoded(self):
+        main = item("A")
+        refs = [
+            {"annotated": "R1.png [input]", "type": "input"},
+            {"annotated": "R2.png [input]", "type": "input"},
+            {"annotated": "R3.png [input]", "type": "input"},
+        ]
+        result = conveyor.ImageConveyor().load_next(
+            self.state([main], output_mode="persistent_refs", reference_slots=refs),
+            queue_item_json=persistent_payload(main, [2]),
+        )["result"]
+        self.assertEqual(["A.png [input]", "R2.png [input]"], FakeLoadImage.calls)
+        self.assertIsNone(result[6])
+        self.assertEqual("image:R2.png [input]", result[7])
+        self.assertIsNone(result[8])
+
     def test_persistent_reference_missing_validation_identifies_slot(self):
         main = item("A")
         self.materialize(main)
@@ -337,6 +414,28 @@ class ImageConveyorStateTest(unittest.TestCase):
         self.assertEqual(
             "Image Conveyor: reference slot 4 is missing 'missing.png [input]'.",
             conveyor.ImageConveyor.VALIDATE_INPUTS(raw),
+        )
+
+    def test_missing_reference_validation_is_scoped_to_connected_outputs(self):
+        main = item("A")
+        self.materialize(main)
+        refs = [
+            {"annotated": "missing-1.png [input]", "type": "input"},
+            {"annotated": "present.png [input]", "type": "input"},
+        ]
+        self.materialize(item("present", "present.png [input]"))
+        raw = self.state([main], output_mode="persistent_refs", reference_slots=refs)
+        self.assertIs(
+            True,
+            conveyor.ImageConveyor.VALIDATE_INPUTS(
+                raw, queue_item_json=persistent_payload(main, [2, 3, 4, 5, 6, 7, 8])
+            ),
+        )
+        self.assertEqual(
+            "Image Conveyor: reference slot 1 is missing 'missing-1.png [input]'.",
+            conveyor.ImageConveyor.VALIDATE_INPUTS(
+                raw, queue_item_json=persistent_payload(main, [1, 2])
+            ),
         )
 
     def test_is_changed_tracks_reference_contents(self):
@@ -349,6 +448,42 @@ class ImageConveyorStateTest(unittest.TestCase):
         baseline = conveyor.ImageConveyor.IS_CHANGED(raw)
         reference_path.write_bytes(b"changed-reference")
         self.assertNotEqual(baseline, conveyor.ImageConveyor.IS_CHANGED(raw))
+
+    def test_is_changed_tracks_connection_snapshot_and_ignores_unconnected_contents(self):
+        main = item("A")
+        first = {"annotated": "R1.png [input]", "type": "input"}
+        second = {"annotated": "R2.png [input]", "type": "input"}
+        self.materialize(main, b"main")
+        first_path = self.materialize(item("R1", "R1.png [input]"), b"first")
+        second_path = self.materialize(item("R2", "R2.png [input]"), b"second")
+        raw = self.state([main], output_mode="persistent_refs", reference_slots=[first, second])
+        first_only = persistent_payload(main, [1])
+        baseline = conveyor.ImageConveyor.IS_CHANGED(raw, queue_item_json=first_only)
+
+        second_path.write_bytes(b"changed-second")
+        self.assertEqual(baseline, conveyor.ImageConveyor.IS_CHANGED(raw, queue_item_json=first_only))
+        self.assertNotEqual(
+            baseline,
+            conveyor.ImageConveyor.IS_CHANGED(raw, queue_item_json=persistent_payload(main, [1, 2])),
+        )
+        first_path.write_bytes(b"changed-first")
+        self.assertNotEqual(baseline, conveyor.ImageConveyor.IS_CHANGED(raw, queue_item_json=first_only))
+
+    def test_malformed_reference_connection_snapshot_fails_validation(self):
+        main = item("A")
+        self.materialize(main)
+        malformed = json.dumps({
+            "id": main["id"],
+            "annotated": main["annotated"],
+            "reference_output_slots": [1, 1],
+        })
+        self.assertEqual(
+            "Image Conveyor: reference output connection snapshot is invalid.",
+            conveyor.ImageConveyor.VALIDATE_INPUTS(
+                self.state([main], output_mode="persistent_refs"),
+                queue_item_json=malformed,
+            ),
+        )
 
     def test_metadata_outputs_describe_first_selected_item(self):
         a, b, c = item("A", source_path="persisted/A.png"), item("B"), item("C")

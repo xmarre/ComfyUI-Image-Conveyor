@@ -11,6 +11,7 @@ import nodes
 _STATE_VERSION = 2
 _MAX_IMAGES_PER_EXECUTION = 9
 _REFERENCE_SLOT_COUNT = 8
+_REFERENCE_OUTPUT_SLOTS_KEY = "reference_output_slots"
 _OUTPUT_MODE_PERSISTENT = "persistent_refs"
 _OUTPUT_MODE_QUEUE_GROUP = "queue_group"
 _SUPPORTED_IMAGE_EXTENSIONS = {
@@ -279,6 +280,47 @@ def _parse_queue_item(raw: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _connected_reference_slots(queue_item_json: Any) -> Optional[Tuple[int, ...]]:
+    """Return the queued 1-based reference-output snapshot, or None for legacy prompts."""
+    payload = _safe_json_load(queue_item_json, {})
+    if not isinstance(payload, dict) or _REFERENCE_OUTPUT_SLOTS_KEY not in payload:
+        return None
+
+    raw_slots = payload.get(_REFERENCE_OUTPUT_SLOTS_KEY)
+    if not isinstance(raw_slots, list):
+        raise RuntimeError("Image Conveyor: reference output connection snapshot is invalid.")
+
+    slots: List[int] = []
+    seen = set()
+    for raw_slot in raw_slots:
+        if (
+            isinstance(raw_slot, bool)
+            or not isinstance(raw_slot, int)
+            or raw_slot < 1
+            or raw_slot > _REFERENCE_SLOT_COUNT
+            or raw_slot in seen
+        ):
+            raise RuntimeError("Image Conveyor: reference output connection snapshot is invalid.")
+        seen.add(raw_slot)
+        slots.append(raw_slot)
+
+    if slots != sorted(slots):
+        raise RuntimeError("Image Conveyor: reference output connection snapshot is invalid.")
+    return tuple(slots)
+
+
+def _active_reference_slots(state: Dict[str, Any], queue_item_json: Any) -> Tuple[int, ...]:
+    """Resolve reference outputs used by this queued persistent-mode execution."""
+    if state.get("output_mode") != _OUTPUT_MODE_PERSISTENT:
+        return ()
+    connected = _connected_reference_slots(queue_item_json)
+    if connected is not None:
+        return connected
+    # Prompts queued by older frontend builds have no topology snapshot. Preserve
+    # their released behavior instead of silently dropping every reference.
+    return tuple(range(1, _REFERENCE_SLOT_COUNT + 1))
+
+
 def _get_runtime_source_path(ui_state: Dict[str, Any], item: Dict[str, Any]) -> str:
     """Resolve the runtime source path, preferring the UI-only source-path override."""
     source_paths = ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
@@ -499,6 +541,7 @@ class ImageConveyor:
             selected = _select_group(
                 state, queue_item_json, allow_processed=state["dont_consume"]
             )
+            active_reference_slots = _active_reference_slots(state, queue_item_json)
         except RuntimeError as exc:
             return _unresolved_change_hash(state, f"selection|{exc}")
 
@@ -519,7 +562,11 @@ class ImageConveyor:
                     f"missing|slot={slot}|index={index}|id={item['id']}|annotated={item['annotated']}",
                 )
         if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
-            for slot, reference in enumerate(state["reference_slots"], start=1):
+            hasher.update(
+                ("|reference_outputs=" + ",".join(map(str, active_reference_slots))).encode("utf-8")
+            )
+            for slot in active_reference_slots:
+                reference = state["reference_slots"][slot - 1]
                 if reference is None:
                     hasher.update(f"|reference_slot={slot}|empty".encode("utf-8"))
                     continue
@@ -543,6 +590,7 @@ class ImageConveyor:
             selected = _select_group(
                 state, queue_item_json, allow_processed=state["dont_consume"]
             )
+            active_reference_slots = _active_reference_slots(state, queue_item_json)
         except RuntimeError as exc:
             return str(exc)
 
@@ -551,7 +599,8 @@ class ImageConveyor:
                 return f"Image Conveyor: missing file '{item['annotated']}'."
 
         if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
-            for slot, reference in enumerate(state["reference_slots"], start=1):
+            for slot in active_reference_slots:
+                reference = state["reference_slots"][slot - 1]
                 if reference is None:
                     continue
                 if not folder_paths.exists_annotated_filepath(reference["annotated"]):
@@ -569,6 +618,7 @@ class ImageConveyor:
         selected = _select_group(
             state, queue_item_json, allow_processed=dont_consume
         )
+        active_reference_slots = _active_reference_slots(state, queue_item_json)
 
         loader = nodes.LoadImage()
         loaded_images: List[Any] = []
@@ -604,17 +654,17 @@ class ImageConveyor:
         }
 
         if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
-            additional_images = []
+            additional_images = [None] * _REFERENCE_SLOT_COUNT
             reference_cache: Dict[str, Any] = {}
-            for reference in state["reference_slots"]:
+            for slot in active_reference_slots:
+                reference = state["reference_slots"][slot - 1]
                 if reference is None:
-                    additional_images.append(None)
-                else:
-                    annotated_reference = reference["annotated"]
-                    if annotated_reference not in reference_cache:
-                        image, _mask = loader.load_image(annotated_reference)
-                        reference_cache[annotated_reference] = image
-                    additional_images.append(reference_cache[annotated_reference])
+                    continue
+                annotated_reference = reference["annotated"]
+                if annotated_reference not in reference_cache:
+                    image, _mask = loader.load_image(annotated_reference)
+                    reference_cache[annotated_reference] = image
+                additional_images[slot - 1] = reference_cache[annotated_reference]
         else:
             additional_images = loaded_images[1:] + [None] * (
                 _MAX_IMAGES_PER_EXECUTION - len(loaded_images)

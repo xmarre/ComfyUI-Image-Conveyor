@@ -7,6 +7,7 @@ import {
   applyReferenceAssignments,
   calculateReferenceShelfLayout,
   classifyReferenceDrag,
+  connectedReferenceOutputSlots,
   effectiveQueueGroupSize,
   loadPresetSnapshot,
   moveReferenceSlot,
@@ -15,7 +16,8 @@ import {
   referencePresetDisplay,
   referenceShelfHit,
   referenceSlotsEqual,
-  relinkReferenceSlots
+  relinkReferenceSlots,
+  snapshotReferenceOutputConnections
 } from '../web/image_conveyor_math.mjs'
 
 const reference = (name) => ({
@@ -35,6 +37,37 @@ test('legacy output-mode migration preserves grouped workflows deterministically
 test('persistent mode always has an effective queue group size of one', () => {
   assert.equal(effectiveQueueGroupSize(OUTPUT_MODE_PERSISTENT, 9), 1)
   assert.equal(effectiveQueueGroupSize(OUTPUT_MODE_QUEUE_GROUP, 9), 9)
+})
+
+test('connected reference outputs snapshot exact sparse socket topology', () => {
+  const outputs = Array.from({ length: 14 }, () => ({ links: null }))
+  outputs[5].links = [100]
+  outputs[6].links = [101, 102]
+  outputs[8].links = []
+  outputs[10].links = [103]
+  outputs[13].links = [104]
+  assert.deepEqual(connectedReferenceOutputSlots(outputs), [1, 5, 8])
+  assert.deepEqual(connectedReferenceOutputSlots(null), [])
+})
+
+test('persistent reservations carry an explicit connection snapshot including none', () => {
+  const outputs = Array.from({ length: 14 }, () => ({ links: null }))
+  const reservation = { id: 'A', annotated: 'A.png [input]' }
+  assert.deepEqual(
+    snapshotReferenceOutputConnections(reservation, OUTPUT_MODE_PERSISTENT, outputs),
+    { ...reservation, reference_output_slots: [] }
+  )
+  outputs[6].links = [1]
+  outputs[13].links = [2]
+  assert.deepEqual(
+    snapshotReferenceOutputConnections(reservation, OUTPUT_MODE_PERSISTENT, outputs),
+    { ...reservation, reference_output_slots: [1, 8] }
+  )
+  assert.equal(snapshotReferenceOutputConnections(null, OUTPUT_MODE_PERSISTENT, outputs), null)
+  assert.equal(
+    snapshotReferenceOutputConnections(reservation, OUTPUT_MODE_QUEUE_GROUP, outputs),
+    reservation
+  )
 })
 
 test('reference slots normalize to exactly eight sparse input records', () => {
