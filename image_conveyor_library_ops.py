@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import ExitStack
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from .image_conveyor_server import (
     InvalidInputPath,
@@ -46,14 +46,12 @@ class CharacterFolderRegistry:
     @staticmethod
     def _safe_character_name(value: Any) -> str:
         raw = " ".join(str(value or "Character").strip().split()) or "Character"
-        cleaned = []
         invalid = set('<>:"/\\|?*')
-        for character in raw:
-            if ord(character) < 32 or ord(character) == 127 or character in invalid:
-                cleaned.append("_")
-            else:
-                cleaned.append(character)
-        name = "".join(cleaned).strip(" .") or "Character"
+        cleaned = "".join(
+            "_" if ord(character) < 32 or ord(character) == 127 or character in invalid else character
+            for character in raw
+        )
+        name = cleaned.strip(" .") or "Character"
         return name[:72].rstrip(" .") or "Character"
 
     @staticmethod
@@ -69,7 +67,7 @@ class CharacterFolderRegistry:
             return []
         if not isinstance(value, list) or len(value) > MAX_BATCH_ITEMS:
             raise InvalidLibraryOperation("The character library member list is malformed or too large.")
-        members: List[str] = []
+        members = []
         seen = set()
         for entry in value:
             relative_path = normalize_relative_path(entry)
@@ -99,7 +97,7 @@ class CharacterFolderRegistry:
         characters = raw.get("characters")
         if not isinstance(characters, dict):
             raise InvalidLibraryOperation("The character folder registry is malformed.")
-        normalized: Dict[str, Dict[str, Any]] = {}
+        normalized = {}
         for preset_id, value in characters.items():
             normalized_id = self._normalize_preset_id(preset_id)
             if not isinstance(value, dict):
@@ -135,8 +133,7 @@ class CharacterFolderRegistry:
                 pass
 
     def _new_folder(self, preset_id: str, name: Any) -> str:
-        readable = self._safe_character_name(name)
-        return f"{CHARACTER_FOLDER_ROOT}/{readable}--{preset_id[:8]}"
+        return f"{CHARACTER_FOLDER_ROOT}/{self._safe_character_name(name)}--{preset_id[:8]}"
 
     def ensure_for_presets(self, presets: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         with self._lock:
@@ -164,9 +161,9 @@ class CharacterFolderRegistry:
                     "members": list(entry.get("members", [])),
                 })
 
-            stale = [preset_id for preset_id in document["characters"] if preset_id not in current_ids]
-            if stale:
-                for preset_id in stale:
+            stale_ids = [preset_id for preset_id in document["characters"] if preset_id not in current_ids]
+            if stale_ids:
+                for preset_id in stale_ids:
                     document["characters"].pop(preset_id, None)
                 changed = True
             if changed:
@@ -292,9 +289,8 @@ def _ensure_directory(input_root: str, relative_folder: str) -> str:
             try:
                 os.mkdir(candidate)
             except FileExistsError:
-                info = os.lstat(candidate)
-            else:
-                info = os.lstat(candidate)
+                pass
+            info = os.lstat(candidate)
         if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISDIR(info.st_mode):
             raise InvalidInputPath("The destination folder contains a symlink or non-directory component.")
         current = candidate
@@ -319,8 +315,7 @@ def _regular_input_file(input_root: str, relative_path: str) -> Tuple[str, os.st
         raise InvalidInputPath("The input path escapes the ComfyUI input directory.") from exc
 
     current = root
-    parts = relative.split("/")
-    for segment in parts[:-1]:
+    for segment in relative.split("/")[:-1]:
         current = os.path.join(current, segment)
         info = os.lstat(current)
         if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISDIR(info.st_mode):
@@ -331,16 +326,23 @@ def _regular_input_file(input_root: str, relative_path: str) -> Tuple[str, os.st
     return lexical, info
 
 
-def _collision_safe_path(input_root: str, destination_folder: str, filename: str) -> str:
-    base = f"{destination_folder}/{filename}" if destination_folder else filename
-    candidate = base
+def _candidate_path(
+    input_root: str,
+    destination_folder: str,
+    filename: str,
+    reserved_casefold: set,
+) -> str:
     stem, extension = os.path.splitext(filename)
-    counter = 1
-    while os.path.lexists(os.path.join(input_root, *candidate.split("/"))):
-        renamed = f"{stem} ({counter}){extension}"
-        candidate = f"{destination_folder}/{renamed}" if destination_folder else renamed
+    counter = 0
+    while True:
+        candidate_name = filename if counter == 0 else f"{stem} ({counter}){extension}"
+        relative = f"{destination_folder}/{candidate_name}" if destination_folder else candidate_name
+        absolute = os.path.join(input_root, *relative.split("/"))
+        key = relative.casefold()
+        if key not in reserved_casefold and not os.path.lexists(absolute):
+            reserved_casefold.add(key)
+            return relative
         counter += 1
-    return candidate
 
 
 def _move_no_replace(source: str, destination: str) -> None:
@@ -348,7 +350,24 @@ def _move_no_replace(source: str, destination: str) -> None:
     os.makedirs(parent, exist_ok=True)
     try:
         os.link(source, destination)
+    except FileExistsError:
+        raise
+    except OSError:
+        source_stat = os.stat(source, follow_symlinks=False)
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat_module.S_IMODE(source_stat.st_mode) or 0o666,
+        )
         try:
+            with os.fdopen(descriptor, "wb") as output, open(source, "rb") as incoming:
+                shutil.copyfileobj(incoming, output, _COPY_CHUNK_SIZE)
+                output.flush()
+                os.fsync(output.fileno())
+            try:
+                shutil.copystat(source, destination, follow_symlinks=False)
+            except OSError:
+                pass
             os.unlink(source)
         except Exception:
             try:
@@ -357,23 +376,8 @@ def _move_no_replace(source: str, destination: str) -> None:
                 pass
             raise
         return
-    except FileExistsError:
-        raise
-    except OSError:
-        pass
 
-    source_stat = os.stat(source, follow_symlinks=False)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    descriptor = os.open(destination, flags, stat_module.S_IMODE(source_stat.st_mode) or 0o666)
     try:
-        with os.fdopen(descriptor, "wb") as output, open(source, "rb") as incoming:
-            shutil.copyfileobj(incoming, output, _COPY_CHUNK_SIZE)
-            output.flush()
-            os.fsync(output.fileno())
-        try:
-            shutil.copystat(source, destination, follow_symlinks=False)
-        except OSError:
-            pass
         os.unlink(source)
     except Exception:
         try:
@@ -433,8 +437,7 @@ def _restore_failed_preset_slots(
         if not original:
             continue
         changed = False
-        original_slots = original.get("slots", [])
-        for index, original_slot in enumerate(original_slots):
+        for index, original_slot in enumerate(original.get("slots", [])):
             if not original_slot:
                 continue
             annotated = str(original_slot.get("annotated") or "")
@@ -457,17 +460,19 @@ def move_input_files(
     paths = _normalize_path_batch(relative_paths)
     destination_folder = _normalize_subfolder(destination_subfolder)
     protected = _normalize_protected_paths(protected_paths)
-    destination_directory = _ensure_directory(service.input_root, destination_folder)
-    del destination_directory
+    _ensure_directory(service.input_root, destination_folder)
 
-    skipped = []
+    skipped = [
+        {"relative_path": path, "reason": "The file is reserved by a queued Conveyor item."}
+        for path in paths
+        if path in protected
+    ]
     candidates = [path for path in paths if path not in protected]
-    for path in paths:
-        if path in protected:
-            skipped.append({"relative_path": path, "reason": "The file is reserved by a queued Conveyor item."})
-
     moved_records: List[Tuple[str, str]] = []
     mappings: List[Dict[str, str]] = []
+    presets_relinked = 0
+    registry_relinked = 0
+
     with ExitStack() as locks:
         lock_keys = {f"dir:{destination_folder.casefold()}"}
         lock_keys.update(path.casefold() for path in candidates)
@@ -475,7 +480,7 @@ def move_input_files(
             locks.enter_context(service._key_lock(service._destination_locks, key))
 
         plan = []
-        target_paths = set()
+        reserved_targets = set()
         for relative_path in candidates:
             try:
                 source, source_stat = _regular_input_file(service.input_root, relative_path)
@@ -487,43 +492,59 @@ def move_input_files(
             if direct_target == relative_path:
                 skipped.append({"relative_path": relative_path, "reason": "The file is already in that folder."})
                 continue
-            target_relative = _collision_safe_path(service.input_root, destination_folder, filename) if collision_safe else direct_target
-            target = os.path.abspath(os.path.join(service.input_root, *target_relative.split("/")))
-            if target_relative in target_paths:
-                if collision_safe:
-                    target_relative = _collision_safe_path(service.input_root, destination_folder, filename)
-                    target = os.path.abspath(os.path.join(service.input_root, *target_relative.split("/")))
-                else:
+
+            if collision_safe:
+                target_relative = _candidate_path(
+                    service.input_root,
+                    destination_folder,
+                    filename,
+                    reserved_targets,
+                )
+            else:
+                target_relative = direct_target
+                target_key = target_relative.casefold()
+                if target_key in reserved_targets:
                     raise InvalidLibraryOperation(f"Multiple selected files would collide at '{target_relative}'.")
-            if not collision_safe and os.path.lexists(target):
-                raise InvalidLibraryOperation(f"Destination already exists: {target_relative}")
-            target_paths.add(target_relative)
+                target = os.path.join(service.input_root, *target_relative.split("/"))
+                if os.path.lexists(target):
+                    raise InvalidLibraryOperation(f"Destination already exists: {target_relative}")
+                reserved_targets.add(target_key)
+
+            target = os.path.abspath(os.path.join(service.input_root, *target_relative.split("/")))
             plan.append((relative_path, source, source_stat, target_relative, target))
 
         try:
-            for old_relative, source, source_stat, new_relative, target in plan:
+            for old_relative, source, expected, new_relative, target in plan:
                 current = os.lstat(source)
                 if (
-                    not stat_module.S_ISREG(current.st_mode)
-                    or stat_module.S_ISLNK(current.st_mode)
-                    or (current.st_dev, current.st_ino) != (source_stat.st_dev, source_stat.st_ino)
-                    or current.st_size != source_stat.st_size
-                    or current.st_mtime_ns != source_stat.st_mtime_ns
+                    stat_module.S_ISLNK(current.st_mode)
+                    or not stat_module.S_ISREG(current.st_mode)
+                    or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+                    or current.st_size != expected.st_size
+                    or current.st_mtime_ns != expected.st_mtime_ns
                 ):
                     raise InvalidLibraryOperation(f"The file changed during the move: {old_relative}")
                 if os.path.lexists(target):
-                    if collision_safe:
-                        filename = PurePosixPath(old_relative).name
-                        new_relative = _collision_safe_path(service.input_root, destination_folder, filename)
-                        target = os.path.abspath(os.path.join(service.input_root, *new_relative.split("/")))
-                    else:
-                        raise InvalidLibraryOperation(f"Destination appeared during the move: {new_relative}")
+                    raise InvalidLibraryOperation(f"Destination appeared during the move: {new_relative}")
                 _move_no_replace(source, target)
                 moved_records.append((source, target))
                 mappings.append({"relative_path": old_relative, "keep_path": new_relative})
 
-            presets_relinked = service.preset_store.relink_paths(mappings) if mappings else 0
-            registry_relinked = _registry_for_service(service).relink_paths(mappings) if mappings else 0
+            if mappings:
+                registry = _registry_for_service(service)
+                registry_relinked = registry.relink_paths(mappings)
+                try:
+                    presets_relinked = service.preset_store.relink_paths(mappings)
+                except Exception:
+                    reverse = [
+                        {"relative_path": entry["keep_path"], "keep_path": entry["relative_path"]}
+                        for entry in mappings
+                    ]
+                    try:
+                        registry.relink_paths(reverse)
+                    except Exception:
+                        LOGGER.exception("Image Conveyor could not roll back character-library path metadata.")
+                    raise
         except Exception:
             rollback_failures = _rollback_moves(moved_records)
             if rollback_failures:
@@ -535,8 +556,8 @@ def move_input_files(
     return {
         "moved": mappings,
         "skipped": skipped,
-        "presets_relinked": presets_relinked if mappings else 0,
-        "character_members_relinked": registry_relinked if mappings else 0,
+        "presets_relinked": presets_relinked,
+        "character_members_relinked": registry_relinked,
     }
 
 
@@ -547,15 +568,17 @@ def delete_input_files(
 ) -> Dict[str, Any]:
     paths = _normalize_path_batch(relative_paths)
     protected = _normalize_protected_paths(protected_paths)
-    skipped = []
+    skipped = [
+        {"relative_path": path, "reason": "The file is reserved by a queued Conveyor item."}
+        for path in paths
+        if path in protected
+    ]
     candidates = [path for path in paths if path not in protected]
-    for path in paths:
-        if path in protected:
-            skipped.append({"relative_path": path, "reason": "The file is reserved by a queued Conveyor item."})
-
     staged: List[Tuple[str, str, str, int]] = []
     deleted = []
+    presets_cleared = 0
     store = service.preset_store
+
     with ExitStack() as locks:
         for key in sorted(path.casefold() for path in candidates):
             locks.enter_context(service._key_lock(service._destination_locks, key))
@@ -579,8 +602,8 @@ def delete_input_files(
                 for relative_path, lexical, expected in validated:
                     current = os.lstat(lexical)
                     if (
-                        not stat_module.S_ISREG(current.st_mode)
-                        or stat_module.S_ISLNK(current.st_mode)
+                        stat_module.S_ISLNK(current.st_mode)
+                        or not stat_module.S_ISREG(current.st_mode)
                         or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
                         or current.st_size != expected.st_size
                         or current.st_mtime_ns != expected.st_mtime_ns
@@ -632,6 +655,7 @@ def delete_input_files(
                             temporary,
                             restore_exc,
                         )
+
             if failed_paths and presets_cleared:
                 restored_document = _restore_failed_preset_slots(
                     store,
@@ -642,13 +666,17 @@ def delete_input_files(
                 store._write_unlocked(restored_document)
 
     deleted_paths = [entry["relative_path"] for entry in deleted]
-    members_removed = _registry_for_service(service).remove_paths(deleted_paths) if deleted_paths else 0
+    members_removed = 0
     if deleted_paths:
+        try:
+            members_removed = _registry_for_service(service).remove_paths(deleted_paths)
+        except Exception:
+            LOGGER.exception("Image Conveyor could not prune deleted files from character-library metadata.")
         service.invalidate_snapshot()
     return {
         "deleted": deleted,
         "skipped": skipped,
-        "presets_cleared": presets_cleared if staged else 0,
+        "presets_cleared": presets_cleared,
         "character_members_removed": members_removed,
         "reclaimed_bytes": sum(entry["size"] for entry in deleted),
     }
@@ -761,9 +789,8 @@ def register_library_routes() -> None:
             payload = await request.json()
             if not isinstance(payload, dict):
                 raise InvalidLibraryOperation("The character library request is malformed.")
-            registry = _registry_for_service(service)
             result = await asyncio.to_thread(
-                registry.add_members,
+                _registry_for_service(service).add_members,
                 request.match_info["preset_id"],
                 payload.get("relative_paths"),
             )
