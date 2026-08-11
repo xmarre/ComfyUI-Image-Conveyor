@@ -51,6 +51,7 @@ def state(items, images_per_execution):
     payload = conveyor._default_state()
     payload["items"] = items
     payload["images_per_execution"] = images_per_execution
+    payload["output_mode"] = conveyor._OUTPUT_MODE_QUEUE_GROUP
     return json.dumps(payload)
 
 

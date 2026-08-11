@@ -9,7 +9,8 @@ import stat as stat_module
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+import uuid
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -36,6 +37,14 @@ class InvalidUpload(ValueError):
 
 
 class InvalidThumbnail(ValueError):
+    pass
+
+
+class InvalidPreset(ValueError):
+    pass
+
+
+class PresetNotFound(LookupError):
     pass
 
 
@@ -68,6 +77,242 @@ def normalize_filename(value: Any) -> str:
     if Path(raw).suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
         raise InvalidUpload(f"Unsupported image extension: {Path(raw).suffix or '(none)'}")
     return raw
+
+
+def normalize_reference_slot(value: Any, input_root: str, *, must_exist: bool = True) -> Optional[Dict[str, str]]:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise InvalidPreset("Reference slots must be image records or null.")
+    storage_type = str(value.get("type", "input")).strip().lower() or "input"
+    if storage_type != "input":
+        raise InvalidPreset("Reference presets may only contain ComfyUI input images.")
+    annotated = str(value.get("annotated", "")).strip()
+    suffix = " [input]"
+    if not annotated.endswith(suffix):
+        raise InvalidPreset("Reference images must use an annotated ComfyUI input path.")
+    try:
+        relative_path = normalize_relative_path(annotated[:-len(suffix)])
+    except InvalidInputPath as exc:
+        raise InvalidPreset("A reference slot contains an invalid input path.") from exc
+    if Path(relative_path).suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+        raise InvalidPreset("A reference slot has an unsupported image extension.")
+    try:
+        resolve_under_root(input_root, relative_path, must_exist=must_exist)
+    except (InvalidInputPath, FileNotFoundError) as exc:
+        raise InvalidPreset(f"Reference image '{annotated}' is outside input or missing.") from exc
+    relative = PurePosixPath(relative_path)
+    parent = "" if str(relative.parent) == "." else str(relative.parent)
+    return {
+        "annotated": f"{relative_path} [input]",
+        "filename": relative.name,
+        "subfolder": parent,
+        "type": "input",
+    }
+
+
+class PresetStore:
+    VERSION = 1
+    SLOT_COUNT = 8
+
+    def __init__(self, path: str, input_root: str):
+        self.path = path
+        self.input_root = os.path.realpath(input_root)
+        self._lock = threading.RLock()
+        self._recovery_pending = False
+
+    @staticmethod
+    def _empty_document() -> Dict[str, Any]:
+        return {"version": PresetStore.VERSION, "presets": []}
+
+    def _normalize_name(self, value: Any) -> str:
+        name = " ".join(str(value or "").strip().split())
+        if not name or len(name) > 120 or any(ord(character) < 32 or ord(character) == 127 for character in name):
+            raise InvalidPreset("Preset names must contain 1 to 120 printable characters.")
+        return name
+
+    def _normalize_id(self, value: Any) -> str:
+        try:
+            return str(uuid.UUID(str(value or "").strip()))
+        except (ValueError, AttributeError) as exc:
+            raise InvalidPreset("The preset ID is invalid.") from exc
+
+    def _normalize_slots(self, value: Any, *, must_exist: bool = True) -> List[Optional[Dict[str, str]]]:
+        if not isinstance(value, list) or len(value) != self.SLOT_COUNT:
+            raise InvalidPreset("A reference preset must contain exactly 8 slots.")
+        return [
+            normalize_reference_slot(slot, self.input_root, must_exist=must_exist)
+            for slot in value
+        ]
+
+    def _normalize_preset(self, value: Any, *, must_exist: bool = False) -> Dict[str, Any]:
+        if not isinstance(value, dict):
+            raise InvalidPreset("The preset document is malformed.")
+        return {
+            "id": self._normalize_id(value.get("id")),
+            "name": self._normalize_name(value.get("name")),
+            "slots": self._normalize_slots(value.get("slots"), must_exist=must_exist),
+            "created_at": max(0, int(value.get("created_at", 0) or 0)),
+            "updated_at": max(0, int(value.get("updated_at", 0) or 0)),
+        }
+
+    def _quarantine(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        quarantine = f"{self.path}.corrupt-{int(time.time() * 1000)}"
+        try:
+            os.replace(self.path, quarantine)
+        except OSError:
+            LOGGER.exception("Image Conveyor could not quarantine malformed preset storage.")
+
+    def _load_unlocked(self) -> Dict[str, Any]:
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            if not isinstance(raw, dict) or raw.get("version") != self.VERSION:
+                raise InvalidPreset("Unsupported preset document version.")
+            values = raw.get("presets")
+            if not isinstance(values, list):
+                raise InvalidPreset("The preset document is malformed.")
+            presets = [self._normalize_preset(value, must_exist=False) for value in values]
+            ids = {preset["id"] for preset in presets}
+            names = {preset["name"].casefold() for preset in presets}
+            if len(ids) != len(presets) or len(names) != len(presets):
+                raise InvalidPreset("The preset document contains duplicate IDs or names.")
+            return {"version": self.VERSION, "presets": presets}
+        except FileNotFoundError:
+            return self._empty_document()
+        except OSError:
+            LOGGER.warning("Image Conveyor could not read preset storage.", exc_info=True)
+            raise
+        except (UnicodeError, json.JSONDecodeError, InvalidPreset, ValueError, TypeError):
+            LOGGER.warning("Image Conveyor preset storage was malformed and has been quarantined.", exc_info=True)
+            self._quarantine()
+            self._recovery_pending = True
+            return self._empty_document()
+
+    def _write_unlocked(self, document: Dict[str, Any]) -> None:
+        parent = os.path.dirname(self.path)
+        os.makedirs(parent, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".reference-presets-", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(document, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            self._recovery_pending = False
+            try:
+                directory_fd = os.open(parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        finally:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _ordered(presets: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return sorted(presets, key=lambda preset: (preset["name"].casefold(), preset["name"], preset["id"]))
+
+    def list(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return json.loads(json.dumps(self._ordered(self._load_unlocked()["presets"])))
+
+    def create(self, name: Any, slots: Any) -> Dict[str, Any]:
+        with self._lock:
+            document = self._load_unlocked()
+            normalized_name = self._normalize_name(name)
+            if any(preset["name"].casefold() == normalized_name.casefold() for preset in document["presets"]):
+                raise InvalidPreset("A preset with that name already exists.")
+            now = int(time.time() * 1000)
+            preset = {
+                "id": str(uuid.uuid4()),
+                "name": normalized_name,
+                "slots": self._normalize_slots(slots),
+                "created_at": now,
+                "updated_at": now,
+            }
+            document["presets"].append(preset)
+            document["presets"] = self._ordered(document["presets"])
+            self._write_unlocked(document)
+            return json.loads(json.dumps(preset))
+
+    def update(self, preset_id: Any, *, name: Any = None, slots: Any = None) -> Dict[str, Any]:
+        with self._lock:
+            document = self._load_unlocked()
+            normalized_id = self._normalize_id(preset_id)
+            preset = next((entry for entry in document["presets"] if entry["id"] == normalized_id), None)
+            if preset is None:
+                raise PresetNotFound(normalized_id)
+            if name is not None:
+                normalized_name = self._normalize_name(name)
+                if any(
+                    entry["id"] != normalized_id and entry["name"].casefold() == normalized_name.casefold()
+                    for entry in document["presets"]
+                ):
+                    raise InvalidPreset("A preset with that name already exists.")
+                preset["name"] = normalized_name
+            if slots is not None:
+                preset["slots"] = self._normalize_slots(slots)
+            if name is None and slots is None:
+                raise InvalidPreset("The preset update did not contain a name or slots.")
+            preset["updated_at"] = int(time.time() * 1000)
+            document["presets"] = self._ordered(document["presets"])
+            self._write_unlocked(document)
+            return json.loads(json.dumps(preset))
+
+    def delete(self, preset_id: Any) -> bool:
+        with self._lock:
+            document = self._load_unlocked()
+            normalized_id = self._normalize_id(preset_id)
+            kept = [entry for entry in document["presets"] if entry["id"] != normalized_id]
+            if len(kept) == len(document["presets"]):
+                return False
+            document["presets"] = kept
+            self._write_unlocked(document)
+            return True
+
+    def relink_paths(self, replacements: Sequence[Dict[str, Any]]) -> int:
+        mapping: Dict[str, str] = {}
+        for replacement in replacements:
+            if not isinstance(replacement, dict):
+                raise InvalidPreset("A preset relink entry is malformed.")
+            old_path = normalize_relative_path(replacement.get("relative_path"))
+            keep_path = normalize_relative_path(replacement.get("keep_path"))
+            resolve_under_root(self.input_root, keep_path, must_exist=True)
+            mapping[old_path] = keep_path
+        if not mapping:
+            return 0
+        with self._lock:
+            document = self._load_unlocked()
+            if self._recovery_pending:
+                raise InvalidPreset(
+                    "Preset storage was malformed; duplicate cleanup is blocked until presets are repaired or saved again."
+                )
+            changed = 0
+            for preset in document["presets"]:
+                for index, slot in enumerate(preset["slots"]):
+                    if slot is None:
+                        continue
+                    relative_path = slot["annotated"][:-len(" [input]")]
+                    keep_path = mapping.get(relative_path)
+                    if not keep_path:
+                        continue
+                    preset["slots"][index] = normalize_reference_slot(
+                        {"annotated": f"{keep_path} [input]", "type": "input"},
+                        self.input_root,
+                    )
+                    preset["updated_at"] = int(time.time() * 1000)
+                    changed += 1
+            if changed:
+                self._write_unlocked(document)
+            return changed
 
 
 def resolve_under_root(root: str, relative_path: str, *, must_exist: bool = False) -> str:
@@ -290,13 +535,23 @@ class _KeyLockEntry:
 
 
 class InputLibrary:
-    def __init__(self, input_root: str, cache_root: str, snapshot_ttl: float = SNAPSHOT_TTL_SECONDS):
+    def __init__(
+        self,
+        input_root: str,
+        cache_root: str,
+        snapshot_ttl: float = SNAPSHOT_TTL_SECONDS,
+        preset_path: Optional[str] = None,
+    ):
         self.input_root = os.path.realpath(input_root)
         self.cache_root = cache_root
         self.snapshot_ttl = snapshot_ttl
         self.index = ContentIndex(os.path.join(cache_root, "content-index.sqlite3"))
         self.thumbnail_root = os.path.join(cache_root, "thumbnails")
         self.upload_temp_root = os.path.join(cache_root, "uploads")
+        self.preset_store = PresetStore(
+            preset_path or os.path.join(cache_root, "reference-presets.json"),
+            self.input_root,
+        )
         self._snapshot: Tuple[FileRecord, ...] = ()
         self._snapshot_at = 0.0
         self._snapshot_wall_ms = 0
@@ -724,6 +979,7 @@ class InputLibrary:
 
         plan = []
         planned_duplicates = 0
+        planned_paths = set()
         for group in groups:
             if not isinstance(group, dict):
                 raise InvalidUpload("The duplicate cleanup plan is malformed.")
@@ -745,8 +1001,13 @@ class InputLibrary:
                 relative_path = normalize_relative_path(duplicate.get("relative_path"))
                 if relative_path == keep_path or not self._is_managed_path(relative_path):
                     raise InvalidUpload("Duplicate cleanup is restricted to the image_conveyor folder.")
+                if relative_path in planned_paths:
+                    raise InvalidUpload("The duplicate cleanup plan contains a repeated path.")
+                planned_paths.add(relative_path)
                 relative_paths.append(relative_path)
             plan.append((digest, keep_path, relative_paths))
+
+        presets_relinked = 0
 
         for digest, keep_path, relative_paths in plan:
             with self._key_lock(self._digest_locks, digest):
@@ -761,6 +1022,7 @@ class InputLibrary:
                         )
                     continue
 
+                candidates = []
                 for relative_path in relative_paths:
                     if relative_path in protected:
                         skipped.append(
@@ -770,7 +1032,17 @@ class InputLibrary:
                             }
                         )
                         continue
-                    with self._key_lock(self._destination_locks, relative_path.casefold()):
+                    candidates.append(relative_path)
+
+                with ExitStack() as destination_locks:
+                    lock_keys = sorted({relative_path.casefold() for relative_path in candidates})
+                    for lock_key in lock_keys:
+                        destination_locks.enter_context(
+                            self._key_lock(self._destination_locks, lock_key)
+                        )
+
+                    validated = []
+                    for relative_path in candidates:
                         managed = self._managed_regular_file(relative_path)
                         if managed is None or managed[1].content_hash != digest:
                             skipped.append(
@@ -780,7 +1052,27 @@ class InputLibrary:
                                 }
                             )
                             continue
-                        lexical_path, current, expected_identity = managed
+                        validated.append(managed)
+
+                    # The preset document is durable. Its atomic update must
+                    # succeed while every validated destination is locked and
+                    # before the first unlink in this digest group.
+                    try:
+                        presets_relinked += self.preset_store.relink_paths([
+                            {
+                                "relative_path": current.relative_path,
+                                "keep_path": keep_path,
+                            }
+                            for _lexical_path, current, _expected_identity in validated
+                        ])
+                    except OSError as exc:
+                        reason = f"Unable to relink reference presets: {exc}"
+                        for _lexical_path, current, _expected_identity in validated:
+                            skipped.append({"relative_path": current.relative_path, "reason": reason})
+                        continue
+
+                    for lexical_path, current, expected_identity in validated:
+                        relative_path = current.relative_path
                         try:
                             identity = os.lstat(lexical_path)
                             if (
@@ -813,6 +1105,7 @@ class InputLibrary:
             "deleted": deleted,
             "skipped": skipped,
             "reclaimed_bytes": sum(entry["size"] for entry in deleted),
+            "presets_relinked": presets_relinked,
         }
 
     def verify_image(self, path: str) -> None:
@@ -885,6 +1178,46 @@ class InputLibrary:
             self._prune_thumbnails()
         return target, etag
 
+    def image_properties(self, relative_path: str) -> Dict[str, Any]:
+        relative = normalize_relative_path(relative_path)
+        if Path(relative).suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            raise InvalidInputPath("Unsupported image source.")
+        source = resolve_under_root(self.input_root, relative, must_exist=True)
+        stat = os.stat(source)
+
+        from PIL import Image, UnidentifiedImageError
+
+        try:
+            with Image.open(source) as opened:
+                width, height = opened.size
+                try:
+                    orientation = opened.getexif().get(274)
+                except (AttributeError, OSError, ValueError):
+                    orientation = None
+                if orientation in {5, 6, 7, 8}:
+                    width, height = height, width
+                image_format = str(opened.format or Path(relative).suffix.lstrip(".")).upper()
+                mode = str(opened.mode or "")
+                frames = max(1, int(getattr(opened, "n_frames", 1) or 1))
+        except UnidentifiedImageError as exc:
+            raise InvalidThumbnail("The image source is not readable.") from exc
+        except OSError as exc:
+            if exc.errno is not None:
+                raise
+            raise InvalidThumbnail("The image source is not readable.") from exc
+
+        return {
+            "relative_path": relative,
+            "filename": PurePosixPath(relative).name,
+            "format": image_format,
+            "mode": mode,
+            "width": width,
+            "height": height,
+            "frames": frames,
+            "size": stat.st_size,
+            "mtime_ms": stat.st_mtime_ns // 1_000_000,
+        }
+
 
 _SERVICE_LOCK = threading.Lock()
 _SERVICE: Optional[InputLibrary] = None
@@ -899,13 +1232,31 @@ def _cache_directory(folder_paths_module) -> str:
     return os.path.join(root, "image_conveyor")
 
 
+def _preset_path(folder_paths_module) -> str:
+    return os.path.join(
+        folder_paths_module.get_user_directory(),
+        "image_conveyor",
+        "reference-presets.json",
+    )
+
+
 def get_service(folder_paths_module) -> InputLibrary:
     global _SERVICE
     input_root = os.path.realpath(folder_paths_module.get_input_directory())
     cache_root = _cache_directory(folder_paths_module)
+    preset_path = _preset_path(folder_paths_module)
     with _SERVICE_LOCK:
-        if _SERVICE is None or _SERVICE.input_root != input_root or _SERVICE.cache_root != cache_root:
-            _SERVICE = InputLibrary(input_root, cache_root)
+        if (
+            _SERVICE is None
+            or _SERVICE.input_root != input_root
+            or _SERVICE.cache_root != cache_root
+            or _SERVICE.preset_store.path != preset_path
+        ):
+            _SERVICE = InputLibrary(
+                input_root,
+                cache_root,
+                preset_path=preset_path,
+            )
         return _SERVICE
 
 
@@ -1055,13 +1406,89 @@ def register_routes() -> None:
                 raise InvalidUpload("The duplicate cleanup plan is malformed or too large.")
             if not isinstance(protected_paths, list) or len(protected_paths) > 10000:
                 raise InvalidUpload("The duplicate cleanup reservation is malformed or too large.")
-            result = await asyncio.to_thread(service.delete_managed_duplicates, groups, protected_paths)
+            result = await asyncio.to_thread(
+                service.delete_managed_duplicates,
+                groups,
+                protected_paths,
+            )
             return web.json_response(result)
-        except (InvalidUpload, InvalidInputPath, json.JSONDecodeError, ValueError) as exc:
+        except (InvalidUpload, InvalidInputPath, InvalidPreset, json.JSONDecodeError, ValueError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
         except Exception:
             LOGGER.exception("Image Conveyor failed to delete managed duplicates.")
             return web.json_response({"error": "Unable to delete exact duplicates."}, status=500)
+
+    @routes.get("/image-conveyor/reference-presets")
+    async def image_conveyor_list_reference_presets(_request):
+        service = get_service(folder_paths)
+        try:
+            presets = await asyncio.to_thread(service.preset_store.list)
+            return web.json_response({"version": PresetStore.VERSION, "presets": presets})
+        except Exception:
+            LOGGER.exception("Image Conveyor failed to list reference presets.")
+            return web.json_response({"error": "Unable to read reference presets."}, status=500)
+
+    @routes.post("/image-conveyor/reference-presets")
+    async def image_conveyor_create_reference_preset(request):
+        service = get_service(folder_paths)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise InvalidPreset("The preset request is malformed.")
+            preset = await asyncio.to_thread(
+                service.preset_store.create,
+                payload.get("name"),
+                payload.get("slots"),
+            )
+            return web.json_response({"preset": preset}, status=201)
+        except (InvalidPreset, InvalidInputPath, json.JSONDecodeError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception:
+            LOGGER.exception("Image Conveyor failed to create a reference preset.")
+            return web.json_response({"error": "Unable to create the reference preset."}, status=500)
+
+    @routes.put("/image-conveyor/reference-presets/{preset_id}")
+    async def image_conveyor_update_reference_preset(request):
+        service = get_service(folder_paths)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise InvalidPreset("The preset request is malformed.")
+            kwargs = {}
+            if "name" in payload:
+                kwargs["name"] = payload.get("name")
+            if "slots" in payload:
+                kwargs["slots"] = payload.get("slots")
+            preset = await asyncio.to_thread(
+                service.preset_store.update,
+                request.match_info["preset_id"],
+                **kwargs,
+            )
+            return web.json_response({"preset": preset})
+        except PresetNotFound:
+            return web.json_response({"error": "Reference preset not found."}, status=404)
+        except (InvalidPreset, InvalidInputPath, json.JSONDecodeError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception:
+            LOGGER.exception("Image Conveyor failed to update a reference preset.")
+            return web.json_response({"error": "Unable to update the reference preset."}, status=500)
+
+    @routes.delete("/image-conveyor/reference-presets/{preset_id}")
+    async def image_conveyor_delete_reference_preset(request):
+        service = get_service(folder_paths)
+        try:
+            deleted = await asyncio.to_thread(
+                service.preset_store.delete,
+                request.match_info["preset_id"],
+            )
+            if not deleted:
+                return web.json_response({"error": "Reference preset not found."}, status=404)
+            return web.json_response({"deleted": True})
+        except (InvalidPreset, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception:
+            LOGGER.exception("Image Conveyor failed to delete a reference preset.")
+            return web.json_response({"error": "Unable to delete the reference preset."}, status=500)
 
     @routes.get("/image-conveyor/thumbnail")
     async def image_conveyor_thumbnail(request):
@@ -1103,5 +1530,22 @@ def register_routes() -> None:
                 "Cache-Control": cache_control,
             },
         )
+
+    @routes.get("/image-conveyor/image-properties")
+    async def image_conveyor_image_properties(request):
+        service = get_service(folder_paths)
+        relative_path = request.rel_url.query.get("relative_path", "")
+        try:
+            properties = await asyncio.to_thread(service.image_properties, relative_path)
+        except FileNotFoundError:
+            return web.json_response({"error": "Image not found."}, status=404)
+        except InvalidInputPath as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except InvalidThumbnail as exc:
+            return web.json_response({"error": str(exc)}, status=415)
+        except Exception:
+            LOGGER.exception("Image Conveyor failed to inspect an image.")
+            return web.json_response({"error": "Unable to inspect the image."}, status=500)
+        return web.json_response(properties)
 
     _ROUTES_REGISTERED = True

@@ -38,6 +38,7 @@ jobs:
         run: |
           node --test tests/test_gallery_math.mjs
           node --test tests/test_queue_groups.mjs
+          node --test tests/test_reference_shelf.mjs
 
       - name: Check JavaScript syntax
         run: |

@@ -3,7 +3,12 @@ import { api } from '../../scripts/api.js'
 import '../../scripts/domWidget.js'
 import {
   CARD_FOOTER_HEIGHT,
+  OUTPUT_MODE_PERSISTENT,
+  OUTPUT_MODE_QUEUE_GROUP,
+  REFERENCE_SLOT_COUNT,
   calculateAutoQueueExtraExecutions,
+  applyReferenceAssignments,
+  calculateReferenceShelfLayout,
   calculateGalleryDropIntent,
   calculateMarqueeGridIndexes,
   calculateGalleryMetrics,
@@ -12,15 +17,21 @@ import {
   chooseViewAfterClose,
   clientPointToScrollContent,
   completeExecutionGroupCount,
+  createPreviewNavigation,
   dispatchKeyboundCommandFallback,
   groupDirectoryPickerFiles,
+  hasVisibleModalCandidate,
   isDragLeavingDocument,
   isGalleryViewportMeasurable,
   isHighVelocityScroll,
   isConveyorGalleryShortcut,
   makeQueueReservationPayload,
   markReservedGroupQueued,
+  moveReferenceSlot,
   normalizeImagesPerExecution,
+  normalizeOutputMode,
+  normalizeReferenceSlot,
+  normalizeReferenceSlots,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
@@ -28,9 +39,17 @@ import {
   queueReservationMembers,
   restoreGraphCanvasFocus,
   selectExecutionGroup,
+  effectiveQueueGroupSize,
+  classifyReferenceDrag,
+  loadPresetSnapshot,
+  referencePresetDisplay,
+  referenceShelfHit,
+  relinkReferenceSlots,
   shouldReanchorGalleryResize,
-  isConveyorDeleteShortcut
-} from './image_conveyor_math.mjs'
+  snapshotReferenceOutputConnections,
+  isConveyorDeleteShortcut,
+  stepPreviewNavigationIndex
+} from './image_conveyor_math.mjs?v=64d0259bdfdbb853'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.VueNodes'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -41,7 +60,7 @@ const CUSTOM_WIDGET_INPUT = 'batch_loader_ui'
 const CUSTOM_WIDGET_TYPE = 'BATCH_IMAGE_LOADER_UI'
 const DOM_WIDGET_NAME = 'batch_loader_ui'
 const STYLE_ID = 'comfy-batch-image-loader-style'
-const STATE_VERSION = 1
+const STATE_VERSION = 2
 const IMAGE_EXTENSIONS = new Set([
   'png',
   'jpg',
@@ -70,6 +89,7 @@ const CARD_SIZES = {
 }
 let keyboardOwnerNode = null
 const keyboardNodes = new Set()
+let activeReferenceDrag = null
 
 function claimGalleryKeyboardOwnership(node) {
   if (keyboardOwnerNode && keyboardOwnerNode !== node) {
@@ -148,16 +168,9 @@ const keyboardCoordinator = {
 }
 
 function hasVisibleModal() {
-  const candidates = document.querySelectorAll(
-    'dialog[open], [aria-modal="true"], .p-dialog-mask, .comfy-modal'
+  return hasVisibleModalCandidate(
+    document.querySelectorAll('dialog[open], [aria-modal="true"], .p-dialog-mask, .comfy-modal')
   )
-  for (const element of candidates) {
-    if (element.hidden || element.getAttribute?.('aria-hidden') === 'true') continue
-    const style = globalThis.getComputedStyle?.(element)
-    if (style?.display === 'none' || style?.visibility === 'hidden') continue
-    return true
-  }
-  return false
 }
 
 function structuredCloneCompat(value) {
@@ -184,7 +197,10 @@ function defaultState() {
     auto_queue: false,
     dont_consume: false,
     catch_canvas_drops: false,
-    images_per_execution: 1
+    images_per_execution: 1,
+    output_mode: OUTPUT_MODE_PERSISTENT,
+    reference_slots: Array(REFERENCE_SLOT_COUNT).fill(null),
+    active_reference_preset_id: ''
   }
 }
 
@@ -234,13 +250,22 @@ function parseState(raw) {
   const items = Array.isArray(state.items)
     ? state.items.map(normalizeItem).filter(Boolean)
     : []
+  const imagesPerExecution = normalizeImagesPerExecution(state.images_per_execution ?? 1)
+  const outputMode = normalizeOutputMode(
+    state.output_mode,
+    imagesPerExecution,
+    Object.hasOwn(state, 'output_mode')
+  )
   return {
     version: STATE_VERSION,
     items,
     auto_queue: Boolean(state.auto_queue),
     dont_consume: Boolean(state.dont_consume),
     catch_canvas_drops: Boolean(state.catch_canvas_drops),
-    images_per_execution: normalizeImagesPerExecution(state.images_per_execution ?? 1)
+    images_per_execution: imagesPerExecution,
+    output_mode: outputMode,
+    reference_slots: normalizeReferenceSlots(state.reference_slots),
+    active_reference_preset_id: String(state.active_reference_preset_id ?? '').trim()
   }
 }
 
@@ -282,7 +307,10 @@ function serializeState(state) {
       auto_queue: Boolean(state.auto_queue),
       dont_consume: Boolean(state.dont_consume),
       catch_canvas_drops: Boolean(state.catch_canvas_drops),
-      images_per_execution: normalizeImagesPerExecution(state.images_per_execution)
+      images_per_execution: normalizeImagesPerExecution(state.images_per_execution),
+      output_mode: normalizeOutputMode(state.output_mode, state.images_per_execution, true),
+      reference_slots: normalizeReferenceSlots(state.reference_slots),
+      active_reference_preset_id: String(state.active_reference_preset_id ?? '').trim()
     },
     null,
     0
@@ -487,7 +515,7 @@ function findFirstByStatus(state, statuses) {
 function findNextLoadGroup(state) {
   return selectExecutionGroup(
     state.items,
-    state.images_per_execution,
+    effectiveQueueGroupSize(state.output_mode, state.images_per_execution),
     state.dont_consume
   )
 }
@@ -537,7 +565,7 @@ const autoQueueCoordinator = {
       const { state } = getCurrentState(node)
       if (!state.auto_queue || state.dont_consume) continue
       const pendingCount = countItemsByStatus(state, 'pending')
-      const imagesPerExecution = normalizeImagesPerExecution(state.images_per_execution)
+      const imagesPerExecution = effectiveQueueGroupSize(state.output_mode, state.images_per_execution)
       const completeGroups = completeExecutionGroupCount(pendingCount, imagesPerExecution)
       if (completeGroups <= 0) continue
       eligible.push({ node, pendingCount, imagesPerExecution, completeGroups })
@@ -1393,6 +1421,21 @@ function makeItemFromInputFile(entry) {
   }
 }
 
+function makeReferenceFromInputEntry(entry) {
+  if (entry?.type && String(entry.type).toLowerCase() !== 'input') return null
+  const relativePath = normalizeSourcePath(
+    entry?.relative_path || stripAnnotatedStorageTypeSuffix(entry?.annotated)
+  ).replace(/^\/+/, '')
+  if (!relativePath) return null
+  const separator = relativePath.lastIndexOf('/')
+  return normalizeReferenceSlot({
+    annotated: `${relativePath} [input]`,
+    filename: separator >= 0 ? relativePath.slice(separator + 1) : relativePath,
+    subfolder: separator >= 0 ? relativePath.slice(0, separator) : '',
+    type: 'input'
+  })
+}
+
 function makeItemFromUploadResponse(data) {
   const filename = String(data?.name ?? '').trim()
   const subfolder = String(data?.subfolder ?? '').trim()
@@ -1463,6 +1506,100 @@ async function uploadFiles(files) {
   return { uploaded, errors }
 }
 
+function mergeUploadedInputMetadata(ctx, uploaded) {
+  if (!ctx.browser?.input?.loaded || !uploaded.length) return
+  const inputPosition = new Map(
+    ctx.browser.input.files.map((entry, index) => [entry.relative_path, index])
+  )
+  for (const entry of uploaded) {
+    if (!entry?.relative_path) continue
+    const inputEntry = {
+      filename: entry.name,
+      subfolder: entry.subfolder || '',
+      relative_path: entry.relative_path,
+      type: 'input',
+      size: Number(entry.size || 0),
+      mtime_ns: Number(entry.mtime_ns || 0),
+      source_version: String(entry.source_version || '')
+    }
+    const existingIndex = inputPosition.get(inputEntry.relative_path) ?? -1
+    if (existingIndex >= 0) ctx.browser.input.files[existingIndex] = inputEntry
+    else {
+      inputPosition.set(inputEntry.relative_path, ctx.browser.input.files.length)
+      ctx.browser.input.files.push(inputEntry)
+    }
+  }
+  ctx.inputVersion += 1
+  updateFolderOptions(ctx)
+}
+
+function setReferenceSlots(node, startIndex, references) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return 0
+  const { state, uiState } = getRenderableState(node)
+  if (state.output_mode !== OUTPUT_MODE_PERSISTENT) return 0
+  const next = applyReferenceAssignments(state, startIndex, references)
+  const changed = next.reference_slots.reduce((count, slot, index) => (
+    slot?.annotated !== state.reference_slots[index]?.annotated ? count + 1 : count
+  ), 0)
+  if (!changed) return 0
+  state.reference_slots = next.reference_slots
+  updateState(node, state, uiState)
+  node.setDirtyCanvas?.(true, true)
+  return changed
+}
+
+function clearReferenceSlot(node, index) {
+  const { state, uiState } = getRenderableState(node)
+  const slots = normalizeReferenceSlots(state.reference_slots)
+  if (!slots[index]) return false
+  slots[index] = null
+  state.reference_slots = slots
+  updateState(node, state, uiState)
+  node.setDirtyCanvas?.(true, true)
+  return true
+}
+
+async function importReferenceOnly(node, files, startIndex) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return false
+  const entries = normalizeUploadFiles(files)
+  if (!entries.length) return false
+  const { uploaded, errors } = await uploadFiles(entries)
+  if (node.__bil !== ctx || ctx.removed) return false
+  mergeUploadedInputMetadata(ctx, uploaded)
+  const references = uploaded.map((entry) => makeReferenceFromInputEntry({
+    relative_path: entry.relative_path,
+    filename: entry.name,
+    subfolder: entry.subfolder,
+    annotated: `${entry.relative_path} [input]`
+  })).filter(Boolean)
+  const assigned = setReferenceSlots(node, startIndex, references)
+  if (errors.length) {
+    const message = errors.length === 1
+      ? errors[0].error.message
+      : `${errors.length} reference images failed to import.`
+    ctx.browser.input.error = message
+    console.error('Image Conveyor: reference-only import failed for some images.', ...errors.map(({ error }) => error))
+    scheduleRenderNode(node)
+  }
+  return assigned > 0
+}
+
+async function assignReferenceDrag(node, drag, slotIndex) {
+  if (!drag?.classification) return false
+  if (drag.classification.requiresImport) {
+    const file = drag.item?.localFile
+    if (!(file instanceof File)) return false
+    return importReferenceOnly(node, [{
+      file,
+      relativeSubfolder: drag.item.relativeSubfolder || drag.item.subfolder || ''
+    }], slotIndex)
+  }
+  const reference = makeReferenceFromInputEntry(drag.item)
+  return reference ? setReferenceSlots(node, slotIndex, [reference]) > 0 : false
+}
+
 function formatByteCount(value) {
   const bytes = Math.max(0, Number(value) || 0)
   if (bytes < 1024) return `${bytes} B`
@@ -1515,6 +1652,12 @@ function rewriteLiveInputReferences(replacements) {
       if (normalizeSourcePath(item.source_path) === oldPath) item.source_path = keepPath
       if (normalizeSourcePath(uiState.source_paths[item.id]) === oldPath) uiState.source_paths[item.id] = keepPath
       rewritten += 1
+      changed = true
+    }
+    const relinkedReferences = relinkReferenceSlots(state.reference_slots, replacements)
+    if (relinkedReferences.changed) {
+      state.reference_slots = relinkedReferences.slots
+      rewritten += relinkedReferences.changed
       changed = true
     }
     if (changed) updateState(node, state, uiState)
@@ -1589,7 +1732,10 @@ async function cleanManagedDuplicates(node) {
     const deleteResponse = await api.fetchApi('/image-conveyor/managed-duplicates/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groups, protected_paths: Array.from(protectedPaths) })
+      body: JSON.stringify({
+        groups,
+        protected_paths: Array.from(protectedPaths)
+      })
     })
     const result = await readJsonResponse(deleteResponse, 'Duplicate cleanup failed')
     const deleted = Array.isArray(result?.deleted) ? result.deleted : []
@@ -1608,6 +1754,9 @@ async function cleanManagedDuplicates(node) {
       `Deleted ${deleted.length} exact duplicate${deleted.length === 1 ? '' : 's'} ` +
       `and reclaimed ${formatByteCount(result?.reclaimed_bytes)}.`,
       rewritten ? `Updated ${rewritten} open Conveyor reference${rewritten === 1 ? '' : 's'}.` : '',
+      result?.presets_relinked
+        ? `Updated ${result.presets_relinked} saved preset reference${result.presets_relinked === 1 ? '' : 's'}.`
+        : '',
       reservationSkips ? `${reservationSkips} newly queued file${reservationSkips === 1 ? ' was' : 's were'} protected.` : '',
       changedSkips ? `${changedSkips} file${changedSkips === 1 ? ' was' : 's were'} skipped because the filesystem changed after the preview.` : ''
     ].filter(Boolean).join('\n')
@@ -1723,6 +1872,14 @@ function ensureStyles() {
     .bil-lightbox img { max-width: 94vw; max-height: 90vh; object-fit: contain; box-shadow: 0 18px 60px rgba(0,0,0,.45); }
     .bil-lightbox-label { position: absolute; left: 24px; bottom: 18px; right: 70px; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .bil-lightbox-close { position: absolute; top: 18px; right: 20px; font-size: 24px; color: white; background: rgba(255,255,255,.12); border: 0; border-radius: 8px; width: 38px; height: 38px; cursor: pointer; }
+    .bil-image-menu { position: fixed; z-index: 100002; width: min(300px, calc(100vw - 16px)); padding: 7px; box-sizing: border-box; border: 1px solid rgba(255,255,255,.22); border-radius: 9px; background: #202124; color: #f0f0f0; box-shadow: 0 14px 40px rgba(0,0,0,.48); font: 12px/1.35 system-ui, sans-serif; }
+    .bil-image-menu-title { padding: 4px 7px 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 680; }
+    .bil-image-menu-properties { padding: 2px 7px 7px; color: rgba(255,255,255,.68); overflow-wrap: anywhere; }
+    .bil-image-menu-properties > div + div { margin-top: 2px; }
+    .bil-image-menu-separator { height: 1px; margin: 5px 3px; background: rgba(255,255,255,.12); }
+    .bil-image-menu button { display: block; width: 100%; border: 0; border-radius: 6px; padding: 6px 7px; background: transparent; color: inherit; text-align: left; font: inherit; cursor: pointer; }
+    .bil-image-menu button:hover, .bil-image-menu button:focus-visible { background: rgba(120,175,240,.18); outline: none; }
+    .bil-image-menu button.bil-danger { color: #ffaaaa; }
     @media (max-width: 600px) { .bil-browserbar { grid-template-columns: minmax(100px,1fr) auto auto; } .bil-browserbar .bil-size-select { display: none; } }
   `
   document.head.appendChild(style)
@@ -1754,12 +1911,14 @@ function attachQueueLifecycle(node) {
 
   queueWidget.beforeQueued = () => {
     const { state } = getCurrentState(node)
-    const count = normalizeImagesPerExecution(state.images_per_execution)
+    const count = effectiveQueueGroupSize(state.output_mode, state.images_per_execution)
     const group = findNextLoadGroup(state)
-    updateQueueWidget(
-      node,
-      group.length === count ? makeQueueReservationPayload(group) : null
+    const payload = snapshotReferenceOutputConnections(
+      group.length === count ? makeQueueReservationPayload(group) : null,
+      state.output_mode,
+      node.outputs
     )
+    updateQueueWidget(node, payload)
   }
 
   queueWidget.afterQueued = () => {
@@ -2214,33 +2373,413 @@ function createLightbox(node) {
   close.textContent = '×'
   close.setAttribute('aria-label', 'Close preview')
   lightbox.append(image, label, close)
+  const navigation = { entries: [], index: -1, collection: '' }
+  const renderCurrent = () => {
+    const entry = navigation.entries[navigation.index]
+    const ctx = node.__bil
+    if (!entry?.item || !ctx || ctx.removed) return false
+    const item = entry.item
+    const itemLabel = item.filename || item.relative_path || getItemDisplayPath(item)
+    image.src = filePreviewUrl(item, ctx)
+    image.alt = itemLabel
+    const position = navigation.entries.length > 1
+      ? `${navigation.index + 1} of ${navigation.entries.length}`
+      : ''
+    const context = [navigation.collection, position].filter(Boolean).join(' · ')
+    label.textContent = `${itemLabel}${context ? ` · ${context}` : ''}${navigation.entries.length > 1 ? ' · ←/→ navigate' : ''}`
+    label.title = label.textContent
+    if (item.sourceId) lightbox.dataset.sourceId = item.sourceId
+    else delete lightbox.dataset.sourceId
+    return true
+  }
+  const navigate = (direction) => {
+    const next = stepPreviewNavigationIndex(
+      navigation.index,
+      direction,
+      navigation.entries.length
+    )
+    if (next < 0 || next === navigation.index) return false
+    navigation.index = next
+    return renderCurrent()
+  }
   const hide = () => {
     lightbox.hidden = true
     image.removeAttribute('src')
+    label.textContent = ''
+    label.removeAttribute('title')
+    navigation.entries = []
+    navigation.index = -1
+    navigation.collection = ''
     delete lightbox.dataset.sourceId
     restoreGraphCanvasFocus(lightbox, app.canvas?.canvas)
   }
   close.addEventListener('click', hide)
   lightbox.addEventListener('click', (event) => { if (event.target === lightbox) hide() })
   lightbox.addEventListener('keydown', (event) => {
-    if (event.key !== 'Escape' || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      consumeGalleryKeyboardEvent(event)
+      navigate(event.key === 'ArrowLeft' ? -1 : 1)
+      return
+    }
+    if (event.key !== 'Escape') return
     consumeGalleryKeyboardEvent(event)
     hide()
   })
   document.body.appendChild(lightbox)
-  return { root: lightbox, image, label, close, hide }
+  const show = (nextNavigation) => {
+    navigation.entries = Array.isArray(nextNavigation?.entries) ? nextNavigation.entries : []
+    navigation.index = Number.isInteger(nextNavigation?.index) ? nextNavigation.index : -1
+    navigation.collection = String(nextNavigation?.collection || '')
+    if (!renderCurrent()) return false
+    lightbox.hidden = false
+    close.focus({ preventScroll: true })
+    return true
+  }
+  return { root: lightbox, image, label, close, hide, navigate, show }
 }
 
-function openPreview(node, item) {
+function previewCollectionLabel(ctx, view) {
+  if (view === 'conveyor') return 'Conveyor'
+  if (view === 'input') return 'Input Folder'
+  const browser = browserForView(ctx, view)
+  const source = browser ? ctx.browser.folderSources.get(browser.sourceId) : null
+  if (!source) return 'Folder'
+  return browser.folderPath ? `${source.name}/${browser.folderPath}` : source.name
+}
+
+function previewNavigationFor(node, item, options = {}) {
+  const ctx = node.__bil
+  const referenceIndex = Number.isInteger(options.referenceIndex) ? options.referenceIndex : null
+  if (referenceIndex != null) {
+    const slots = getRenderableState(node).state.reference_slots
+    const currentId = `reference:${referenceIndex}`
+    const result = createPreviewNavigation(
+      slots.map((reference, index) => ({ id: `reference:${index}`, item: reference })),
+      currentId
+    )
+    if (result.index >= 0) return { ...result, collection: 'Reference Shelf' }
+  }
+
+  const view = String(options.view || '')
+  if (view && view === ctx.browser.activeView) {
+    const currentId = options.itemId ?? getViewItemId(ctx, item, view)
+    const result = createPreviewNavigation(
+      (ctx.visibleItems || []).map((entry) => ({
+        id: getViewItemId(ctx, entry, view),
+        item: entry
+      })),
+      currentId
+    )
+    if (result.index >= 0) return { ...result, collection: previewCollectionLabel(ctx, view) }
+  }
+
+  return { entries: [{ id: 'current', item }], index: 0, collection: '' }
+}
+
+function openPreview(node, item, options = {}) {
   const ctx = node.__bil
   if (!ctx?.lightbox || !item || item.kind === 'folder') return
-  const label = item.filename || item.relative_path || getItemDisplayPath(item)
-  ctx.lightbox.image.src = filePreviewUrl(item, ctx)
-  ctx.lightbox.image.alt = label
-  ctx.lightbox.label.textContent = label
-  if (item.sourceId) ctx.lightbox.root.dataset.sourceId = item.sourceId
-  ctx.lightbox.root.hidden = false
-  ctx.lightbox.close.focus({ preventScroll: true })
+  ctx.lightbox.show(previewNavigationFor(node, item, options))
+}
+
+function closeImageContextMenu(ctx) {
+  if (!ctx) return
+  if (ctx.imageContextMenuDismiss) {
+    document.removeEventListener('pointerdown', ctx.imageContextMenuDismiss.pointerdown, true)
+    document.removeEventListener('keydown', ctx.imageContextMenuDismiss.keydown, true)
+    window.removeEventListener('blur', ctx.imageContextMenuDismiss.blur)
+    ctx.imageContextMenuDismiss = null
+  }
+  ctx.imageContextMenu?.remove?.()
+  ctx.imageContextMenu = null
+  ctx.imageContextMenuSource = null
+}
+
+function localImageProperties(ctx, item) {
+  const file = item?.localFile
+  if (!(file instanceof File)) return Promise.reject(new Error('Local image metadata is unavailable.'))
+  const extension = String(file.name || '').split('.').at(-1)?.toUpperCase() || ''
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    image.onload = () => resolve({
+      relative_path: item.relative_path || file.name,
+      filename: file.name,
+      format: String(file.type || '').split('/').at(-1)?.toUpperCase() || extension,
+      mode: '',
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+      frames: 1,
+      size: file.size,
+      mtime_ms: file.lastModified
+    })
+    image.onerror = () => reject(new Error('Unable to read image properties.'))
+    image.src = localObjectUrl(ctx, item)
+  })
+}
+
+async function requestImageProperties(node, item) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) throw new Error('The node is no longer available.')
+  if (item?.localFile) return await localImageProperties(ctx, item)
+  const relativePath = getInputRelativePath(item)
+  if (!relativePath) throw new Error('Properties are only available for input images.')
+  const params = new URLSearchParams({ relative_path: relativePath })
+  const response = await api.fetchApi(`/image-conveyor/image-properties?${params.toString()}`)
+  return await readJsonResponse(response, 'Unable to read image properties')
+}
+
+function imagePropertyLines(properties, item) {
+  const summary = []
+  const width = Number(properties?.width)
+  const height = Number(properties?.height)
+  if (width > 0 && height > 0) summary.push(`${width} × ${height}`)
+  const format = String(properties?.format || '').trim()
+  if (format) summary.push(format)
+  const bytes = Number(properties?.size ?? item?.size ?? item?.localFile?.size)
+  if (Number.isFinite(bytes) && bytes >= 0) summary.push(formatByteCount(bytes))
+  const frames = Math.max(1, Number(properties?.frames) || 1)
+  if (frames > 1) summary.push(`${frames} frames`)
+
+  const lines = []
+  if (summary.length) lines.push(summary.join(' · '))
+  const modified = Number(properties?.mtime_ms ?? item?.localFile?.lastModified)
+  if (modified > 0) lines.push(`Modified ${new Date(modified).toLocaleString()}`)
+  const path = String(properties?.relative_path || getInputRelativePath(item) || item?.relative_path || '').trim()
+  if (path) lines.push(path)
+  return lines
+}
+
+function mutateConveyorContextItem(node, itemId, action) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return
+  const { state, uiState } = getRenderableState(node)
+  const item = state.items.find((entry) => entry.id === itemId)
+  if (!item) return
+  if (action === 'pending' || action === 'processed') {
+    item.status = action
+    if (action === 'processed') item.last_processed_at = Date.now()
+  } else if (action === 'remove') {
+    state.items = state.items.filter((entry) => entry.id !== itemId)
+    ctx.browser.conveyor.selected.delete(itemId)
+    uiState.selected_ids = uiState.selected_ids.filter((id) => id !== itemId)
+    delete uiState.source_paths[itemId]
+  }
+  updateState(node, state, uiState)
+}
+
+function showImageContextMenu(node, item, clientX, clientY, options = {}) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed || !item || item.kind === 'folder') return false
+  closeImageContextMenu(ctx)
+  closePresetPopover(ctx)
+
+  const menu = document.createElement('div')
+  menu.className = 'bil-image-menu'
+  menu.setAttribute('role', 'menu')
+  menu.addEventListener('contextmenu', (event) => event.preventDefault())
+  const title = document.createElement('div')
+  title.className = 'bil-image-menu-title'
+  title.textContent = item.filename || item.relative_path || getItemDisplayPath(item)
+  const properties = document.createElement('div')
+  properties.className = 'bil-image-menu-properties'
+  properties.textContent = 'Loading properties…'
+  menu.append(title, properties)
+
+  const addSeparator = () => {
+    const separator = document.createElement('div')
+    separator.className = 'bil-image-menu-separator'
+    separator.setAttribute('role', 'separator')
+    menu.appendChild(separator)
+  }
+  const addAction = (label, handler, { danger = false } = {}) => {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.setAttribute('role', 'menuitem')
+    button.textContent = label
+    if (danger) button.classList.add('bil-danger')
+    button.addEventListener('click', async () => {
+      try {
+        await handler()
+      } catch (error) {
+        window.alert(error?.message || 'The image action failed.')
+      } finally {
+        closeImageContextMenu(ctx)
+      }
+    })
+    menu.appendChild(button)
+    return button
+  }
+
+  addSeparator()
+  const openButton = addAction('Open image preview', () => openPreview(node, item, options))
+  addAction('Copy image path', async () => {
+    const path = getInputRelativePath(item) || item.relative_path || getItemDisplayPath(item)
+    if (!path || !navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable.')
+    await navigator.clipboard.writeText(path)
+  })
+
+  const referenceIndex = Number.isInteger(options.referenceIndex) ? options.referenceIndex : null
+  if (referenceIndex != null) {
+    addSeparator()
+    addAction('Clear reference', () => clearReferenceSlot(node, referenceIndex), { danger: true })
+  } else if (options.view === 'conveyor') {
+    addSeparator()
+    addAction('Mark pending', () => mutateConveyorContextItem(node, options.itemId, 'pending'))
+    addAction('Mark processed', () => mutateConveyorContextItem(node, options.itemId, 'processed'))
+    addAction('Remove from Conveyor', () => mutateConveyorContextItem(node, options.itemId, 'remove'), { danger: true })
+  } else {
+    addSeparator()
+    addAction('Add to Conveyor', () => addLibraryEntries(node, [item]))
+  }
+
+  document.body.appendChild(menu)
+  const x = Math.max(8, Number(clientX) || 8)
+  const y = Math.max(8, Number(clientY) || 8)
+  menu.style.left = `${x}px`
+  menu.style.top = `${y}px`
+  const rect = menu.getBoundingClientRect()
+  if (rect.right > innerWidth - 8) menu.style.left = `${Math.max(8, innerWidth - rect.width - 8)}px`
+  if (rect.bottom > innerHeight - 8) menu.style.top = `${Math.max(8, innerHeight - rect.height - 8)}px`
+  ctx.imageContextMenu = menu
+  ctx.imageContextMenuSource = {
+    item,
+    itemId: options.itemId ?? null,
+    referenceIndex: Number.isInteger(options.referenceIndex) ? options.referenceIndex : null
+  }
+
+  const pointerdown = (event) => {
+    if (!menu.contains(event.target)) closeImageContextMenu(ctx)
+  }
+  const keydown = (event) => {
+    if (event.key === 'Escape') closeImageContextMenu(ctx)
+  }
+  const blur = () => closeImageContextMenu(ctx)
+  ctx.imageContextMenuDismiss = { pointerdown, keydown, blur }
+  document.addEventListener('pointerdown', pointerdown, true)
+  document.addEventListener('keydown', keydown, true)
+  window.addEventListener('blur', blur)
+  openButton.focus({ preventScroll: true })
+
+  void requestImageProperties(node, item).then((result) => {
+    if (ctx.imageContextMenu !== menu || ctx.removed) return
+    const lines = imagePropertyLines(result, item)
+    properties.replaceChildren(...(lines.length ? lines : ['Properties unavailable']).map((line) => {
+      const row = document.createElement('div')
+      row.textContent = line
+      return row
+    }))
+    const nextRect = menu.getBoundingClientRect()
+    if (nextRect.bottom > innerHeight - 8) menu.style.top = `${Math.max(8, innerHeight - nextRect.height - 8)}px`
+  }).catch((error) => {
+    if (ctx.imageContextMenu !== menu || ctx.removed) return
+    properties.textContent = error?.message || 'Properties unavailable.'
+  })
+  return true
+}
+
+function consumeImageContextPointer(event) {
+  event?.preventDefault?.()
+  event?.stopPropagation?.()
+  event?.stopImmediatePropagation?.()
+}
+
+const imageContextMenuCoordinator = {
+  nodes: new Set(),
+  windowPointerDownHandler: null,
+  hookedCanvas: null,
+  previousCanvasOnMouse: null,
+  canvasOnMouseHandler: null,
+
+  registerNode(node) {
+    this.nodes.add(node)
+    this.attachWindowCapture()
+    this.ensureCanvasHook()
+  },
+
+  unregisterNode(node) {
+    this.nodes.delete(node)
+    if (this.nodes.size) return
+    if (this.windowPointerDownHandler) {
+      window.removeEventListener('pointerdown', this.windowPointerDownHandler, true)
+      this.windowPointerDownHandler = null
+    }
+    if (this.hookedCanvas?.onMouse === this.canvasOnMouseHandler) {
+      this.hookedCanvas.onMouse = this.previousCanvasOnMouse
+    }
+    this.hookedCanvas = null
+    this.previousCanvasOnMouse = null
+    this.canvasOnMouseHandler = null
+  },
+
+  attachWindowCapture() {
+    if (this.windowPointerDownHandler) return
+    this.windowPointerDownHandler = (event) => this.handleDomPointerDown(event)
+    window.addEventListener('pointerdown', this.windowPointerDownHandler, true)
+  },
+
+  ensureCanvasHook() {
+    const graphCanvas = app.canvas
+    if (!graphCanvas || graphCanvas === this.hookedCanvas) return
+    if (this.hookedCanvas?.onMouse === this.canvasOnMouseHandler) {
+      this.hookedCanvas.onMouse = this.previousCanvasOnMouse
+    }
+    this.hookedCanvas = graphCanvas
+    const previousCanvasOnMouse = graphCanvas.onMouse
+    this.previousCanvasOnMouse = previousCanvasOnMouse
+    const coordinator = this
+    this.canvasOnMouseHandler = function (event) {
+      if (coordinator.handleCanvasPointerDown(event)) return true
+      return previousCanvasOnMouse?.call(this, event)
+    }
+    graphCanvas.onMouse = this.canvasOnMouseHandler
+  },
+
+  handleDomPointerDown(event) {
+    if (event?.button !== 2) return false
+    const target = eventOrigin(event)
+    if (!(target instanceof Element)) return false
+    for (const node of this.nodes) {
+      const ctx = node?.__bil
+      if (!ctx || ctx.removed || !ctx.root?.contains(target)) continue
+      const slot = ctx.cardPool.find((entry) => (
+        entry.itemId &&
+        entry.item?.kind !== 'folder' &&
+        entry.media?.contains(target)
+      ))
+      if (!slot) return false
+      const item = slot.item
+      const itemId = slot.itemId
+      const view = ctx.browser.activeView
+      const clientX = event.clientX
+      const clientY = event.clientY
+      consumeImageContextPointer(event)
+      queueMicrotask(() => {
+        if (
+          node.__bil !== ctx || ctx.removed ||
+          slot.item !== item || slot.itemId !== itemId
+        ) return
+        showImageContextMenu(node, item, clientX, clientY, { view, itemId })
+      })
+      return true
+    }
+    return false
+  },
+
+  handleCanvasPointerDown(event) {
+    if (event?.button !== 2) return false
+    const node = getCanvasNodeAtEvent(event)
+    if (!node || !this.nodes.has(node)) return false
+    const hit = referenceShelfEventHit(node, event)
+    if (hit?.type !== 'slot' && hit?.type !== 'clear') return false
+    const reference = getRenderableState(node).state.reference_slots[hit.index]
+    if (!reference) return false
+    if (!showImageContextMenu(node, reference, event.clientX, event.clientY, {
+      referenceIndex: hit.index
+    })) return false
+    consumeImageContextPointer(event)
+    return true
+  }
 }
 
 function clearCardDragTargets(ctx, except = null) {
@@ -2450,12 +2989,38 @@ function createCardSlot(node, ctx) {
 
   card.addEventListener('dragstart', (event) => {
     if (!slot.draggable || !slot.itemId) { event.preventDefault(); return }
-    ctx.draggedId = slot.itemId
+    const classification = classifyReferenceDrag(
+      slot.item,
+      ctx.browser.activeView,
+      canReorderConveyor(ctx)
+    )
+    if (!classification) { event.preventDefault(); return }
+    activeReferenceDrag = {
+      node,
+      item: slot.item,
+      view: ctx.browser.activeView,
+      classification
+    }
+    ctx.draggedId = classification.canReorder
+      ? slot.itemId
+      : null
+    event.dataTransfer?.setData('application/x-image-conveyor-reference', JSON.stringify({
+      kind: classification.kind,
+      itemId: slot.itemId
+    }))
     event.dataTransfer?.setData('text/plain', slot.itemId)
-    if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = ctx.draggedId ? 'copyMove' : 'copy'
     clearInternalDragTarget(ctx)
   })
-  card.addEventListener('dragend', () => { ctx.draggedId = null; clearInternalDragTarget(ctx) })
+  card.addEventListener('dragend', () => {
+    ctx.draggedId = null
+    activeReferenceDrag = null
+    if (ctx.referenceDragHoverIndex != null) {
+      ctx.referenceDragHoverIndex = null
+      node.setDirtyCanvas?.(true, false)
+    }
+    clearInternalDragTarget(ctx)
+  })
 
   const media = document.createElement('div')
   media.className = 'bil-media'
@@ -2467,7 +3032,19 @@ function createCardSlot(node, ctx) {
     }
     selectItemFromClick(node, slot.itemId, event)
   })
-  media.addEventListener('dblclick', () => openPreview(node, slot.item))
+  media.addEventListener('contextmenu', (event) => {
+    if (!slot.itemId || slot.item?.kind === 'folder') return
+    consumeImageContextPointer(event)
+    if (
+      ctx.imageContextMenuSource?.item !== slot.item ||
+      ctx.imageContextMenuSource?.itemId !== slot.itemId
+    ) {
+      showImageContextMenu(node, slot.item, event.clientX, event.clientY, {
+        view: ctx.browser.activeView,
+        itemId: slot.itemId
+      })
+    }
+  })
   const thumb = document.createElement('img')
   thumb.className = 'bil-thumb'
   thumb.loading = 'lazy'
@@ -2641,7 +3218,7 @@ function updateCardSlot(node, slot, item, itemIndex, metrics, selected, annotate
   slot.card.classList.toggle('bil-folder-card', folderItem)
   slot.folderIcon.hidden = !folderItem
   slot.thumb.hidden = folderItem
-  const draggable = !inputView && canReorderConveyor(ctx)
+  const draggable = !folderItem
   if (slot.draggable !== draggable) {
     slot.draggable = draggable
     slot.card.draggable = draggable
@@ -2839,6 +3416,8 @@ function renderGalleryNode(node) {
   ctx.dontConsumeCheckbox.checked = Boolean(state.dont_consume)
   ctx.canvasDropCheckbox.checked = Boolean(state.catch_canvas_drops)
   ctx.imagesPerExecutionSelect.value = String(normalizeImagesPerExecution(state.images_per_execution))
+  ctx.outputModeSelect.value = normalizeOutputMode(state.output_mode, state.images_per_execution, true)
+  ctx.imagesPerExecutionLabel.hidden = state.output_mode !== OUTPUT_MODE_QUEUE_GROUP
 
   if (!ctx.visibleItems.length) {
     hideUnusedCards(ctx); ctx.renderedRangeKey = ''
@@ -3040,7 +3619,10 @@ function handleGalleryKeyDown(node, event) {
     case 'Enter':
       consumeGalleryKeyboardEvent(event)
       if (items[index].kind === 'folder') openFolderView(node, items[index].sourceId, items[index].folderPath)
-      else openPreview(node, items[index])
+      else openPreview(node, items[index], {
+        view: ctx.browser.activeView,
+        itemId: itemId(items[index])
+      })
       return true
     case ' ': {
       consumeGalleryKeyboardEvent(event)
@@ -3166,6 +3748,24 @@ function buildGalleryDom(node) {
   const autoQueue = makeToggle('Auto queue all pending', 'Auto queue all pending images')
   const dontConsume = makeToggle("Don't consume", 'Do not consume images')
   const canvasDrop = makeToggle('Catch canvas drops', 'Catch image drops anywhere on the canvas')
+  const outputModeLabel = document.createElement('label')
+  outputModeLabel.className = 'bil-toggle'
+  const outputModeText = document.createElement('span')
+  outputModeText.textContent = 'Additional outputs'
+  const outputModeSelect = document.createElement('select')
+  outputModeSelect.className = 'bil-select'
+  outputModeSelect.setAttribute('aria-label', 'Additional image output mode')
+  outputModeSelect.title = 'Persistent references always advances one Conveyor image and uses only populated shelf slots whose reference outputs are connected.'
+  ;[
+    [OUTPUT_MODE_PERSISTENT, 'Persistent references'],
+    [OUTPUT_MODE_QUEUE_GROUP, 'Queue execution group']
+  ].forEach(([value, label]) => {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    outputModeSelect.appendChild(option)
+  })
+  outputModeLabel.append(outputModeText, outputModeSelect)
   const imagesPerExecutionLabel = document.createElement('label')
   imagesPerExecutionLabel.className = 'bil-toggle'
   const imagesPerExecutionText = document.createElement('span')
@@ -3173,7 +3773,7 @@ function buildGalleryDom(node) {
   const imagesPerExecutionSelect = document.createElement('select')
   imagesPerExecutionSelect.className = 'bil-select bil-images-per-execution'
   imagesPerExecutionSelect.setAttribute('aria-label', 'Images per execution')
-  imagesPerExecutionSelect.title = 'Number of consecutive Conveyor images returned by each execution. 1 keeps the normal single-image behavior; 2-9 expose additional images through image_2 ... image_9.'
+  imagesPerExecutionSelect.title = 'Number of consecutive Conveyor images returned by each execution. 1 keeps the normal single-image behavior; 2-9 expose additional images through ref_image_1 ... ref_image_8.'
   for (let count = 1; count <= 9; count += 1) {
     const option = document.createElement('option')
     option.value = String(count)
@@ -3187,7 +3787,7 @@ function buildGalleryDom(node) {
   const jumpPendingBtn = document.createElement('button'); jumpPendingBtn.className = 'bil-btn'; jumpPendingBtn.type = 'button'; jumpPendingBtn.textContent = 'Jump to next pending'
   const cleanDuplicatesBtn = document.createElement('button'); cleanDuplicatesBtn.className = 'bil-btn'; cleanDuplicatesBtn.type = 'button'; cleanDuplicatesBtn.textContent = 'Clean exact duplicates'
   cleanDuplicatesBtn.title = 'Preview and remove byte-identical redundant files from the legacy input/image_conveyor folder'
-  settingsRow.append(autoQueue.label, dontConsume.label, imagesPerExecutionLabel, canvasDrop.label, selectVisibleBtn, clearQueuedBtn, clearProcessedBtn, jumpPendingBtn, cleanDuplicatesBtn)
+  settingsRow.append(autoQueue.label, dontConsume.label, outputModeLabel, imagesPerExecutionLabel, canvasDrop.label, selectVisibleBtn, clearQueuedBtn, clearProcessedBtn, jumpPendingBtn, cleanDuplicatesBtn)
   settings.append(settingsSummary, settingsRow)
 
   const list = document.createElement('div')
@@ -3216,7 +3816,8 @@ function buildGalleryDom(node) {
     contextLabel, setPendingBtn, setProcessedBtn, deleteSelectedBtn, contextAddBtn,
     cleanDuplicatesBtn,
     autoQueueCheckbox: autoQueue.checkbox, dontConsumeCheckbox: dontConsume.checkbox,
-    canvasDropCheckbox: canvasDrop.checkbox, imagesPerExecutionSelect,
+    canvasDropCheckbox: canvasDrop.checkbox, outputModeSelect,
+    imagesPerExecutionLabel, imagesPerExecutionSelect,
     list, listInner, listWindow, selectionMarquee, dropIndicator,
     browser: createBrowserState(), visibleItems: [], cardPool: [],
     draggedId: null, dragIntent: null, empty: null, state: null, uiState: null, renderVersion: 0,
@@ -3238,7 +3839,14 @@ function buildGalleryDom(node) {
     clearExternalDragState: null, restoreCanvasShortcutFocus: null, marqueeSelection: null,
     keyboardActive: false,
     queueRevision: 0, annotatedCountsRevision: -1, annotatedCounts: new Map(),
-    thumbnailUrlCache: new WeakMap(), localObjectUrls: new Map(), activePickerInput: null
+    thumbnailUrlCache: new WeakMap(), localObjectUrls: new Map(), activePickerInput: null,
+    referenceShelfLayout: null, referenceLayoutWidth: 0, referenceLayoutWidgetY: 0,
+    referenceOutputGutter: 0, referenceOutputGutterKey: '', referenceDragHoverIndex: null,
+    referenceDragSourceIndex: null, referenceShelfPointerDrag: null,
+    referenceThumbs: new Map(), presets: [],
+    presetsLoaded: false, presetsPromise: null, presetRequestId: 0,
+    presetPopover: null, presetPopoverDismiss: null,
+    imageContextMenu: null, imageContextMenuDismiss: null, imageContextMenuSource: null
   }
   const ctx = node.__bil
   ctx.lightbox = createLightbox(node)
@@ -3389,6 +3997,12 @@ function buildGalleryDom(node) {
   })
   autoQueue.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.auto_queue = autoQueue.checkbox.checked; updateState(node, state, uiState) })
   dontConsume.checkbox.addEventListener('change', () => { const { state, uiState } = getRenderableState(node); state.dont_consume = dontConsume.checkbox.checked; updateState(node, state, uiState) })
+  outputModeSelect.addEventListener('change', () => {
+    const { state, uiState } = getRenderableState(node)
+    state.output_mode = normalizeOutputMode(outputModeSelect.value, state.images_per_execution, true)
+    updateQueueWidget(node, null)
+    updateState(node, state, uiState)
+  })
   imagesPerExecutionSelect.addEventListener('change', () => {
     const { state, uiState } = getRenderableState(node)
     state.images_per_execution = normalizeImagesPerExecution(imagesPerExecutionSelect.value)
@@ -3650,37 +4264,14 @@ async function uploadViaNode(node, files, { feedbackView = 'input' } = {}) {
       throw new Error(errors.length === 1 ? errors[0].error.message : `${errors.length} images failed to import.`)
     }
     const { state, uiState } = getRenderableState(node)
-    const inputPosition = ctx.browser?.input?.loaded
-      ? new Map(ctx.browser.input.files.map((entry, index) => [entry.relative_path, index]))
-      : null
     for (const entry of uploaded) {
       const item = makeItemFromUploadResponse(entry)
       if (!item) continue
       state.items.push(item)
       const runtimeSourcePath = normalizeSourcePath(entry?.source_path)
       if (runtimeSourcePath) uiState.source_paths[item.id] = runtimeSourcePath
-      if (ctx.browser?.input?.loaded && entry.relative_path) {
-        const inputEntry = {
-          filename: entry.name,
-          subfolder: entry.subfolder || '',
-          relative_path: entry.relative_path,
-          type: 'input',
-          size: Number(entry.size || 0),
-          mtime_ns: Number(entry.mtime_ns || 0),
-          source_version: String(entry.source_version || '')
-        }
-        const existingIndex = inputPosition.get(inputEntry.relative_path) ?? -1
-        if (existingIndex >= 0) ctx.browser.input.files[existingIndex] = inputEntry
-        else {
-          inputPosition.set(inputEntry.relative_path, ctx.browser.input.files.length)
-          ctx.browser.input.files.push(inputEntry)
-        }
-      }
     }
-    if (ctx.browser?.input?.loaded && uploaded.length) {
-      ctx.inputVersion += 1
-      updateFolderOptions(ctx)
-    }
+    mergeUploadedInputMetadata(ctx, uploaded)
     const feedbackBrowser = browserForView(ctx, feedbackView) ?? ctx.browser.input
     if (uploaded.length && !errors.length) feedbackBrowser.error = ''
     if (uploaded.length) updateState(node, state, uiState)
@@ -3701,6 +4292,479 @@ async function uploadViaNode(node, files, { feedbackView = 'input' } = {}) {
       ctx.dropzoneLabel = ''
     }
   }
+}
+
+async function presetRequest(path = '', options = {}) {
+  const response = await api.fetchApi(`/image-conveyor/reference-presets${path}`, options)
+  return readJsonResponse(response, 'Reference preset request failed')
+}
+
+async function loadReferencePresets(node, { force = false } = {}) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return []
+  if (ctx.presetsLoaded && !force) return ctx.presets
+  if (ctx.presetsPromise && !force) return ctx.presetsPromise
+  const requestId = ++ctx.presetRequestId
+  const request = presetRequest().then((payload) => {
+    if (node.__bil !== ctx || ctx.removed || requestId !== ctx.presetRequestId) return ctx.presets
+    ctx.presets = Array.isArray(payload?.presets)
+      ? payload.presets.map((preset) => ({
+          ...preset,
+          slots: normalizeReferenceSlots(preset?.slots)
+        }))
+      : []
+    ctx.presetsLoaded = true
+    node.setDirtyCanvas?.(true, true)
+    return ctx.presets
+  }).finally(() => {
+    if (node.__bil === ctx && ctx.presetsPromise === request) ctx.presetsPromise = null
+  })
+  ctx.presetsPromise = request
+  return request
+}
+
+function activeReferencePreset(ctx, state) {
+  const id = String(state?.active_reference_preset_id ?? '')
+  return ctx.presets.find((preset) => preset?.id === id) ?? null
+}
+
+function hydrateReferencePresetName(node, state) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed || !String(state?.active_reference_preset_id ?? '').trim()) return
+  queueMicrotask(() => {
+    if (node.__bil !== ctx || ctx.removed) return
+    void loadReferencePresets(node).catch((error) => {
+      if (node.__bil !== ctx || ctx.removed) return
+      console.warn('Image Conveyor: unable to load reference preset names.', error)
+    })
+  })
+}
+
+async function createReferencePreset(node, name, slots) {
+  const payload = await presetRequest('', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, slots: normalizeReferenceSlots(slots) })
+  })
+  await loadReferencePresets(node, { force: true })
+  return payload?.preset ?? null
+}
+
+async function updateReferencePreset(node, presetId, changes) {
+  const payload = await presetRequest(`/${encodeURIComponent(presetId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(changes)
+  })
+  await loadReferencePresets(node, { force: true })
+  return payload?.preset ?? null
+}
+
+function loadPresetIntoNode(node, preset) {
+  const snapshot = loadPresetSnapshot(preset)
+  if (!snapshot.activePresetId) return false
+  const { state, uiState } = getRenderableState(node)
+  state.reference_slots = snapshot.slots
+  state.active_reference_preset_id = snapshot.activePresetId
+  updateState(node, state, uiState)
+  node.setDirtyCanvas?.(true, true)
+  return true
+}
+
+async function saveActiveReferencePreset(node) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return
+  try {
+    await loadReferencePresets(node)
+    if (node.__bil !== ctx || ctx.removed) return
+    const state = ctx.state ?? getRenderableState(node).state
+    const active = activeReferencePreset(ctx, state)
+    let preset
+    if (active) {
+      preset = await updateReferencePreset(node, active.id, {
+        slots: normalizeReferenceSlots(state.reference_slots)
+      })
+    } else {
+      const name = window.prompt('Character preset name:')
+      if (!name?.trim()) return
+      preset = await createReferencePreset(node, name, state.reference_slots)
+    }
+    if (node.__bil !== ctx || ctx.removed) return
+    if (!preset) return
+    const latest = getRenderableState(node)
+    latest.state.active_reference_preset_id = preset.id
+    updateState(node, latest.state, latest.uiState)
+  } catch (error) {
+    if (node.__bil !== ctx || ctx.removed) return
+    window.alert(error?.message || 'Unable to save the character preset.')
+  }
+}
+
+function closePresetPopover(ctx) {
+  if (ctx?.presetPopoverDismiss) {
+    document.removeEventListener('pointerdown', ctx.presetPopoverDismiss.pointerdown, true)
+    document.removeEventListener('keydown', ctx.presetPopoverDismiss.keydown, true)
+    ctx.presetPopoverDismiss = null
+  }
+  ctx?.presetPopover?.remove?.()
+  if (ctx) ctx.presetPopover = null
+}
+
+async function showPresetPopover(node, clientX, clientY) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return
+  closePresetPopover(ctx)
+  try {
+    await loadReferencePresets(node)
+  } catch (error) {
+    window.alert(error?.message || 'Unable to load character presets.')
+    return
+  }
+  if (node.__bil !== ctx || ctx.removed) return
+  const popover = document.createElement('div')
+  popover.className = 'bil-reference-preset-popover'
+  Object.assign(popover.style, {
+    position: 'fixed', zIndex: '100001', left: `${Math.max(8, clientX)}px`,
+    top: `${Math.max(8, clientY)}px`, width: '260px', padding: '9px',
+    border: '1px solid rgba(255,255,255,.22)', borderRadius: '9px',
+    background: 'rgba(28,28,32,.98)', color: '#eee', boxShadow: '0 12px 34px rgba(0,0,0,.45)',
+    font: '12px/1.35 system-ui,sans-serif'
+  })
+  const select = document.createElement('select')
+  select.className = 'bil-select'
+  select.style.width = '100%'
+  const empty = document.createElement('option')
+  empty.value = ''
+  empty.textContent = ctx.presets.length ? 'Choose character…' : 'No saved characters'
+  select.appendChild(empty)
+  const { state } = getRenderableState(node)
+  for (const preset of ctx.presets) {
+    const option = document.createElement('option')
+    option.value = preset.id
+    option.textContent = preset.name
+    select.appendChild(option)
+  }
+  select.value = activeReferencePreset(ctx, state)?.id ?? ''
+  const actions = document.createElement('div')
+  Object.assign(actions.style, { display: 'flex', flexWrap: 'wrap', gap: '5px', marginTop: '8px' })
+  const button = (label, handler) => {
+    const element = document.createElement('button')
+    element.className = 'bil-btn'
+    element.type = 'button'
+    element.textContent = label
+    element.addEventListener('click', () => void handler())
+    actions.appendChild(element)
+    return element
+  }
+  const selectedPreset = () => ctx.presets.find((preset) => preset.id === select.value) ?? null
+  button('Load', async () => {
+    const preset = selectedPreset()
+    if (preset) loadPresetIntoNode(node, preset)
+    closePresetPopover(ctx)
+  })
+  button('New', async () => {
+    const name = window.prompt('New character preset name:')
+    if (!name?.trim()) return
+    try {
+      const preset = await createReferencePreset(node, name, Array(REFERENCE_SLOT_COUNT).fill(null))
+      if (preset) loadPresetIntoNode(node, preset)
+      closePresetPopover(ctx)
+    } catch (error) { window.alert(error?.message || 'Unable to create the preset.') }
+  })
+  button('Save as…', async () => {
+    const name = window.prompt('Save current references as:')
+    if (!name?.trim()) return
+    try {
+      const current = getRenderableState(node).state
+      const preset = await createReferencePreset(node, name, current.reference_slots)
+      if (preset) {
+        const latest = getRenderableState(node)
+        latest.state.active_reference_preset_id = preset.id
+        updateState(node, latest.state, latest.uiState)
+      }
+      closePresetPopover(ctx)
+    } catch (error) { window.alert(error?.message || 'Unable to save the preset.') }
+  })
+  button('Rename', async () => {
+    const preset = selectedPreset()
+    if (!preset) return
+    const name = window.prompt('Rename character preset:', preset.name)
+    if (!name?.trim() || name.trim() === preset.name) return
+    try {
+      await updateReferencePreset(node, preset.id, { name })
+      closePresetPopover(ctx)
+    } catch (error) { window.alert(error?.message || 'Unable to rename the preset.') }
+  })
+  button('Duplicate', async () => {
+    const preset = selectedPreset()
+    if (!preset) return
+    const name = window.prompt('Duplicate preset as:', `${preset.name} copy`)
+    if (!name?.trim()) return
+    try {
+      const duplicate = await createReferencePreset(node, name, preset.slots)
+      if (duplicate) loadPresetIntoNode(node, duplicate)
+      closePresetPopover(ctx)
+    } catch (error) { window.alert(error?.message || 'Unable to duplicate the preset.') }
+  })
+  button('Delete', async () => {
+    const preset = selectedPreset()
+    if (!preset || !window.confirm(`Delete character preset '${preset.name}'? Image files will not be deleted.`)) return
+    try {
+      await presetRequest(`/${encodeURIComponent(preset.id)}`, { method: 'DELETE' })
+      await loadReferencePresets(node, { force: true })
+      const snapshot = getRenderableState(node)
+      if (snapshot.state.active_reference_preset_id === preset.id) {
+        snapshot.state.active_reference_preset_id = ''
+        updateState(node, snapshot.state, snapshot.uiState)
+      }
+      closePresetPopover(ctx)
+    } catch (error) { window.alert(error?.message || 'Unable to delete the preset.') }
+  })
+  button('Close', async () => closePresetPopover(ctx))
+  popover.append(select, actions)
+  document.body.appendChild(popover)
+  const rect = popover.getBoundingClientRect()
+  if (rect.right > innerWidth - 8) popover.style.left = `${Math.max(8, innerWidth - rect.width - 8)}px`
+  if (rect.bottom > innerHeight - 8) popover.style.top = `${Math.max(8, innerHeight - rect.height - 8)}px`
+  ctx.presetPopover = popover
+  const pointerdown = (event) => {
+    if (!popover.contains(event.target)) closePresetPopover(ctx)
+  }
+  const keydown = (event) => {
+    if (event.key === 'Escape') closePresetPopover(ctx)
+  }
+  ctx.presetPopoverDismiss = { pointerdown, keydown }
+  document.addEventListener('pointerdown', pointerdown, true)
+  document.addEventListener('keydown', keydown, true)
+  select.focus({ preventScroll: true })
+}
+
+function roundedRect(context, x, y, width, height, radius = 6) {
+  if (typeof context.roundRect === 'function') {
+    context.beginPath()
+    context.roundRect(x, y, width, height, radius)
+    return
+  }
+  context.beginPath()
+  context.rect(x, y, width, height)
+}
+
+function referenceThumbnail(ctx, node, reference) {
+  const key = reference?.annotated || ''
+  if (!key) return null
+  const existing = ctx.referenceThumbs.get(key)
+  if (existing) return existing
+  const image = new Image()
+  const entry = { image, ready: false, failed: false }
+  image.onload = () => { entry.ready = true; node.setDirtyCanvas?.(true, false) }
+  image.onerror = () => { entry.failed = true; node.setDirtyCanvas?.(true, false) }
+  image.src = thumbnailUrl(reference, 'small')
+  ctx.referenceThumbs.set(key, entry)
+  return entry
+}
+
+function drawContainedImage(context, image, x, y, width, height) {
+  const scale = Math.min(width / image.naturalWidth, height / image.naturalHeight)
+  const drawWidth = image.naturalWidth * scale
+  const drawHeight = image.naturalHeight * scale
+  context.drawImage(image, x + (width - drawWidth) / 2, y + (height - drawHeight) / 2, drawWidth, drawHeight)
+}
+
+function drawReferenceShelf(node, context) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return
+  const { state } = getRenderableState(node)
+  if (state.output_mode !== OUTPUT_MODE_PERSISTENT) {
+    ctx.referenceShelfLayout = null
+    ctx.referenceShelfPointerDrag = null
+    ctx.referenceDragSourceIndex = null
+    ctx.referenceDragHoverIndex = null
+    return
+  }
+  const outputGutterKey = JSON.stringify(
+    (node.outputs ?? []).map((output) => String(output?.label || output?.name || ''))
+  )
+  if (ctx.referenceOutputGutterKey !== outputGutterKey) {
+    ctx.referenceOutputGutter = 72
+    for (const output of node.outputs ?? []) {
+      ctx.referenceOutputGutter = Math.max(
+        ctx.referenceOutputGutter,
+        context.measureText(String(output?.label || output?.name || '')).width + 30
+      )
+    }
+    ctx.referenceOutputGutterKey = outputGutterKey
+    ctx.referenceShelfLayout = null
+  }
+  const widgetY = getFiniteNumber(node.__bilWidget?.y, node.__bilWidget?.last_y)
+  const nodeWidth = getFiniteNumber(node.size?.[0])
+  if (
+    !ctx.referenceShelfLayout ||
+    ctx.referenceLayoutWidth !== nodeWidth ||
+    ctx.referenceLayoutWidgetY !== widgetY
+  ) {
+    ctx.referenceShelfLayout = calculateReferenceShelfLayout(
+      nodeWidth,
+      widgetY,
+      ctx.referenceOutputGutter,
+      30
+    )
+    ctx.referenceLayoutWidth = nodeWidth
+    ctx.referenceLayoutWidgetY = widgetY
+  }
+  const layout = ctx.referenceShelfLayout
+  if (!layout.usable) return
+  const characterLabel = referencePresetDisplay(
+    ctx.presets,
+    ctx.presetsLoaded,
+    state.active_reference_preset_id,
+    state.reference_slots
+  ).label
+  context.save()
+  context.font = '12px sans-serif'
+  context.textBaseline = 'middle'
+  context.fillStyle = 'rgba(255,255,255,.82)'
+  context.fillText(`Character: ${characterLabel}`, layout.left + 4, layout.top + layout.headerHeight / 2)
+  context.textAlign = 'center'
+  const menuWidth = Math.min(54, layout.width * 0.18)
+  const saveWidth = Math.min(52, layout.width * 0.18)
+  context.fillStyle = 'rgba(255,255,255,.07)'
+  roundedRect(context, layout.right - menuWidth - saveWidth, layout.top + 2, saveWidth - 4, layout.headerHeight - 4, 5)
+  context.fill()
+  roundedRect(context, layout.right - menuWidth, layout.top + 2, menuWidth - 4, layout.headerHeight - 4, 5)
+  context.fill()
+  context.fillStyle = 'rgba(255,255,255,.86)'
+  context.fillText('Save', layout.right - menuWidth - saveWidth / 2 - 2, layout.top + layout.headerHeight / 2)
+  context.fillText('•••', layout.right - menuWidth / 2 - 2, layout.top + layout.headerHeight / 2)
+  for (let index = 0; index < REFERENCE_SLOT_COUNT; index += 1) {
+    const reference = state.reference_slots[index]
+    const slot = layout.slots[index]
+    roundedRect(context, slot.x, slot.y, slot.width, slot.height, 6)
+    context.fillStyle = ctx.referenceDragSourceIndex === index
+      ? 'rgba(75,140,220,.22)'
+      : reference ? 'rgba(0,0,0,.30)' : 'rgba(255,255,255,.035)'
+    context.fill()
+    context.strokeStyle = ctx.referenceDragHoverIndex === index
+      ? 'rgba(110,180,255,.98)'
+      : ctx.referenceDragSourceIndex === index
+        ? 'rgba(110,180,255,.62)'
+      : 'rgba(255,255,255,.15)'
+    context.lineWidth = ctx.referenceDragHoverIndex === index ? 2 : 1
+    context.stroke()
+    if (reference) {
+      const thumbnail = referenceThumbnail(ctx, node, reference)
+      if (thumbnail?.ready) {
+        context.save()
+        roundedRect(context, slot.x + 2, slot.y + 2, slot.width - 4, slot.height - 4, 5)
+        context.clip()
+        drawContainedImage(context, thumbnail.image, slot.x + 2, slot.y + 2, slot.width - 4, slot.height - 4)
+        context.restore()
+      }
+      context.fillStyle = 'rgba(12,12,14,.78)'
+      context.fillRect(slot.x + slot.width - 17, slot.y, 17, 17)
+      context.fillStyle = '#fff'
+      context.fillText('×', slot.x + slot.width - 8.5, slot.y + 8.5)
+    }
+    context.textAlign = 'left'
+    context.fillStyle = 'rgba(255,255,255,.88)'
+    context.fillText(`Ref ${index + 1}`, slot.x + 5, slot.y + slot.height - 10)
+    context.textAlign = 'center'
+  }
+  for (const key of ctx.referenceThumbs.keys()) {
+    let retained = false
+    for (const reference of state.reference_slots) {
+      if (reference?.annotated === key) {
+        retained = true
+        break
+      }
+    }
+    if (!retained) ctx.referenceThumbs.delete(key)
+  }
+  context.restore()
+}
+
+function eventNodePoint(node, event, localPosition = null) {
+  if (Array.isArray(localPosition) && localPosition.length >= 2) {
+    return { x: Number(localPosition[0]), y: Number(localPosition[1]) }
+  }
+  try { app.canvas?.adjustMouseEvent?.(event) } catch {}
+  const canvasX = Number(event?.canvasX)
+  const canvasY = Number(event?.canvasY)
+  if (!Number.isFinite(canvasX) || !Number.isFinite(canvasY)) return null
+  return { x: canvasX - Number(node.pos?.[0] || 0), y: canvasY - Number(node.pos?.[1] || 0) }
+}
+
+function referenceShelfEventHit(node, event, localPosition = null) {
+  const ctx = node.__bil
+  const state = ctx ? getRenderableState(node).state : null
+  if (!ctx?.referenceShelfLayout || state?.output_mode !== OUTPUT_MODE_PERSISTENT) return null
+  const point = eventNodePoint(node, event, localPosition)
+  return point ? referenceShelfHit(ctx.referenceShelfLayout, point.x, point.y) : null
+}
+
+function beginReferenceShelfPointerDrag(node, event, localPosition, index) {
+  const ctx = node.__bil
+  const reference = ctx ? getRenderableState(node).state.reference_slots[index] : null
+  const point = eventNodePoint(node, event, localPosition)
+  if (!ctx || !reference || !point) return false
+  ctx.referenceShelfPointerDrag = {
+    pointerId: event?.pointerId ?? null,
+    fromIndex: index,
+    targetIndex: index,
+    startX: point.x,
+    startY: point.y,
+    active: false
+  }
+  ctx.referenceDragSourceIndex = index
+  ctx.referenceDragHoverIndex = null
+  node.setDirtyCanvas?.(true, false)
+  return true
+}
+
+function updateReferenceShelfPointerDrag(node, event, localPosition = null) {
+  const ctx = node.__bil
+  const drag = ctx?.referenceShelfPointerDrag
+  if (!drag || (drag.pointerId != null && event?.pointerId != null && drag.pointerId !== event.pointerId)) return false
+  if (Number.isFinite(event?.buttons) && (event.buttons & 1) === 0) {
+    finishReferenceShelfPointerDrag(node, event)
+    return true
+  }
+  const point = eventNodePoint(node, event, localPosition)
+  if (!point) return true
+  if (!drag.active && Math.hypot(point.x - drag.startX, point.y - drag.startY) >= MARQUEE_DRAG_THRESHOLD) {
+    drag.active = true
+  }
+  let targetIndex = null
+  if (drag.active) {
+    const hit = referenceShelfHit(ctx.referenceShelfLayout, point.x, point.y)
+    if (hit?.type === 'slot' || hit?.type === 'clear') targetIndex = hit.index
+  }
+  drag.targetIndex = targetIndex
+  if (ctx.referenceDragHoverIndex !== targetIndex) {
+    ctx.referenceDragHoverIndex = targetIndex
+    node.setDirtyCanvas?.(true, false)
+  }
+  event.preventDefault?.()
+  event.stopPropagation?.()
+  return true
+}
+
+function finishReferenceShelfPointerDrag(node, event = null) {
+  const ctx = node.__bil
+  const drag = ctx?.referenceShelfPointerDrag
+  if (!drag || (drag.pointerId != null && event?.pointerId != null && drag.pointerId !== event.pointerId)) return false
+  ctx.referenceShelfPointerDrag = null
+  ctx.referenceDragSourceIndex = null
+  ctx.referenceDragHoverIndex = null
+  if (drag.active && drag.targetIndex != null && drag.targetIndex !== drag.fromIndex) {
+    const { state, uiState } = getRenderableState(node)
+    state.reference_slots = moveReferenceSlot(state.reference_slots, drag.fromIndex, drag.targetIndex)
+    updateState(node, state, uiState)
+  } else {
+    node.setDirtyCanvas?.(true, false)
+  }
+  event?.preventDefault?.()
+  event?.stopPropagation?.()
+  return true
 }
 
 function initializeNode(node, widget) {
@@ -3728,8 +4792,72 @@ function initializeNode(node, widget) {
   attachQueueLifecycle(node)
   autoQueueCoordinator.registerNode(node)
   canvasDropCoordinator.registerNode(node)
+  imageContextMenuCoordinator.registerNode(node)
 
+  chainNodeCallback(node, 'onDrawForeground', function (context) {
+    drawReferenceShelf(node, context)
+  })
+
+  const previousMouseDown = node.onMouseDown
+  node.onMouseDown = function (event, localPosition, graphCanvas) {
+    const hit = referenceShelfEventHit(node, event, localPosition)
+    if (hit) {
+      if (event.button === 2 && (hit.type === 'slot' || hit.type === 'clear')) {
+        const reference = getRenderableState(node).state.reference_slots[hit.index]
+        if (reference) {
+          showImageContextMenu(node, reference, event.clientX, event.clientY, { referenceIndex: hit.index })
+          event.preventDefault?.()
+          event.stopPropagation?.()
+          return true
+        }
+      }
+      if (event.button !== 0) return previousMouseDown?.call(this, event, localPosition, graphCanvas)
+      if (hit.type === 'clear') clearReferenceSlot(node, hit.index)
+      else if (hit.type === 'slot') {
+        beginReferenceShelfPointerDrag(node, event, localPosition, hit.index)
+      } else if (hit.type === 'save') {
+        void saveActiveReferencePreset(node)
+      } else {
+        void showPresetPopover(node, event.clientX, event.clientY)
+      }
+      event.preventDefault?.()
+      event.stopPropagation?.()
+      return true
+    }
+    return previousMouseDown?.call(this, event, localPosition, graphCanvas)
+  }
+
+  const previousMouseMove = node.onMouseMove
+  node.onMouseMove = function (event, localPosition, graphCanvas) {
+    if (updateReferenceShelfPointerDrag(node, event, localPosition)) return true
+    return previousMouseMove?.call(this, event, localPosition, graphCanvas)
+  }
+
+  const previousMouseUp = node.onMouseUp
+  node.onMouseUp = function (event, localPosition, graphCanvas) {
+    if (finishReferenceShelfPointerDrag(node, event)) return true
+    return previousMouseUp?.call(this, event, localPosition, graphCanvas)
+  }
+
+  const previousDragOver = node.onDragOver
   node.onDragOver = (event) => {
+    const hit = referenceShelfEventHit(node, event)
+    if (hit?.type === 'slot' && (activeReferenceDrag || hasExternalFileDrag(event))) {
+      event.preventDefault?.()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+      const dragCtx = node.__bil
+      if (dragCtx?.referenceDragHoverIndex !== hit.index) {
+        if (dragCtx) dragCtx.referenceDragHoverIndex = hit.index
+        node.setDirtyCanvas?.(true, false)
+      }
+      return true
+    }
+    if (node.__bil?.referenceDragHoverIndex != null) {
+      node.__bil.referenceDragHoverIndex = null
+      node.setDirtyCanvas?.(true, false)
+    }
+    const previousResult = previousDragOver?.call(node, event)
+    if (previousResult === true) return true
     if (!hasExternalFileDrag(event)) return false
     event.preventDefault?.()
     event.stopPropagation?.()
@@ -3737,11 +4865,38 @@ function initializeNode(node, widget) {
     return true
   }
 
+  const previousDragDrop = node.onDragDrop
   node.onDragDrop = async (event) => {
+    const hit = referenceShelfEventHit(node, event)
+    if (hit?.type === 'slot') {
+      event.preventDefault?.()
+      event.stopPropagation?.()
+      const drag = activeReferenceDrag
+      activeReferenceDrag = null
+      if (node.__bil) node.__bil.referenceDragHoverIndex = null
+      node.setDirtyCanvas?.(true, false)
+      if (drag) return await assignReferenceDrag(node, drag, hit.index)
+      if (hasExternalFileDrag(event)) {
+        const files = await getDroppedImageFiles(event)
+        return await importReferenceOnly(node, files, hit.index)
+      }
+      return false
+    }
+    const previousResult = await previousDragDrop?.call(node, event)
+    if (previousResult === true) return true
     if (!consumeExternalFileDrag(event)) return false
     const files = await getDroppedImageFiles(event)
     if (!files.length) return false
     return await uploadViaNode(node, files)
+  }
+
+  const previousDragLeave = node.onDragLeave
+  node.onDragLeave = function (event) {
+    if (node.__bil?.referenceDragHoverIndex != null) {
+      node.__bil.referenceDragHoverIndex = null
+      node.setDirtyCanvas?.(true, false)
+    }
+    return previousDragLeave?.call(this, event)
   }
 
   node.pasteFile = (file) => {
@@ -3782,6 +4937,7 @@ function initializeNode(node, widget) {
       markNodeDirty(node)
     }
     cacheRenderableState(node, snapshot.state, snapshot.uiState)
+    hydrateReferencePresetName(node, snapshot.state)
     queueMicrotask(() => scheduleRenderNode(node))
   })
 
@@ -3793,10 +4949,12 @@ function initializeNode(node, widget) {
   chainNodeCallback(node, 'onRemoved', function () {
     autoQueueCoordinator.unregisterNode(node)
     canvasDropCoordinator.unregisterNode(node)
+    imageContextMenuCoordinator.unregisterNode(node)
     keyboardCoordinator.unregisterNode(node)
     const ctx = node.__bil
     if (!ctx) return
     ctx.removed = true
+    ctx.presetRequestId += 1
     ctx.inputRequestId += 1
     if (ctx.documentPasteHandler) {
       document.removeEventListener('paste', ctx.documentPasteHandler, true)
@@ -3843,6 +5001,12 @@ function initializeNode(node, widget) {
     clearTimeout(ctx.scrollSettleTimer)
     ctx.scrollSettleTimer = 0
     ctx.lightbox?.root?.remove?.()
+    closePresetPopover(ctx)
+    closeImageContextMenu(ctx)
+    if (activeReferenceDrag?.node === node) activeReferenceDrag = null
+    ctx.referenceShelfPointerDrag = null
+    ctx.referenceDragSourceIndex = null
+    ctx.referenceDragHoverIndex = null
     ctx.listResizeObserver?.disconnect?.()
     ctx.listResizeObserver = null
     ctx.clearExternalDragState?.()
@@ -3850,6 +5014,12 @@ function initializeNode(node, widget) {
     for (const slot of ctx.cardPool) resetCardThumbnail(slot)
     ctx.cardPool.length = 0
     ctx.thumbnailUrlCache = new WeakMap()
+    for (const entry of ctx.referenceThumbs.values()) {
+      entry.image.onload = null
+      entry.image.onerror = null
+      entry.image.removeAttribute?.('src')
+    }
+    ctx.referenceThumbs.clear()
     for (const entry of ctx.localObjectUrls.values()) URL.revokeObjectURL(entry.url)
     ctx.localObjectUrls.clear()
     ctx.browser.folderViews.clear()
@@ -3869,6 +5039,7 @@ function initializeNode(node, widget) {
     markNodeDirty(node)
   }
   cacheRenderableState(node, snapshot.state, snapshot.uiState)
+  hydrateReferencePresetName(node, snapshot.state)
   queueMicrotask(() => scheduleRenderNode(node))
   keyboardCoordinator.registerNode(node)
   return widget

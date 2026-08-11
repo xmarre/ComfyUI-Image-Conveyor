@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import {
   calculateGalleryMetrics,
@@ -8,9 +10,11 @@ import {
   calculateVisibleCardRange,
   clientPointToScrollContent,
   chooseViewAfterClose,
+  createPreviewNavigation,
   dispatchKeyboundCommandFallback,
   findKeyboundCommand,
   groupDirectoryPickerFiles,
+  hasVisibleModalCandidate,
   isDragLeavingDocument,
   isGalleryViewportMeasurable,
   isHighVelocityScroll,
@@ -18,11 +22,27 @@ import {
   isConveyorGalleryShortcut,
   isReservedTextInputShortcut,
   keyboardComboSignature,
+  isElementTreeVisible,
   planCardSlotReuse,
   planViewScrollSwitch,
   prepareManagedDuplicateCleanup,
-  restoreGraphCanvasFocus
+  restoreGraphCanvasFocus,
+  stepPreviewNavigationIndex
 } from '../web/image_conveyor_math.mjs'
+
+test('production helper import is cache-keyed to the helper contents', async () => {
+  const helperUrl = new URL('../web/image_conveyor_math.mjs', import.meta.url)
+  const extensionUrl = new URL('../web/image_conveyor.js', import.meta.url)
+  const [helper, extension] = await Promise.all([
+    readFile(helperUrl),
+    readFile(extensionUrl, 'utf8')
+  ])
+  const cacheKey = createHash('sha256').update(helper).digest('hex').slice(0, 16)
+  assert.match(
+    extension,
+    new RegExp(`from ['"]\\./image_conveyor_math\\.mjs\\?v=${cacheKey}['"]`)
+  )
+})
 
 test('responsive metrics add columns as width grows', () => {
   const medium = calculateGalleryMetrics(520, 172, 10)
@@ -38,6 +58,30 @@ test('hidden gallery viewports are excluded from virtual layout', () => {
   assert.equal(isGalleryViewportMeasurable(0, 700), false)
   assert.equal(isGalleryViewportMeasurable(720, 0), false)
   assert.equal(isGalleryViewportMeasurable(Number.NaN, 700), false)
+})
+
+test('image preview navigation keeps presented order and skips folder cards', () => {
+  const first = { filename: 'first.png' }
+  const second = { filename: 'second.png' }
+  const navigation = createPreviewNavigation([
+    { id: 'first', item: first },
+    { id: 'folder', item: { kind: 'folder', filename: 'Nested' } },
+    { id: 'second', item: second }
+  ], 'second')
+
+  assert.deepEqual(navigation.entries, [
+    { id: 'first', item: first },
+    { id: 'second', item: second }
+  ])
+  assert.equal(navigation.index, 1)
+})
+
+test('image preview navigation stops at collection boundaries', () => {
+  assert.equal(stepPreviewNavigationIndex(1, -1, 4), 0)
+  assert.equal(stepPreviewNavigationIndex(1, 1, 4), 2)
+  assert.equal(stepPreviewNavigationIndex(0, -1, 4), 0)
+  assert.equal(stepPreviewNavigationIndex(3, 1, 4), 3)
+  assert.equal(stepPreviewNavigationIndex(0, 1, 0), -1)
 })
 
 test('marquee hit testing follows virtual card geometry and ignores gaps', () => {
@@ -297,6 +341,28 @@ test('fallback honors live reassignment, canvas scope, text editing, and modal s
     manager,
     { target: canvas, documentRef, modalOpen: true }
   ), false)
+})
+
+test('hidden Manager dialog descendants do not keep shortcut fallback modal-locked', () => {
+  const body = { style: { display: 'block', visibility: 'visible' }, parentElement: null }
+  const hiddenMask = {
+    style: { display: 'none', visibility: 'visible' },
+    parentElement: body,
+    getAttribute: () => null
+  }
+  const managerDialog = {
+    style: { display: 'flex', visibility: 'visible' },
+    parentElement: hiddenMask,
+    getAttribute: (name) => name === 'aria-modal' ? 'true' : null
+  }
+  const getStyle = (element) => element.style
+
+  assert.equal(isElementTreeVisible(managerDialog, getStyle), false)
+  assert.equal(hasVisibleModalCandidate([managerDialog, hiddenMask], getStyle), false)
+
+  hiddenMask.style.display = 'flex'
+  assert.equal(isElementTreeVisible(managerDialog, getStyle), true)
+  assert.equal(hasVisibleModalCandidate([managerDialog, hiddenMask], getStyle), true)
 })
 
 test('window listener ordering executes each live command once', () => {
