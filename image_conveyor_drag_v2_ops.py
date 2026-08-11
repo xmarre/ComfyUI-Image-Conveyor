@@ -76,6 +76,12 @@ def _normalize_preset_id(value: Any) -> str:
         raise InvalidLibraryOperation("The character preset ID is invalid.") from exc
 
 
+def _protected_set(values: Any) -> set:
+    if isinstance(values, set):
+        values = tuple(values)
+    return _normalize_protected_paths(values)
+
+
 def _validate_unchanged(path: str, expected: os.stat_result, label: str) -> None:
     current = os.lstat(path)
     if (
@@ -186,11 +192,7 @@ def _scan_destination(service, destination_folder: str) -> Dict[int, List[Dict[s
             continue
         relative = f"{destination_folder}/{entry.name}" if destination_folder else entry.name
         by_size.setdefault(int(info.st_size), []).append(
-            {
-                "name": entry.name,
-                "relative": relative,
-                "absolute": entry.path,
-            }
+            {"name": entry.name, "relative": relative, "absolute": entry.path}
         )
     for candidates in by_size.values():
         candidates.sort(key=lambda item: (item["name"].casefold(), item["name"]))
@@ -213,14 +215,7 @@ def _find_identical_destination(
     for entry in destination_by_size.get(int(source_stat.st_size), []):
         if entry["relative"] == source_relative:
             continue
-        candidates.append(
-            (
-                entry["name"] != filename,
-                entry["name"].casefold(),
-                entry["name"],
-                entry,
-            )
-        )
+        candidates.append((entry["name"] != filename, entry["name"].casefold(), entry["name"], entry))
     for _different_name, _folded, _name, entry in sorted(candidates):
         if _digest(entry["absolute"], digest_cache) != source_digest:
             continue
@@ -238,7 +233,7 @@ def relocate_input_files(
     """Move canonical Input images and collapse byte-identical destination or batch duplicates."""
     paths = _normalize_path_batch(relative_paths)
     destination_folder = _normalize_subfolder(destination_subfolder)
-    protected = _normalize_protected_paths(protected_paths)
+    protected = _protected_set(protected_paths)
     destination_by_size = _scan_destination(service, destination_folder)
     digest_cache: Dict[str, str] = {}
     results: Dict[str, Dict[str, Any]] = {}
@@ -261,10 +256,7 @@ def relocate_input_files(
             source, source_stat = _regular_input_file(service.input_root, relative_path)
         except FileNotFoundError:
             skipped.append(
-                {
-                    "relative_path": relative_path,
-                    "reason": "The file disappeared before the relocation.",
-                }
+                {"relative_path": relative_path, "reason": "The file disappeared before the relocation."}
             )
             continue
         source_absolutes[relative_path] = source
@@ -454,9 +446,9 @@ def _collapse_orphan_character_duplicates(
     service,
     characters,
     protected_paths=(),
-) -> List[Dict[str, str]]:
+) -> Dict[str, List[Dict[str, str]]]:
     """Repair copy-era duplicates without touching currently queued canonical sources."""
-    protected = _normalize_protected_paths(protected_paths)
+    protected = _protected_set(protected_paths)
     records, _version, _scanned_at = service.list_files(force=True)
     character_targets: Dict[str, List[Any]] = {}
     outside_by_size: Dict[int, List[Any]] = {}
@@ -469,7 +461,9 @@ def _collapse_orphan_character_duplicates(
 
     digest_cache: Dict[str, str] = {}
     removed = set()
-    mappings = []
+    deferred = set()
+    mappings: List[Dict[str, str]] = []
+    skipped: List[Dict[str, str]] = []
     for character in characters:
         for target_record in character_targets.get(character["folder"], []):
             target_relative = target_record.relative_path
@@ -481,7 +475,7 @@ def _collapse_orphan_character_duplicates(
                 continue
             for candidate in outside_by_size.get(int(target_record.size), []):
                 source_relative = candidate.relative_path
-                if source_relative in protected or source_relative in removed:
+                if source_relative in removed or source_relative in deferred:
                     continue
                 source_absolute = os.path.join(service.input_root, *source_relative.split("/"))
                 if not _regular_existing_target(source_absolute):
@@ -489,6 +483,15 @@ def _collapse_orphan_character_duplicates(
                 if _digest(source_absolute, digest_cache) != target_digest:
                     continue
                 if not _same_file_contents(source_absolute, target_absolute):
+                    continue
+                if source_relative in protected:
+                    deferred.add(source_relative)
+                    skipped.append(
+                        {
+                            "relative_path": source_relative,
+                            "reason": "The file is reserved by a queued Conveyor item.",
+                        }
+                    )
                     continue
                 try:
                     mapping = _collapse_identical_source(service, source_relative, target_relative)
@@ -502,12 +505,13 @@ def _collapse_orphan_character_duplicates(
                 removed.add(source_relative)
                 mappings.append(mapping)
     _record_relocations(mappings)
-    return mappings
+    return {"moved": mappings, "skipped": skipped}
 
 
 def migrate_character_libraries(service, protected_paths=()) -> Dict[str, Any]:
     """Retroactively move saved character members/reference slots and remove copy-era duplicates."""
-    protected = _normalize_protected_paths(protected_paths)
+    protected = _protected_set(protected_paths)
+    protected_sequence = tuple(protected)
     registry = _registry_for_service(service)
     presets = service.preset_store.list()
     characters = registry.ensure_for_presets(presets)
@@ -540,7 +544,7 @@ def migrate_character_libraries(service, protected_paths=()) -> Dict[str, Any]:
             service,
             character["preset_id"],
             candidates,
-            protected,
+            protected_sequence,
         )
         migrated_files += len(result["files"])
         deduplicated += int(result.get("deduplicated", 0) or 0)
@@ -548,8 +552,10 @@ def migrate_character_libraries(service, protected_paths=()) -> Dict[str, Any]:
         all_skipped.extend(result.get("skipped", []))
 
     refreshed = registry.ensure_for_presets(service.preset_store.list())
-    orphan_mappings = _collapse_orphan_character_duplicates(service, refreshed, protected)
+    orphan_result = _collapse_orphan_character_duplicates(service, refreshed, protected_sequence)
+    orphan_mappings = orphan_result["moved"]
     all_moved.extend(orphan_mappings)
+    all_skipped.extend(orphan_result["skipped"])
     deduplicated += len(orphan_mappings)
     migrated_files += len(orphan_mappings)
     return {
