@@ -35,11 +35,7 @@ jobs:
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Run frontend pure-function tests
-        run: |
-          node --test tests/test_gallery_math.mjs
-          node --test tests/test_queue_groups.mjs
-          node --test tests/test_reference_shelf.mjs
-          node --test tests/test_drag_math.mjs
+        run: node --test tests/*.mjs
 
       - name: Check JavaScript syntax
         run: |
@@ -49,6 +45,7 @@ jobs:
           node --check web/image_conveyor_drag_ops.js
           node --check web/image_conveyor_drag_math.mjs
           node --check web/image_conveyor_followup_fixes.js
+          node --check web/image_conveyor_followup_math.mjs
 
       - name: Check Python syntax
         run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py image_conveyor_library_ops.py image_conveyor_drag_ops.py image_conveyor_drag_v2_ops.py
