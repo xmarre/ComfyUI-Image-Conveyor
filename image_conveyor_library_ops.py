@@ -27,17 +27,29 @@ CHARACTER_FOLDER_ROOT = "image_conveyor_characters"
 REGISTRY_VERSION = 1
 MAX_BATCH_ITEMS = 10000
 _COPY_CHUNK_SIZE = 1024 * 1024
+_REGISTRY_LOCKS_GUARD = threading.Lock()
+_REGISTRY_LOCKS: Dict[str, threading.RLock] = {}
 
 
 class InvalidLibraryOperation(ValueError):
     pass
 
 
+def _shared_registry_lock(path: str) -> threading.RLock:
+    key = os.path.realpath(path)
+    with _REGISTRY_LOCKS_GUARD:
+        lock = _REGISTRY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _REGISTRY_LOCKS[key] = lock
+        return lock
+
+
 class CharacterFolderRegistry:
     def __init__(self, path: str, input_root: str):
         self.path = path
         self.input_root = os.path.realpath(input_root)
-        self._lock = threading.RLock()
+        self._lock = _shared_registry_lock(path)
 
     @staticmethod
     def _empty_document() -> Dict[str, Any]:
@@ -346,8 +358,6 @@ def _candidate_path(
 
 
 def _move_no_replace(source: str, destination: str) -> None:
-    parent = os.path.dirname(destination)
-    os.makedirs(parent, exist_ok=True)
     try:
         os.link(source, destination)
     except FileExistsError:
@@ -479,6 +489,7 @@ def move_input_files(
         for key in sorted(lock_keys):
             locks.enter_context(service._key_lock(service._destination_locks, key))
 
+        destination_directory = _ensure_directory(service.input_root, destination_folder)
         plan = []
         reserved_targets = set()
         for relative_path in candidates:
@@ -524,6 +535,11 @@ def move_input_files(
                     or current.st_mtime_ns != expected.st_mtime_ns
                 ):
                     raise InvalidLibraryOperation(f"The file changed during the move: {old_relative}")
+                current_destination = _ensure_directory(service.input_root, destination_folder)
+                if os.path.realpath(current_destination) != os.path.realpath(destination_directory):
+                    raise InvalidInputPath("The destination folder changed during the move.")
+                if os.path.dirname(target) != os.path.abspath(current_destination):
+                    raise InvalidInputPath("The destination path changed during the move.")
                 if os.path.lexists(target):
                     raise InvalidLibraryOperation(f"Destination appeared during the move: {new_relative}")
                 _move_no_replace(source, target)
