@@ -1,7 +1,7 @@
 import logging
 
 from .image_conveyor import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-from .image_conveyor_drag_ops import register_drag_routes
+from .image_conveyor_drag_v2_ops import register_drag_routes
 from .image_conveyor_library_ops import register_library_routes
 from .image_conveyor_server import register_routes
 
