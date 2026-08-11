@@ -120,8 +120,6 @@ def copy_input_files(
         finalized = finalize([]) if finalize is not None else None
         return {"files": [], "copied": 0, "finalized": finalized}
 
-    # Validate every source before destination creation, so a malformed/missing batch cannot
-    # leave a new empty folder behind.
     prevalidated = []
     for relative_path in paths:
         source, expected = _regular_input_file(service.input_root, relative_path)
@@ -321,6 +319,7 @@ def materialize_character_files(
 
 
 def register_drag_routes() -> None:
+    """Register drag/copy API routes once, including across alternate plugin imports."""
     global _DRAG_ROUTES_REGISTERED
     if _DRAG_ROUTES_REGISTERED:
         return
@@ -350,6 +349,8 @@ def register_drag_routes() -> None:
                 payload.get("destination_subfolder", ""),
             )
             return web.json_response(result)
+        except web.HTTPBadRequest as exc:
+            return web.json_response({"error": exc.reason or "A JSON request body is required."}, status=400)
         except (InvalidLibraryOperation, InvalidUpload, InvalidInputPath, InvalidPreset, json.JSONDecodeError, ValueError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
         except FileNotFoundError:
@@ -372,6 +373,8 @@ def register_drag_routes() -> None:
                 payload.get("relative_paths"),
             )
             return web.json_response(result)
+        except web.HTTPBadRequest as exc:
+            return web.json_response({"error": exc.reason or "A JSON request body is required."}, status=400)
         except FileNotFoundError:
             return web.json_response({"error": "A selected input image no longer exists."}, status=409)
         except (InvalidLibraryOperation, InvalidUpload, InvalidInputPath, InvalidPreset, json.JSONDecodeError, ValueError) as exc:
