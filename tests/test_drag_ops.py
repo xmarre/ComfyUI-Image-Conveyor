@@ -98,18 +98,22 @@ class DragOperationsTest(unittest.TestCase):
         self.assertEqual(result["files"][0]["relative_path"], "dest/a (1).png")
         self.assertEqual((self.input_root / "dest" / "a (1).png").read_bytes(), b"source")
 
-    def test_character_materialization_physically_copies_existing_input_member(self):
+    def test_character_materialization_replaces_old_logical_member_with_physical_copy(self):
         source = self.write_image("existing/a.png", b"payload")
         preset = self.service.preset_store.create("Mara", slots(reference("existing/a.png")))
+        registry = library._registry_for_service(self.service)
+        registry.ensure_for_presets(self.service.preset_store.list())
+        registry.add_members(preset["id"], ["existing/a.png"])
+
         result = drag.materialize_character_files(self.service, preset["id"], ["existing/a.png"])
         self.assertTrue(source.is_file())
         self.assertEqual(len(result["files"]), 1)
         materialized = result["files"][0]["relative_path"]
         self.assertTrue(materialized.startswith(f"{library.CHARACTER_FOLDER_ROOT}/Mara--"))
         self.assertEqual((self.input_root / Path(materialized)).read_bytes(), b"payload")
-        registry = library._registry_for_service(self.service)
         character = registry.ensure_for_presets(self.service.preset_store.list())[0]
         self.assertIn(materialized, character["members"])
+        self.assertNotIn("existing/a.png", character["members"])
         self.assertNotEqual(materialized, "existing/a.png")
 
     def test_character_materialization_reuses_file_already_in_character_folder(self):
@@ -122,6 +126,8 @@ class DragOperationsTest(unittest.TestCase):
         self.assertEqual(result["files"][0]["relative_path"], relative)
         self.assertFalse(result["files"][0]["copied"])
         self.assertFalse((self.input_root / Path(character["folder"]) / "a (1).png").exists())
+        character = registry.ensure_for_presets(self.service.preset_store.list())[0]
+        self.assertEqual(character["members"], [relative])
 
     def test_character_registry_failure_rolls_back_new_copy(self):
         self.write_image("source/a.png", b"payload")
@@ -129,7 +135,7 @@ class DragOperationsTest(unittest.TestCase):
         registry = library._registry_for_service(self.service)
         character = registry.ensure_for_presets(self.service.preset_store.list())[0]
         with mock.patch.object(drag, "_registry_for_service", return_value=registry):
-            with mock.patch.object(registry, "add_members", side_effect=OSError("registry locked")):
+            with mock.patch.object(registry, "_write_unlocked", side_effect=OSError("registry locked")):
                 with self.assertRaises(OSError):
                     drag.materialize_character_files(self.service, preset["id"], ["source/a.png"])
         self.assertFalse((self.input_root / Path(character["folder"]) / "a.png").exists())
