@@ -1,12 +1,10 @@
 import importlib.util
-import json
 import os
 import sys
 import tempfile
 import types
 import unittest
-import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,12 +34,21 @@ server, ops = load_modules()
 
 
 def reference(relative_path):
+    path = PurePosixPath(relative_path)
+    parent = "" if str(path.parent) == "." else str(path.parent)
     return {
         "annotated": f"{relative_path} [input]",
-        "filename": Path(relative_path).name,
-        "subfolder": str(Path(relative_path).parent).replace("\\", "/").replace(".", ""),
+        "filename": path.name,
+        "subfolder": parent,
         "type": "input",
     }
+
+
+def slots(*references):
+    values = list(references)
+    if len(values) > 8:
+        raise ValueError("reference test fixture exceeds the eight-slot preset contract")
+    return values + [None] * (8 - len(values))
 
 
 class InputLibraryOperationsTest(unittest.TestCase):
@@ -69,7 +76,7 @@ class InputLibraryOperationsTest(unittest.TestCase):
         return path
 
     def test_character_folder_is_created_once_and_survives_rename_and_delete(self):
-        preset = self.service.preset_store.create("Mara", [])
+        preset = self.service.preset_store.create("Mara", slots())
         characters = self.registry.ensure_for_presets(self.service.preset_store.list())
         self.assertEqual(len(characters), 1)
         folder = characters[0]["folder"]
@@ -86,7 +93,7 @@ class InputLibraryOperationsTest(unittest.TestCase):
 
     def test_character_members_are_unique_and_validate_existing_files(self):
         file_path = self.write_image("refs/a.png")
-        preset = self.service.preset_store.create("Mara", [])
+        preset = self.service.preset_store.create("Mara", slots())
         self.registry.ensure_for_presets(self.service.preset_store.list())
         result = self.registry.add_members(preset["id"], ["refs/a.png", "refs/a.png"])
         self.assertEqual(result["members"], ["refs/a.png"])
@@ -108,7 +115,7 @@ class InputLibraryOperationsTest(unittest.TestCase):
 
     def test_move_relinks_saved_reference_and_character_membership(self):
         source = self.write_image("source/a.png")
-        preset = self.service.preset_store.create("Mara", [reference("source/a.png")])
+        preset = self.service.preset_store.create("Mara", slots(reference("source/a.png")))
         self.registry.ensure_for_presets(self.service.preset_store.list())
         self.registry.add_members(preset["id"], ["source/a.png"])
 
@@ -161,7 +168,7 @@ class InputLibraryOperationsTest(unittest.TestCase):
 
     def test_delete_clears_saved_reference_and_character_membership(self):
         source = self.write_image("source/a.png", b"payload")
-        preset = self.service.preset_store.create("Mara", [reference("source/a.png")])
+        preset = self.service.preset_store.create("Mara", slots(reference("source/a.png")))
         self.registry.ensure_for_presets(self.service.preset_store.list())
         self.registry.add_members(preset["id"], ["source/a.png"])
 
