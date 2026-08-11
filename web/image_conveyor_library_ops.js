@@ -525,7 +525,12 @@ async function activeCharacter(node) {
   if (!presetId) return null
   let character = characterCache.get(presetId)
   if (!character) {
-    await syncCharacterFolders(true)
+    try {
+      await syncCharacterFolders(true)
+    } catch (error) {
+      console.warn('Image Conveyor: character-folder sync failed during reference assignment.', error)
+      throw new Error('Unable to refresh the active character folder. The reference drop was not applied.')
+    }
     character = characterCache.get(presetId) ?? null
   }
   return character
@@ -550,12 +555,14 @@ async function addCharacterMembers(character, paths) {
 
 function customTabElements(node, viewId, label, title) {
   const ctx = node.__bil
+  ctx.tabs?.setAttribute('role', 'tablist')
   const shell = document.createElement('div')
   shell.className = 'bil-tab-shell'
   const tab = document.createElement('button')
   tab.className = 'bil-tab'
   tab.type = 'button'
   tab.setAttribute('role', 'tab')
+  tab.setAttribute('aria-selected', 'false')
   tab.setAttribute('aria-controls', ctx.list.id)
   tab.id = `${ctx.tabSetId}-${viewId.replace(/[^a-zA-Z0-9_-]/g, '-')}`
   tab.title = title
@@ -581,6 +588,12 @@ function switchCustomView(node, viewId) {
   const current = activeBrowser(ctx)
   if (current && ctx.list && ctx.browser.activeView !== viewId) current.scrollTop = ctx.list.scrollTop
   ctx.browser.activeView = viewId
+  ctx.conveyorTab?.setAttribute('aria-selected', 'false')
+  ctx.inputTab?.setAttribute('aria-selected', 'false')
+  for (const [candidateView, elements] of ctx.folderTabElements) {
+    elements.tab?.setAttribute('aria-selected', String(candidateView === viewId))
+    elements.shell?.classList.toggle('bil-tab-active', candidateView === viewId)
+  }
   ctx.pendingScrollRestore = { view: viewId, scrollTop: destination.scrollTop || 0 }
   ctx.renderedRangeKey = ''
   requestMainRender(node)
@@ -795,11 +808,19 @@ async function uploadFiles(files, destinationFolder = '') {
 }
 
 async function assignReferences(node, startIndex, items = [], externalFiles = []) {
-  const character = await activeCharacter(node)
+  let character
+  try {
+    character = await activeCharacter(node)
+  } catch (error) {
+    console.error('Image Conveyor: reference assignment aborted because the character folder could not be refreshed.', error)
+    window.alert(error?.message || 'Unable to refresh the active character folder. The reference drop was not applied.')
+    return false
+  }
   const references = []
   const memberPaths = []
   const errors = []
   let uploadedAnything = false
+  let membershipSaved = false
 
   for (const item of items) {
     if (item?.localFile instanceof File) continue
@@ -842,6 +863,7 @@ async function assignReferences(node, startIndex, items = [], externalFiles = []
   if (character && memberPaths.length) {
     try {
       await addCharacterMembers(character, Array.from(new Set(memberPaths)))
+      membershipSaved = true
     } catch (error) {
       errors.push({ file: null, error })
     }
@@ -860,7 +882,7 @@ async function assignReferences(node, startIndex, items = [], externalFiles = []
   }
 
   if (uploadedAnything) refreshAllInputs()
-  if (character) {
+  if (character && membershipSaved) {
     character.members = Array.from(new Set([...character.members, ...memberPaths]))
     characterCacheRevision += 1
     for (const candidate of enhancedNodes) {
@@ -1087,6 +1109,20 @@ function finishShelfPointerDrag(node, event) {
   return true
 }
 
+function cancelShelfPointerDrag(node, event) {
+  const ctx = node.__bil
+  const ext = ctx?.icx
+  const drag = ext?.shelfPointerDrag
+  if (!drag) return false
+  if (drag.pointerId != null && event?.pointerId != null && drag.pointerId !== event.pointerId) return false
+  ext.shelfPointerDrag = null
+  ctx.root?.classList.remove('bil-dragover')
+  ctx.referenceDragHoverIndex = null
+  document.body.classList.remove('icx-reference-grabbing')
+  node.setDirtyCanvas?.(true, false)
+  return true
+}
+
 function handleShelfPointerMove(node, event) {
   const ctx = node.__bil
   const ext = ctx?.icx
@@ -1189,6 +1225,7 @@ function installNodeEnhancement(node) {
     characterRevision: characterCacheRevision,
     presetSignature: '',
     cardDrag: null,
+    dropTargetCard: null,
     referenceSelected: new Set(),
     referenceAnchor: null,
     shelfPointerDrag: null,
@@ -1249,8 +1286,16 @@ function installNodeEnhancement(node) {
     if (ext.inputMode === 'folders') void loadInputDirectories(node)
   })
 
+  const clearFolderDropTarget = () => {
+    ext.dropTargetCard?.classList.remove('bil-drag-target')
+    ext.dropTargetCard = null
+  }
+
   ctx.root.addEventListener('dragstart', (event) => handleCardDragStart(node, event), true)
-  ctx.root.addEventListener('dragend', () => queueMicrotask(() => clearCardDrag(node)), true)
+  ctx.root.addEventListener('dragend', () => {
+    clearFolderDropTarget()
+    queueMicrotask(() => clearCardDrag(node))
+  }, true)
   ctx.root.addEventListener('click', () => queueMicrotask(() => updateEnhancedControls(node)))
   ctx.root.addEventListener('pointerup', () => queueMicrotask(() => updateEnhancedControls(node)))
 
@@ -1264,6 +1309,7 @@ function installNodeEnhancement(node) {
     event.preventDefault()
     event.stopPropagation()
     event.stopImmediatePropagation?.()
+    clearFolderDropTarget()
     clearCardDrag(node)
     releaseMainCardDrag(drag)
     void moveInputPaths(node, paths, target.item.folderPath).then((result) => {
@@ -1273,29 +1319,52 @@ function installNodeEnhancement(node) {
   }, true)
 
   ext.documentDragOver = (event) => {
-    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return
+    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) {
+      clearFolderDropTarget()
+      return
+    }
     const slot = cardSlotAtTarget(ctx, event.target)
-    if (slot?.item?.kind !== 'folder' || slot.item.sourceId !== SERVER_INPUT_SOURCE_ID) return
+    if (slot?.item?.kind !== 'folder' || slot.item.sourceId !== SERVER_INPUT_SOURCE_ID) {
+      clearFolderDropTarget()
+      return
+    }
+    if (ext.dropTargetCard !== slot.card) clearFolderDropTarget()
     event.preventDefault()
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
     slot.card.classList.add('bil-drag-target')
+    ext.dropTargetCard = slot.card
   }
+  ext.documentDragLeave = (event) => {
+    const card = ext.dropTargetCard
+    if (!card) return
+    const origin = event.target
+    const related = event.relatedTarget
+    if (!(origin instanceof Node) || !card.contains(origin)) return
+    if (related instanceof Node && card.contains(related)) return
+    clearFolderDropTarget()
+  }
+  ext.documentDragEnd = () => clearFolderDropTarget()
   ext.documentDrop = (event) => {
-    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return
+    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) {
+      clearFolderDropTarget()
+      return
+    }
     const slot = cardSlotAtTarget(ctx, event.target)
+    clearFolderDropTarget()
     if (slot?.item?.kind !== 'folder' || slot.item.sourceId !== SERVER_INPUT_SOURCE_ID) return
     const files = Array.from(event.dataTransfer?.files ?? []).filter(isImageFile)
     if (!files.length) return
     event.preventDefault()
     event.stopPropagation()
     event.stopImmediatePropagation?.()
-    slot.card.classList.remove('bil-drag-target')
     void uploadFiles(files, slot.item.folderPath).then((result) => {
       refreshAllInputs()
       if (result.errors.length) window.alert(`${result.errors.length} image${result.errors.length === 1 ? '' : 's'} failed to import into the folder.`)
     }).catch((error) => window.alert(error?.message || 'Unable to import images into the folder.'))
   }
   document.addEventListener('dragover', ext.documentDragOver, true)
+  document.addEventListener('dragleave', ext.documentDragLeave, true)
+  document.addEventListener('dragend', ext.documentDragEnd, true)
   document.addEventListener('drop', ext.documentDrop, true)
 
   ext.documentPointerMove = (event) => { handleShelfPointerMove(node, event) }
@@ -1303,9 +1372,13 @@ function installNodeEnhancement(node) {
     if (ext.shelfPointerDrag) finishShelfPointerDrag(node, event)
     queueMicrotask(() => updateEnhancedControls(node))
   }
+  ext.documentPointerCancel = (event) => {
+    if (ext.shelfPointerDrag) cancelShelfPointerDrag(node, event)
+    queueMicrotask(() => updateEnhancedControls(node))
+  }
   document.addEventListener('pointermove', ext.documentPointerMove, true)
   document.addEventListener('pointerup', ext.documentPointerUp, true)
-  document.addEventListener('pointercancel', ext.documentPointerUp, true)
+  document.addEventListener('pointercancel', ext.documentPointerCancel, true)
 
   const previousDraw = node.onDrawForeground
   node.onDrawForeground = function (context) {
@@ -1384,11 +1457,14 @@ function installNodeEnhancement(node) {
   node.onRemoved = function (...args) {
     ext.removed = true
     enhancedNodes.delete(node)
+    clearFolderDropTarget()
     document.removeEventListener('dragover', ext.documentDragOver, true)
+    document.removeEventListener('dragleave', ext.documentDragLeave, true)
+    document.removeEventListener('dragend', ext.documentDragEnd, true)
     document.removeEventListener('drop', ext.documentDrop, true)
     document.removeEventListener('pointermove', ext.documentPointerMove, true)
     document.removeEventListener('pointerup', ext.documentPointerUp, true)
-    document.removeEventListener('pointercancel', ext.documentPointerUp, true)
+    document.removeEventListener('pointercancel', ext.documentPointerCancel, true)
     document.body.classList.remove('icx-reference-grabbing')
     return previousRemoved?.apply(this, args)
   }
