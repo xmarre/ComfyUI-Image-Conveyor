@@ -133,10 +133,8 @@ function requestMainRender(node) {
 function commitNodeState(node, state, uiState = readUiState(node)) {
   const ctx = node.__bil
   state.reference_slots = normalizeReferenceSlots(state.reference_slots)
-  const stateEntry = widget(node, STATE_WIDGET)
-  const uiEntry = widget(node, UI_STATE_WIDGET)
-  writeWidget(stateEntry, JSON.stringify(state))
-  writeWidget(uiEntry, JSON.stringify(uiState))
+  writeWidget(widget(node, STATE_WIDGET), JSON.stringify(state))
+  writeWidget(widget(node, UI_STATE_WIDGET), JSON.stringify(uiState))
   if (ctx) {
     ctx.state = state
     ctx.uiState = uiState
@@ -201,7 +199,7 @@ function isServerLibraryView(ctx, view = ctx.browser.activeView) {
 function getQueuedInputPaths() {
   const paths = new Set()
   for (const node of enhancedNodes) {
-    const state = readState(node)
+    const state = node.__bil?.state ?? readState(node)
     for (const item of state.items ?? []) {
       if (item?.status !== 'queued') continue
       const path = itemInputPath(item)
@@ -287,9 +285,7 @@ function removeLivePaths(relativePaths) {
     state.reference_slots = slots
     ui.selected_ids = (ui.selected_ids ?? []).filter((id) => !removedIds.has(id))
     for (const id of removedIds) delete ui.source_paths?.[id]
-    if (ctx.browser?.conveyor?.selected) {
-      for (const id of removedIds) ctx.browser.conveyor.selected.delete(id)
-    }
+    for (const id of removedIds) ctx.browser?.conveyor?.selected?.delete(id)
     commitNodeState(node, state, ui)
   }
   return changedCount
@@ -326,7 +322,12 @@ function librarySort(value, fallback = DEFAULT_LIBRARY_SORT) {
   return VALID_LIBRARY_SORTS.has(String(value)) ? String(value) : fallback
 }
 
+function invalidateDirectoryCache(ext) {
+  ext.directoryCacheRevision = -1
+}
+
 function allDirectories(ext) {
+  if (ext.directoryCacheRevision === ext.dataRevision) return ext.directoryCache
   const result = new Set(ext.serverDirectories)
   for (const entry of ext.allFiles) {
     let current = normalizeFolder(entry?.subfolder)
@@ -342,18 +343,19 @@ function allDirectories(ext) {
       current = parentPath(current)
     }
   }
+  ext.directoryCache = result
+  ext.directoryCacheRevision = ext.dataRevision
   return result
 }
 
 function serverSource(ctx) {
   const ext = ctx.icx
-  const source = {
-    id: SERVER_INPUT_SOURCE_ID,
-    name: 'Input Folder',
-    directories: allDirectories(ext),
-    files: []
+  let source = ctx.browser.folderSources.get(SERVER_INPUT_SOURCE_ID)
+  if (!source) {
+    source = { id: SERVER_INPUT_SOURCE_ID, name: 'Input Folder', directories: new Set(), files: [] }
+    ctx.browser.folderSources.set(SERVER_INPUT_SOURCE_ID, source)
   }
-  ctx.browser.folderSources.set(SERVER_INPUT_SOURCE_ID, source)
+  source.directories = allDirectories(ext)
   return source
 }
 
@@ -374,14 +376,12 @@ function folderEntry(path) {
 function directInputEntries(ctx, folderPath = '') {
   const ext = ctx.icx
   const currentFolder = normalizeFolder(folderPath) || ''
-  const directories = allDirectories(ext)
   const entries = []
-  for (const directory of directories) {
+  for (const directory of allDirectories(ext)) {
     if (parentPath(directory) === currentFolder) entries.push(folderEntry(directory))
   }
   for (const file of ext.allFiles) {
-    const parent = normalizeFolder(file?.subfolder) || ''
-    if (parent === currentFolder) entries.push(file)
+    if ((normalizeFolder(file?.subfolder) || '') === currentFolder) entries.push(file)
   }
   return entries
 }
@@ -392,7 +392,7 @@ function characterEntries(ctx, character) {
   const folder = normalizeFolder(character?.folder) || ''
   for (const file of ext.allFiles) {
     const path = normalizePath(file.relative_path)
-    if (folder && (path.startsWith(`${folder}/`) || path === folder)) wanted.add(path)
+    if (folder && path.startsWith(`${folder}/`)) wanted.add(path)
   }
   const byPath = new Map(ext.allFiles.map((file) => [normalizePath(file.relative_path), file]))
   return Array.from(wanted).map((path) => byPath.get(path)).filter(Boolean)
@@ -417,6 +417,7 @@ function captureMainInputData(ctx) {
   }
   ext.seenInputVersion = ctx.inputVersion
   ext.dataRevision += 1
+  invalidateDirectoryCache(ext)
   return true
 }
 
@@ -425,8 +426,7 @@ function rebuildInputViews(node) {
   const ext = ctx?.icx
   if (!ctx || !ext) return
   serverSource(ctx)
-  const rootEntries = directInputEntries(ctx, '')
-  ext.displayFiles = ext.inputMode === 'folders' ? rootEntries : ext.allFiles
+  ext.displayFiles = ext.inputMode === 'folders' ? directInputEntries(ctx, '') : ext.allFiles
   if (ctx.browser.input.files !== ext.displayFiles) ctx.browser.input.files = ext.displayFiles
 
   for (const [viewId, browser] of ctx.browser.folderViews) {
@@ -440,8 +440,7 @@ function rebuildInputViews(node) {
         browser.sort = ext.lastLibrarySort
       }
     } else if (browser.sourceKind === 'character') {
-      const character = characterCache.get(browser.characterId)
-      browser.entries = characterEntries(ctx, character)
+      browser.entries = characterEntries(ctx, characterCache.get(browser.characterId))
       if (!ext.seenLibraryViews.has(viewId)) {
         browser.sort = ext.lastLibrarySort
         ext.seenLibraryViews.add(viewId)
@@ -470,6 +469,7 @@ async function loadInputDirectories(node) {
         .filter(Boolean)
     )
     ext.dataRevision += 1
+    invalidateDirectoryCache(ext)
     rebuildInputViews(node)
     requestMainRender(node)
   } catch (error) {
@@ -501,6 +501,7 @@ async function syncCharacterFolders(force = false) {
       if (!ctx || ctx.removed || !ctx.icx) continue
       ctx.icx.characterRevision = characterCacheRevision
       ctx.icx.dataRevision += 1
+      invalidateDirectoryCache(ctx.icx)
       rebuildInputViews(node)
       node.setDirtyCanvas?.(true, false)
     }
@@ -513,7 +514,7 @@ async function syncCharacterFolders(force = false) {
 }
 
 async function activeCharacter(node) {
-  const state = readState(node)
+  const state = node.__bil?.state ?? readState(node)
   const presetId = String(state.active_reference_preset_id || '')
   if (!presetId) return null
   let character = characterCache.get(presetId)
@@ -630,7 +631,9 @@ function openCharacterLibrary(node, character) {
     const elements = customTabElements(node, viewId, character.name || 'Character', character.folder)
     elements.tab.addEventListener('click', () => switchCustomView(node, viewId))
     elements.close.addEventListener('click', (event) => {
-      event.preventDefault(); event.stopPropagation(); closeCustomView(node, viewId)
+      event.preventDefault()
+      event.stopPropagation()
+      closeCustomView(node, viewId)
     })
   }
   switchCustomView(node, viewId)
@@ -656,9 +659,7 @@ function selectedServerPaths(node) {
   const selected = browser?.selected ?? new Set()
   const byPath = new Set()
   for (const item of ctx.visibleItems ?? []) {
-    if (item?.kind === 'folder') continue
-    const id = viewItemId(item)
-    if (!selected.has(id)) continue
+    if (item?.kind === 'folder' || !selected.has(viewItemId(item))) continue
     const path = itemInputPath(item)
     if (path) byPath.add(path)
   }
@@ -700,9 +701,7 @@ async function moveSelectedInput(node) {
   const paths = selectedServerPaths(node)
   if (!paths.length) return
   const browser = activeBrowser(ctx)
-  const character = browser?.sourceKind === 'character'
-    ? characterCache.get(browser.characterId)
-    : null
+  const character = browser?.sourceKind === 'character' ? characterCache.get(browser.characterId) : null
   const currentFolder = character?.folder ?? (browser?.sourceKind === 'server-input' ? browser.folderPath : '') ?? ''
   const destination = window.prompt(
     `Move ${paths.length} selected input image${paths.length === 1 ? '' : 's'} to which input subfolder?\n\n` +
@@ -795,25 +794,22 @@ async function assignReferences(node, startIndex, items = [], externalFiles = []
   const errors = []
   let uploadedAnything = false
 
-  const localItems = items.filter((item) => item?.localFile instanceof File)
-  const existingItems = items.filter((item) => !(item?.localFile instanceof File))
-  for (const item of existingItems) {
+  for (const item of items) {
+    if (item?.localFile instanceof File) continue
     const path = itemInputPath(item)
     if (!path) continue
     const reference = pathToReference(path)
-    if (reference) {
-      references.push(reference)
-      memberPaths.push(path)
-    }
+    if (!reference) continue
+    references.push(reference)
+    memberPaths.push(path)
   }
 
-  const files = [
-    ...localItems.map((item) => item.localFile),
-    ...Array.from(externalFiles ?? []).filter(isImageFile)
-  ]
-  if (files.length) {
-    const destination = character?.folder || ''
-    const result = await uploadFiles(files, destination)
+  const localItems = items.filter((item) => item?.localFile instanceof File)
+  if (character && (localItems.length || externalFiles.length)) {
+    const result = await uploadFiles(
+      [...localItems.map((item) => item.localFile), ...Array.from(externalFiles).filter(isImageFile)],
+      character.folder
+    )
     uploadedAnything = result.uploaded.length > 0
     for (const entry of result.uploaded) {
       const reference = pathToReference(entry.relative_path)
@@ -823,6 +819,17 @@ async function assignReferences(node, startIndex, items = [], externalFiles = []
       }
     }
     errors.push(...result.errors)
+  } else {
+    for (const item of localItems) {
+      const destination = normalizeFolder(item.relativeSubfolder ?? item.subfolder ?? '')
+      const result = await uploadFiles([item.localFile], destination == null ? '' : destination)
+      uploadedAnything ||= result.uploaded.length > 0
+      for (const entry of result.uploaded) {
+        const reference = pathToReference(entry.relative_path)
+        if (reference) references.push(reference)
+      }
+      errors.push(...result.errors)
+    }
   }
 
   if (character && memberPaths.length) {
@@ -849,7 +856,13 @@ async function assignReferences(node, startIndex, items = [], externalFiles = []
   if (character) {
     character.members = Array.from(new Set([...character.members, ...memberPaths]))
     characterCacheRevision += 1
-    for (const candidate of enhancedNodes) rebuildInputViews(candidate)
+    for (const candidate of enhancedNodes) {
+      const ext = candidate.__bil?.icx
+      if (!ext) continue
+      ext.dataRevision += 1
+      invalidateDirectoryCache(ext)
+      rebuildInputViews(candidate)
+    }
   }
   if (errors.length) {
     console.error('Image Conveyor: some reference images failed to import or catalog.', ...errors.map((entry) => entry.error))
@@ -943,10 +956,10 @@ function drawEnhancementOverlay(node, context) {
   const ext = ctx?.icx
   const layout = ctx?.referenceShelfLayout
   if (!ctx || !ext || !layout?.usable) return
-  const state = readState(node)
-  const selected = ext.referenceSelected
+  const state = ctx.state
+  if (!state) return
   context.save()
-  for (const index of selected) {
+  for (const index of ext.referenceSelected) {
     const slot = layout.slots[index]
     if (!slot || !state.reference_slots?.[index]) continue
     context.strokeStyle = 'rgba(135,195,255,.98)'
@@ -973,7 +986,7 @@ function drawEnhancementOverlay(node, context) {
 
 function selectReferenceForDrag(node, index, event) {
   const ext = node.__bil.icx
-  const state = readState(node)
+  const state = node.__bil.state ?? readState(node)
   if (!state.reference_slots?.[index]) return false
   if (event.shiftKey && ext.referenceAnchor != null) {
     const start = Math.min(index, ext.referenceAnchor)
@@ -991,7 +1004,9 @@ function selectReferenceForDrag(node, index, event) {
     ext.referenceAnchor = index
   }
   if (!ext.referenceSelected.size) ext.referenceSelected.add(index)
-  const indices = Array.from(ext.referenceSelected).filter((current) => state.reference_slots[current]).sort((a, b) => a - b)
+  const indices = Array.from(ext.referenceSelected)
+    .filter((current) => state.reference_slots[current])
+    .sort((a, b) => a - b)
   ext.shelfPointerDrag = {
     pointerId: event.pointerId ?? null,
     fromIndex: index,
@@ -1083,7 +1098,7 @@ function updateEnhancedControls(node) {
   if (!ctx || !ext) return
   const inputRoot = ctx.browser.activeView === 'input'
   const serverView = isServerLibraryView(ctx)
-  const selectedCount = serverView ? selectedServerPaths(node).length : 0
+  const selectedCount = serverView ? (activeBrowser(ctx)?.selected?.size ?? 0) : 0
   ext.modeButton.hidden = !inputRoot
   ext.modeButton.textContent = ext.inputMode === 'folders' ? 'View: Folders' : 'View: Flat'
   ctx.root.classList.toggle('icx-folder-mode', inputRoot && ext.inputMode === 'folders')
@@ -1121,6 +1136,7 @@ function tickNode(node) {
       browser.sort = ext.lastLibrarySort
     }
   }
+  if (!VALID_LIBRARY_SORTS.has(ctx.browser.input.sort)) ctx.browser.input.sort = ext.lastLibrarySort
   updateEnhancedControls(node)
 }
 
@@ -1145,6 +1161,8 @@ function installNodeEnhancement(node) {
     allFiles: Array.isArray(ctx.browser.input.files) ? ctx.browser.input.files : [],
     displayFiles: null,
     serverDirectories: new Set(),
+    directoryCache: new Set(),
+    directoryCacheRevision: -1,
     seenInputVersion: ctx.inputVersion,
     dataRevision: 0,
     lastLibrarySort: DEFAULT_LIBRARY_SORT,
@@ -1207,7 +1225,7 @@ function installNodeEnhancement(node) {
     const value = librarySort(ctx.inputSort.value, ext.lastLibrarySort)
     ext.lastLibrarySort = value
     const browser = activeBrowser(ctx)
-    if (browser && isServerLibraryView(ctx)) browser.sort = value
+    if (browser) browser.sort = value
   })
   ctx.refreshBtn?.addEventListener('click', () => {
     if (ext.inputMode === 'folders') void loadInputDirectories(node)
@@ -1249,7 +1267,9 @@ function installNodeEnhancement(node) {
     if (slot?.item?.kind !== 'folder' || slot.item.sourceId !== SERVER_INPUT_SOURCE_ID) return
     const files = Array.from(event.dataTransfer?.files ?? []).filter(isImageFile)
     if (!files.length) return
-    event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation?.()
+    event.preventDefault()
+    event.stopPropagation()
+    event.stopImmediatePropagation?.()
     slot.card.classList.remove('bil-drag-target')
     void uploadFiles(files, slot.item.folderPath).then((result) => {
       refreshAllInputs()
@@ -1259,9 +1279,7 @@ function installNodeEnhancement(node) {
   document.addEventListener('dragover', ext.documentDragOver, true)
   document.addEventListener('drop', ext.documentDrop, true)
 
-  ext.documentPointerMove = (event) => {
-    if (handleShelfPointerMove(node, event)) return
-  }
+  ext.documentPointerMove = (event) => { handleShelfPointerMove(node, event) }
   ext.documentPointerUp = (event) => {
     if (ext.shelfPointerDrag) finishShelfPointerDrag(node, event)
     queueMicrotask(() => updateEnhancedControls(node))
@@ -1281,17 +1299,18 @@ function installNodeEnhancement(node) {
   const previousMouseDown = node.onMouseDown
   node.onMouseDown = function (event, localPosition, graphCanvas) {
     const point = nodePoint(node, event)
-    const rect = folderButtonRect(ctx)
-    if (event.button === 0 && pointInRect(point, rect)) {
-      event.preventDefault?.(); event.stopPropagation?.()
+    if (event.button === 0 && pointInRect(point, folderButtonRect(ctx))) {
+      event.preventDefault?.()
+      event.stopPropagation?.()
       void openActiveCharacterLibrary(node)
       return true
     }
     const hit = shelfHit(node, event)
     if (event.button === 0 && hit?.type === 'slot') {
-      const state = readState(node)
+      const state = ctx.state ?? readState(node)
       if (state.reference_slots?.[hit.index] && selectReferenceForDrag(node, hit.index, event)) {
-        event.preventDefault?.(); event.stopPropagation?.()
+        event.preventDefault?.()
+        event.stopPropagation?.()
         return true
       }
     }
@@ -1317,16 +1336,23 @@ function installNodeEnhancement(node) {
     if (hit?.type === 'slot' && ext.cardDrag?.items?.length) {
       const drag = ext.cardDrag
       clearCardDrag(node)
-      event.preventDefault?.(); event.stopPropagation?.()
+      event.preventDefault?.()
+      event.stopPropagation?.()
       ctx.referenceDragHoverIndex = null
       node.setDirtyCanvas?.(true, false)
+      const state = ctx.state ?? readState(node)
+      const oneLocalWithoutCharacter = drag.items.length === 1
+        && drag.items[0]?.localFile instanceof File
+        && !state.active_reference_preset_id
+      if (oneLocalWithoutCharacter) return await previousDragDrop?.call(this, event)
       return await assignReferences(node, hit.index, drag.items, [])
     }
     if (hit?.type === 'slot') {
-      const character = await activeCharacter(node)
       const files = Array.from(event.dataTransfer?.files ?? []).filter(isImageFile)
-      if (character && files.length) {
-        event.preventDefault?.(); event.stopPropagation?.()
+      const state = ctx.state ?? readState(node)
+      if (state.active_reference_preset_id && files.length) {
+        event.preventDefault?.()
+        event.stopPropagation?.()
         ctx.referenceDragHoverIndex = null
         return await assignReferences(node, hit.index, [], files)
       }
