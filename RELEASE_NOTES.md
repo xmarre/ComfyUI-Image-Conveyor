@@ -1,48 +1,47 @@
-# Image Conveyor v1.3.0
+# Image Conveyor v1.4.0
 
-Adds a persistent eight-slot reference workflow and reusable character presets while preserving the existing Conveyor and queue-group behavior.
+This release turns the Input Folder and persistent reference shelf into a managed image library with real folder operations, batch drag/drop, and canonical per-character storage.
 
-## Persistent Reference Shelf
+## Managed Input Folder
 
-- Adds eight fixed reference slots above the browser, exposed as `ref_image_1` through `ref_image_8`.
-- Keeps `image` as the advancing main Conveyor image.
-- In **Persistent references** mode, exactly one Conveyor item is reserved and consumed per execution regardless of the stored **Images per execution** value.
-- Snapshots the connected reference outputs when a prompt is queued and loads only connected, populated slots.
-- Keeps connected empty slots inactive (`None`) without shifting references, so all nine image connections remain safe with a partially populated shelf.
-- Supports drag/drop assignment from Conveyor, Input Folder, local-folder tabs, and the operating system without adding reference-only imports to the queue.
-- Supports left-drag insertion sorting across populated and sparse shelf slots.
+- Adds hierarchical Input Folder browsing with real folder cards and folder tabs while retaining the flat all-images view.
+- Adds physical move and delete operations for selected Input files, with queued files protected from destructive changes.
+- Supports dragging selected images into folders, folder tabs, or the Conveyor; multi-selection drag preserves the full selection even outside the virtualized card window.
+- Supports hover-opening folder tabs during a drag and dropping directly into the newly opened folder.
+- Preserves the active folder and scroll position after move, drop, refresh, and gallery rerender operations.
+- Fixes stale folder views after filesystem moves and prevents scrollbar interaction from accidentally marquee-selecting the far-right column.
 
-## Character presets and safety
+## Character libraries and canonical files
 
-- Adds global character presets with New, Load, Save, Save as, Rename, Duplicate, and Delete operations.
-- Stores presets as locked, atomically replaced JSON under the ComfyUI user directory.
-- Keeps detached workflow snapshots authoritative, allowing workflows to survive renamed, changed, missing, or deleted global presets.
-- Restricts reference paths to supported images inside the ComfyUI input directory.
-- Relinks open shelves and saved presets during exact-duplicate cleanup before removing redundant files.
-- Preserves files on transient preset-store I/O failures and quarantines malformed preset data safely.
+- Gives every saved character a stable physical folder under `input/image_conveyor_characters/`.
+- Makes the character folder the physical source of truth for that character's images; the eight reference slots are the active visible subset of the same library.
+- Assigning an existing Input or Conveyor image to an active character relocates the canonical file into that character folder instead of creating another physical copy.
+- Reuses a byte-identical file already present in the character folder and removes the redundant source copy.
+- Preserves different-content filename collisions with collision-safe naming.
+- Relinks open Conveyor items, reference slots, UI source paths, saved presets, and character membership whenever a canonical path changes.
+- Automatically migrates character presets and reference slots created by earlier builds into their character folders and collapses legacy byte-identical copies.
+- Defers migration of queued files until they are safe to move.
 
-## Image browsing and interaction
+## Drag/drop and reference workflow
 
-- Adds one shared right-click image menu to the Reference Shelf, Conveyor, Input Folder, and local-folder tabs.
-- Adds a screen-fitted original-file preview with concise image properties, path copying, and context-specific actions.
-- Adds Left/Right Arrow navigation through the populated shelf or the current filtered and sorted browser view.
-- Keeps preview navigation independent from queue selection, consumption, ordering, and scrolling.
-- Restores native ComfyUI shortcuts after ComfyUI-Manager closes, including the Manager registry-search lifecycle.
-- Version-locks the frontend helper-module import to prevent mixed cached JavaScript versions from disabling the node UI.
+- Multi-image Conveyor reordering now moves the selected images as one ordered block.
+- Selected Input, folder, and Conveyor images can be moved between managed folders with Conveyor entries kept and relinked.
+- Reference-shelf images can be dragged back into the Conveyor and hydrate immediately without requiring a manual refresh or tab switch.
+- Reference assignment and character materialization use queued-path protection consistently rather than depending on frontend extension install order.
+- Same-batch identical sources collapse onto one canonical destination instead of creating suffixed duplicates.
 
-## Compatibility
+## Reliability and performance
 
-- Queue execution group mode retains the v1.2 behavior for ordered groups of 1 through 9 images.
-- Existing output indices 0 through 13 are unchanged. The original six outputs remain in slots 0 through 5.
-- State schema version 2 migrates legacy single-image nodes to Persistent references and multi-image nodes to Queue execution group deterministically.
-- `ImageConveyor` and the legacy `SequentialBatchImageLoader` alias remain available.
-- After updating from v1.2 or an earlier PR build, reload the frontend and recreate existing Image Conveyor nodes so ComfyUI rebuilds the new output labels and widget layout. Preserve the old node's embedded queue before replacing it.
+- Uses one backend owner for the drag/materialization routes, eliminating route-order-dependent behavior.
+- Missing files are handled as per-item skips so one disappearing source does not invalidate an otherwise successful batch.
+- Relocation synchronization is serialized by generation so later callers cannot receive a stale in-flight snapshot.
+- Character migration is no longer triggered by transient queue-status changes during normal canvas rendering.
+- Destination and migration duplicate matching use indexed metadata/content hashes to avoid repeated full-file comparisons on large libraries.
+- Destination paths are validated before scanning, including symlinked directory components.
+- Multi-file uploads perform one authoritative Input snapshot refresh per batch instead of repeatedly rescanning large Input folders.
+- Removes synthetic re-entrant `dragend` dispatch from intercepted native drops, reducing the most suspicious PR-specific path related to the reported Chrome `STATUS_ACCESS_VIOLATION` renderer crash.
 
 ## Validation
 
-- 90 Python tests pass.
-- 28 gallery and shortcut JavaScript tests pass.
-- 20 queue-group JavaScript tests pass.
-- 17 Reference Shelf JavaScript tests pass.
-- JavaScript syntax checks, Python compilation, cache-version checks, and whitespace checks pass.
-- Live ComfyUI testing confirmed the shelf, presets, image menus, preview navigation, restored shortcuts, and a nine-connection workflow with five populated references.
+- Complete GitHub Actions suite passes: Python tests, frontend pure-function tests, JavaScript syntax checks, Python compilation, and whitespace validation.
+- Live ComfyUI testing confirmed group drag/drop, physical folder moves, character-folder ownership/migration behavior, folder refresh and scroll preservation, and reference-shelf to Conveyor hydration.
