@@ -2630,7 +2630,13 @@ function showImageContextMenu(node, item, clientX, clientY, options = {}) {
     addAction('Remove from Conveyor', () => mutateConveyorContextItem(node, options.itemId, 'remove'), { danger: true })
   } else {
     addSeparator()
-    addAction('Add to Conveyor', () => addLibraryEntries(node, [item]))
+    const selected = activeBrowser(ctx)?.selected
+    const addSelection = selected instanceof Set && selected.has(options.itemId)
+    addAction('Add to Conveyor', () => (
+      addSelection
+        ? addSelectedLibraryEntries(node)
+        : addLibraryEntries(node, [item])
+    ))
   }
 
   document.body.appendChild(menu)
