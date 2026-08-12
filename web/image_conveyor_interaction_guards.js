@@ -1,5 +1,5 @@
 import { app } from '../../scripts/app.js'
-import { referenceShelfHit } from './image_conveyor_math.mjs'
+import { isConveyorDeleteShortcut, referenceShelfHit } from './image_conveyor_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.InteractionGuards'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -45,6 +45,12 @@ function itemPath(item) {
 
 function activeBrowser(ctx) {
   return ctx.browser?.[ctx.browser.activeView] ?? ctx.browser?.folderViews?.get(ctx.browser.activeView) ?? null
+}
+
+function isManagedLibraryView(ctx) {
+  if (ctx?.browser?.activeView === 'input') return true
+  const browser = activeBrowser(ctx)
+  return browser?.sourceKind === 'server-input' || browser?.sourceKind === 'character'
 }
 
 function cardSlotAtTarget(ctx, target) {
@@ -309,6 +315,52 @@ function installBatchDropGuard(ctx, ext) {
   return true
 }
 
+function consumeKeyboardEvent(event) {
+  event.preventDefault()
+  event.stopPropagation()
+  event.stopImmediatePropagation?.()
+}
+
+function installManagedLibraryDeleteShortcut(node, ctx, ext) {
+  const documentKeyDown = (event) => {
+    if (
+      event.defaultPrevented ||
+      event.isComposing ||
+      !ctx.keyboardActive ||
+      !isConveyorDeleteShortcut(event) ||
+      !isManagedLibraryView(ctx)
+    ) return
+    const browser = activeBrowser(ctx)
+    if (!(browser?.selected instanceof Set) || browser.selected.size === 0) return
+
+    // The core gallery keyboard coordinator already owns the Delete key for the Conveyor.
+    // Managed Input/character views use that exact ownership flag as well, but their physical
+    // delete action lives in the library extension. Consume the key here before ComfyUI's
+    // canvas/node shortcut sees it, then invoke the canonical "Delete files from disk" action.
+    consumeKeyboardEvent(event)
+    ext.deleteDiskButton?.click?.()
+  }
+  document.addEventListener('keydown', documentKeyDown, true)
+  return documentKeyDown
+}
+
+function installPresetAutoLoad(node, ctx) {
+  const documentChange = (event) => {
+    const target = event.target
+    const popover = ctx.presetPopover
+    if (!(target instanceof HTMLSelectElement) || !popover?.contains(target)) return
+    if (!String(target.value || '').trim()) return
+
+    // Reuse the preset popover's canonical Load action so changing the selection gets exactly
+    // the same state normalization, persistence, redraw, and migration behavior as pressing Load.
+    const loadButton = Array.from(popover.querySelectorAll('button'))
+      .find((button) => String(button.textContent || '').trim() === 'Load')
+    loadButton?.click?.()
+  }
+  document.addEventListener('change', documentChange, true)
+  return documentChange
+}
+
 function installNode(node, attempts = 0) {
   if (!node || node.__bil?.removed || attempts > 120) return
   const ctx = node.__bil
@@ -322,6 +374,8 @@ function installNode(node, attempts = 0) {
 
   installFolderModeRefreshGuard(node, ctx, ext)
   installBatchDropGuard(ctx, ext)
+  const documentKeyDown = installManagedLibraryDeleteShortcut(node, ctx, ext)
+  const documentChange = installPresetAutoLoad(node, ctx)
 
   const documentMouseUp = () => {
     // LiteGraph's canvas mouseup gets first chance to finish a legitimate shelf reorder.
@@ -347,6 +401,8 @@ function installNode(node, attempts = 0) {
 
   const previousRemoved = node.onRemoved
   node.onRemoved = function (...args) {
+    document.removeEventListener('keydown', documentKeyDown, true)
+    document.removeEventListener('change', documentChange, true)
     document.removeEventListener('mouseup', documentMouseUp)
     document.removeEventListener('pointerdown', documentPointerDown, true)
     document.removeEventListener('pointercancel', documentPointerCancel, true)
