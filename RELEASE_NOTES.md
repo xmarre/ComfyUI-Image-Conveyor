@@ -6,9 +6,12 @@ This release turns the Input Folder and persistent reference shelf into a manage
 
 - Adds hierarchical Input Folder browsing with real folder cards and folder tabs while retaining the flat all-images view.
 - Adds physical move and delete operations for selected Input files, with queued files protected from destructive changes.
+- `Delete` / `Entf` now works consistently in the Input Folder, managed subfolders, and character libraries: the gallery owns the shortcut and invokes the existing physical-delete flow instead of letting ComfyUI delete the node.
 - Supports dragging selected images into folders, folder tabs, or the Conveyor; multi-selection drag preserves the full selection even outside the virtualized card window.
+- Corrects the internal drag contract so Input/Conveyor-backed drags advertise move capability while external/local imports remain copy-only.
+- Treats drops back onto the same physical folder as a no-op instead of sending an invalid move that reports the file is already in that folder.
 - Supports hover-opening folder tabs during a drag and dropping directly into the newly opened folder.
-- Preserves the active folder and scroll position after move, drop, refresh, and gallery rerender operations.
+- Preserves the active folder mode and scroll position after move, drop, refresh, and gallery rerender operations, including authoritative Input refreshes on very large libraries.
 - Fixes stale folder views after filesystem moves and prevents scrollbar interaction from accidentally marquee-selecting the far-right column.
 
 ## Character libraries and canonical files
@@ -21,12 +24,15 @@ This release turns the Input Folder and persistent reference shelf into a manage
 - Relinks open Conveyor items, reference slots, UI source paths, saved presets, and character membership whenever a canonical path changes.
 - Automatically migrates character presets and reference slots created by earlier builds into their character folders and collapses legacy byte-identical copies.
 - Defers migration of queued files until they are safe to move.
+- Selecting a character in the preset dropdown now loads it immediately; the separate Load button is no longer required for normal preset switching.
+- The character preset menu now explicitly uses dark-compatible surfaces, text, options, and controls instead of inheriting an unreadable light native-select palette.
 
 ## Drag/drop and reference workflow
 
 - Multi-image Conveyor reordering now moves the selected images as one ordered block.
 - Selected Input, folder, and Conveyor images can be moved between managed folders with Conveyor entries kept and relinked.
 - Reference-shelf images can be dragged back into the Conveyor and hydrate immediately without requiring a manual refresh or tab switch.
+- Reference shelf drag/selection highlights now clear correctly when the pointer is released or the user clicks away outside the shelf.
 - Reference assignment and character materialization use queued-path protection consistently rather than depending on frontend extension install order.
 - Same-batch identical sources collapse onto one canonical destination instead of creating suffixed duplicates.
 
@@ -44,4 +50,4 @@ This release turns the Input Folder and persistent reference shelf into a manage
 ## Validation
 
 - Complete GitHub Actions suite passes: Python tests, frontend pure-function tests, JavaScript syntax checks, Python compilation, and whitespace validation.
-- Live ComfyUI testing confirmed group drag/drop, physical folder moves, character-folder ownership/migration behavior, folder refresh and scroll preservation, and reference-shelf to Conveyor hydration.
+- Live ComfyUI testing confirmed group drag/drop, physical folder moves, folder-mode/scroll preservation, managed-library Delete handling, character preset switching, character-folder ownership/migration behavior, reference-shelf interaction cleanup, and reference-shelf to Conveyor hydration.
