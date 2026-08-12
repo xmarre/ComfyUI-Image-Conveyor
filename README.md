@@ -2,7 +2,8 @@
 
 A sequential, visual image queue for ComfyUI with an integrated input-folder browser.
 
-<img width="673" height="1109" alt="2026-08-10 10_39_14-Bilder und 11 weitere Registerkarten – Explorer" src="https://github.com/user-attachments/assets/34cd4dd3-ae28-49c1-9472-cee8a7e5ea57" />
+<img width="709" height="1210" alt="Screenshot 2026-08-12 132520" src="https://github.com/user-attachments/assets/39f3827f-a12e-4392-b55e-f49b8317ec13" />
+
 
 ## What it does
 
