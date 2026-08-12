@@ -26,7 +26,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "22.7.0"
 
       - name: Install test dependencies
         run: python -m pip install --upgrade pillow
@@ -35,18 +35,21 @@ jobs:
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Run frontend pure-function tests
-        run: |
-          node --test tests/test_gallery_math.mjs
-          node --test tests/test_queue_groups.mjs
-          node --test tests/test_reference_shelf.mjs
+        run: node --test tests/*.mjs
 
       - name: Check JavaScript syntax
         run: |
           node --check web/image_conveyor.js
           node --check web/image_conveyor_math.mjs
+          node --check web/image_conveyor_library_ops.js
+          node --check web/image_conveyor_drag_ops.js
+          node --check web/image_conveyor_drag_math.mjs
+          node --check web/image_conveyor_followup_fixes.js
+          node --check web/image_conveyor_followup_math.mjs
+          node --check web/image_conveyor_interaction_guards.js
 
       - name: Check Python syntax
-        run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py
+        run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py image_conveyor_library_ops.py image_conveyor_drag_ops.py image_conveyor_drag_v2_ops.py
 
       - name: Check whitespace errors
         shell: bash
