@@ -316,13 +316,21 @@ function installDragAutoscroll(ctx, ext) {
       config.edgeSize,
       config.maxSpeed
     )
+    if (!speed) {
+      stop()
+      return
+    }
     const previousAt = ext.queueQolDragLastAt || now
     const elapsed = Math.min(40, Math.max(0, now - previousAt))
     ext.queueQolDragLastAt = now
-    if (speed && elapsed) {
+    if (elapsed) {
       const maxScroll = Math.max(0, ctx.list.scrollHeight - ctx.list.clientHeight)
       const next = Math.min(maxScroll, Math.max(0, ctx.list.scrollTop + speed * elapsed / 1000))
-      if (next !== ctx.list.scrollTop) ctx.list.scrollTop = next
+      if (next === ctx.list.scrollTop) {
+        stop()
+        return
+      }
+      ctx.list.scrollTop = next
     }
     ext.queueQolDragFrame = requestAnimationFrame(frame)
   }
