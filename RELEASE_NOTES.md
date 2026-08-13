@@ -1,6 +1,6 @@
 # Image Conveyor v1.5.0
 
-This release adds direct queue-priority controls and fixes scrolling while dragging images inside the gallery.
+This release adds direct queue-priority controls and fixes scrolling/navigation interactions inside the gallery.
 
 ## Queue priority and context actions
 
@@ -20,13 +20,17 @@ This release adds direct queue-priority controls and fixes scrolling while dragg
 - External files dragged from the operating system continue to use native browser drag-and-drop.
 - Edge autoscroll has a wider adaptive activation region, a smooth speed ramp, calibrated maximum speed, stale-drag cleanup, and stops cleanly outside active edges or at scroll limits.
 - Ordinary gallery wheel input is owned by the gallery so it does not leak to the surrounding ComfyUI canvas.
+- Middle-click inside the gallery now starts a consistent built-in vertical autoscroll mode instead of depending on browser-native middle-click behavior that may be intercepted by ComfyUI canvas panning.
+- The middle-click mode shows an `↕` anchor at the activation point; moving above or below the anchor controls continuous scroll direction and speed. Another click, normal wheel input, Escape, focus loss, or node removal cancels it.
+- Middle-button canvas panning outside the gallery remains untouched.
 
 ## Validation
 
 - Complete GitHub Actions suite passes on the feature PR: Python tests, frontend pure-function tests, JavaScript syntax checks, Python compilation, and whitespace validation.
-- CodeRabbit completed review successfully with no actionable inline review comments remaining.
+- CodeRabbit completed review successfully with no actionable inline review comments remaining before release preparation.
 - Live ComfyUI testing confirmed **Move to front of pending queue** works for the intended queue cases.
 - Live ComfyUI testing confirmed mouse-wheel scrolling works while selected images are actively dragged.
+- Pure-function coverage now also checks the middle-click autoscroll dead zone, direction, acceleration ramp, and viewport-scaled speed clamps.
 
 ## Packaging
 
