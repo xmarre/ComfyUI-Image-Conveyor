@@ -26,7 +26,7 @@ This release adds direct queue-priority controls and fixes scrolling/navigation 
 
 ## Validation
 
-- Complete GitHub Actions suite passes on the final feature/release-prep head: Python tests, frontend pure-function tests, JavaScript syntax checks, Python compilation, and whitespace validation.
+- Complete GitHub Actions suite passes on the feature implementation and release-prep changes: Python tests, frontend pure-function tests, JavaScript syntax checks, Python compilation, and whitespace validation.
 - The main queue-priority/pointer-drag implementation received a CodeRabbit pass with no actionable comments. A final re-review request after the release-prep/middle-autoscroll additions was rate-limited by CodeRabbit rather than reporting a code failure.
 - Live ComfyUI testing confirmed **Move to front of pending queue** works for the intended queue cases.
 - Live ComfyUI testing confirmed mouse-wheel scrolling works while selected images are actively dragged.
