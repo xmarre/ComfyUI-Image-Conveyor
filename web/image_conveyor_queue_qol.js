@@ -362,7 +362,7 @@ function installDragAutoscroll(ctx, ext) {
 function installNode(node, attempts = 0) {
   if (!node || node.__bil?.removed || attempts > 120) return
   const ctx = node.__bil
-  if (!ctx?.list || !ctx.browser) {
+  if (!ctx?.list || !ctx.browser || !ctx.icx) {
     requestAnimationFrame(() => installNode(node, attempts + 1))
     return
   }
@@ -370,7 +370,6 @@ function installNode(node, attempts = 0) {
   patchedNodes.add(node)
   ensureMenuObserver()
 
-  if (!ctx.icx) ctx.icx = {}
   const ext = ctx.icx
   installGalleryWheelOwnership(ctx, ext)
   installDragAutoscroll(ctx, ext)
