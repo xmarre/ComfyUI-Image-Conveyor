@@ -101,10 +101,13 @@ The main browser provides:
 - a shared right-click image menu with an original-file preview scaled to the available screen, concise properties, path copying, and context-specific actions;
 - Left/Right Arrow navigation inside the preview, scoped to the populated Reference Shelf or the current filtered/sorted browser view;
 - arrow-key navigation, Home, End, PageUp, PageDown, Space selection, and Escape to close preview;
+- mouse-wheel scrolling while selected images are actively dragged;
+- middle-click gallery autoscroll with a visible `↕` anchor; move above/below the anchor to control direction and speed, then click again, use the wheel, press Escape, or leave focus to cancel;
 - **Jump to next pending**;
+- **Move to front of pending queue** from the Conveyor image context menu, including active multi-selection and processed-to-pending re-queueing;
 - drag reorder in unfiltered manual Conveyor order.
 
-Search and filters change the browser presentation only. Applying a Conveyor sort retains the established behavior of changing the actual queue order.
+Search and filters change the browser presentation only. Applying a Conveyor sort retains the established behavior of changing the actual queue order. Queue-priority moves return the Conveyor to manual order so the displayed order matches the next unreserved execution order. Middle-button canvas panning outside the gallery remains ComfyUI's normal behavior.
 
 ## Performance behavior
 
@@ -155,6 +158,7 @@ Repeated logical queue entries remain valid. Two different Conveyor entries that
 
 Available queue controls include:
 
+- move the clicked/selected image set to the first unreserved pending position; processed selections are re-queued as pending, while already queued reservations remain untouched;
 - mark selected pending or processed;
 - delete selected queue entries with the button or the standard `Delete` key (`Entf` on German keyboards);
 - clear queued reservations;
@@ -227,43 +231,14 @@ After updating from a build without the Reference Shelf or with the older `image
 
 The original six output slots remain at indices `0` through `5` in their existing order. The eight additional `IMAGE` outputs are appended at indices `6` through `13`, so saved links to the original outputs keep their indices.
 
-The node keeps the existing `ImageConveyor` class, the legacy `SequentialBatchImageLoader` alias, legacy single-item queue reservation shape, and legacy singular execution-delta fields. State version 2 adds `output_mode`, a fixed `reference_slots` array, and the optional active preset association.
+The node keeps the existing `ImageConveyor` class, the legacy `SequentialBatchImageLoader` alias, legacy single-item state JSON, and old workflows using the original execution mode. Persistent-reference mode is the new-node default; existing workflows keep their stored mode where available.
 
-Migration is deterministic for released workflows that have no `output_mode` field:
+## Install
 
-- `images_per_execution > 1` becomes **Queue execution group**, preserving existing grouped reservations, output mapping, Don't consume behavior, and auto-queue arithmetic;
-- `images_per_execution == 1` becomes **Persistent references** with eight empty slots, which is externally identical because every additional image output was already inactive.
+### ComfyUI Manager
 
-The original six output indices and all eight additional output indices remain unchanged.
-
-The frontend uses ComfyUI's custom widget + DOMWidget integration and remains VueNodes-compatible.
-
-## Installation
-
-### ComfyUI-Manager
-
-Install **ComfyUI Image Conveyor** through ComfyUI-Manager, then restart ComfyUI.
+Search for **ComfyUI Image Conveyor** in ComfyUI Manager and install it there, then restart ComfyUI and reload the frontend.
 
 ### Manual
 
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/xmarre/ComfyUI-Image-Conveyor.git
-```
-
-Restart ComfyUI after installation or update.
-
-## Development checks
-
-```bash
-python -m unittest discover -s tests -p 'test_*.py' -v
-node --test tests/test_gallery_math.mjs
-node --test tests/test_queue_groups.mjs
-node --test tests/test_reference_shelf.mjs
-node --check web/image_conveyor.js
-node --check web/image_conveyor_math.mjs
-python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py
-git diff --check
-```
-
-The Python suite covers queue/group compatibility, persistent-reference selection and output mapping, cache identity, preset CRUD and atomic persistence, preset path validation, duplicate-cleanup relinking, reservation strictness, duplicate resolution, stale metadata, canonical selection, concurrent uploads, index recovery, recursive listing, thumbnails, and path containment. The JavaScript tests additionally cover output-mode migration, fixed slot normalization, reference-only assignment, preset snapshot/dirty behavior, shelf hit geometry, drag-source classification, scrollbar preservation, gallery behavior, and bounded virtualization for a 10,000-item collection.
+Clone or extract the repository into `ComfyUI/custom_nodes/ComfyUI-Image-Conveyor`, restart ComfyUI, and reload the frontend.
