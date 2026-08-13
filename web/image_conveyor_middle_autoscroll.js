@@ -80,7 +80,11 @@ function frame(session, now) {
   if (elapsed) {
     const maxScroll = Math.max(0, ctx.list.scrollHeight - ctx.list.clientHeight)
     const next = Math.min(maxScroll, Math.max(0, ctx.list.scrollTop + speed * elapsed / 1000))
-    if (next !== ctx.list.scrollTop) ctx.list.scrollTop = next
+    if (next === ctx.list.scrollTop) {
+      session.lastAt = 0
+      return
+    }
+    ctx.list.scrollTop = next
   }
   session.frame = requestAnimationFrame((timestamp) => frame(session, timestamp))
 }
@@ -145,7 +149,7 @@ function installNode(node, attempts = 0) {
       return
     }
 
-    if (activeSession) stopSession(activeSession)
+    if (activeSession?.node === node) stopSession(activeSession)
   }
 
   ext.middleAutoscrollMouseDown = (event) => {
