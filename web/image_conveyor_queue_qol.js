@@ -5,7 +5,7 @@ import {
   dragEdgeAutoscrollSpeed,
   jumpPendingItemsToFront,
   normalizeWheelDelta
-} from './image_conveyor_queue_qol_math.mjs'
+} from './image_conveyor_queue_qol_math.mjs?v=20260813b'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.QueueQualityOfLife'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -25,8 +25,9 @@ function widget(node, name) {
 
 function readJsonWidget(node, name, fallback) {
   const entry = widget(node, name)
+  if (!entry || typeof entry.value !== 'string') return clone(fallback)
   try {
-    const parsed = JSON.parse(String(entry?.value ?? ''))
+    const parsed = JSON.parse(entry.value)
     return parsed && typeof parsed === 'object' ? parsed : clone(fallback)
   } catch {
     return clone(fallback)
@@ -34,23 +35,21 @@ function readJsonWidget(node, name, fallback) {
 }
 
 function readState(node) {
-  const ctx = node.__bil
-  const state = ctx?.state
-    ? clone(ctx.state)
-    : readJsonWidget(node, STATE_WIDGET, { version: 2, items: [] })
+  const fromWidget = readJsonWidget(node, STATE_WIDGET, null)
+  const state = fromWidget && typeof fromWidget === 'object'
+    ? fromWidget
+    : clone(node.__bil?.state ?? { version: 2, items: [] })
   state.items = Array.isArray(state.items) ? state.items : []
   return state
 }
 
 function readUiState(node) {
-  const ctx = node.__bil
-  const ui = ctx?.uiState
-    ? clone(ctx.uiState)
-    : readJsonWidget(node, UI_STATE_WIDGET, { version: 2, selected_ids: [], source_paths: {} })
+  const fromWidget = readJsonWidget(node, UI_STATE_WIDGET, null)
+  const ui = fromWidget && typeof fromWidget === 'object'
+    ? fromWidget
+    : clone(node.__bil?.uiState ?? { version: 2, selected_ids: [], source_paths: {} })
   ui.selected_ids = Array.isArray(ui.selected_ids) ? ui.selected_ids : []
-  ui.source_paths = ui.source_paths && typeof ui.source_paths === 'object'
-    ? ui.source_paths
-    : {}
+  ui.source_paths = ui.source_paths && typeof ui.source_paths === 'object' ? ui.source_paths : {}
   return ui
 }
 
@@ -64,12 +63,11 @@ function requestRender(node) {
   const ctx = node.__bil
   if (!ctx || ctx.removed) return
   ctx.renderedRangeKey = ''
-  const browser = ctx.browser?.[ctx.browser.activeView] ?? ctx.browser?.folderViews?.get(ctx.browser.activeView)
-  if (ctx.searchInput && browser) {
-    ctx.searchInput.value = String(browser.query || '')
-    ctx.searchInput.dispatchEvent(new Event('input'))
+  if (ctx.browser?.activeView === 'conveyor' && ctx.conveyorFilter) {
+    ctx.conveyorFilter.dispatchEvent(new Event('change'))
+  } else {
+    node.setDirtyCanvas?.(true, true)
   }
-  node.setDirtyCanvas?.(true, true)
 }
 
 function commitState(node, state, uiState = readUiState(node)) {
@@ -151,6 +149,11 @@ function jumpContextTargets(node, clickedId) {
   const result = jumpPendingItemsToFront(state.items, selected, clickedId)
   if (!result.changed) return
   state.items = result.items
+
+  // Queue priority must be visible as the actual execution order, even if the user previously
+  // chose a one-shot display sort. The persistent queue is always manual after a priority move.
+  ctx.browser.conveyor.sort = 'manual'
+  if (ctx.conveyorSort) ctx.conveyorSort.value = 'manual'
   commitState(node, state)
 }
 
@@ -195,8 +198,8 @@ function enhanceConveyorContextMenu(menu) {
 
   const { state, ids } = currentContextTargets(node, clickedId)
   const targetSet = new Set(ids)
-  const pendingCount = state.items.filter((item) => (
-    item?.status === 'pending' && targetSet.has(String(item?.id ?? ''))
+  const promotableCount = state.items.filter((item) => (
+    item?.status !== 'queued' && targetSet.has(String(item?.id ?? ''))
   )).length
   const markPending = menuButton(menu, 'Mark pending')
   const markProcessed = menuButton(menu, 'Mark processed')
@@ -206,13 +209,13 @@ function enhanceConveyorContextMenu(menu) {
     const jumpButton = document.createElement('button')
     jumpButton.type = 'button'
     jumpButton.setAttribute('role', 'menuitem')
-    jumpButton.textContent = pendingCount > 1
-      ? `Move ${pendingCount} pending images to queue front`
+    jumpButton.textContent = promotableCount > 1
+      ? `Move ${promotableCount} selected images to queue front`
       : 'Move to front of pending queue'
-    jumpButton.disabled = pendingCount === 0
-    jumpButton.title = pendingCount
-      ? 'Move the selected pending image(s) to the earliest pending queue position. Processed history and already queued reservations stay fixed.'
-      : 'Only pending images can be moved ahead; queued images are already reserved for execution.'
+    jumpButton.disabled = promotableCount === 0
+    jumpButton.title = promotableCount
+      ? 'Make the selected image(s) the next unreserved Conveyor work. Processed selections are re-queued as pending; already queued reservations stay fixed.'
+      : 'The selected image(s) are already reserved by queued ComfyUI executions.'
     installOwnedMenuAction(jumpButton, ctx, () => jumpContextTargets(node, clickedId))
     markPending.before(jumpButton)
   }
@@ -240,9 +243,7 @@ function ensureMenuObserver() {
       for (const added of record.addedNodes) {
         if (!(added instanceof Element)) continue
         if (added.matches('.bil-image-menu')) enhanceConveyorContextMenu(added)
-        for (const menu of added.querySelectorAll?.('.bil-image-menu') ?? []) {
-          enhanceConveyorContextMenu(menu)
-        }
+        for (const menu of added.querySelectorAll?.('.bil-image-menu') ?? []) enhanceConveyorContextMenu(menu)
       }
     }
   })
@@ -309,13 +310,7 @@ function installDragAutoscroll(ctx, ext) {
 
     const rect = ctx.list.getBoundingClientRect()
     const config = dragEdgeAutoscrollConfig(ctx.list.clientHeight)
-    const speed = dragEdgeAutoscrollSpeed(
-      pointer.clientY,
-      rect.top,
-      rect.bottom,
-      config.edgeSize,
-      config.maxSpeed
-    )
+    const speed = dragEdgeAutoscrollSpeed(pointer.clientY, rect.top, rect.bottom, config.edgeSize, config.maxSpeed)
     if (!speed) {
       stop()
       return
@@ -344,9 +339,7 @@ function installDragAutoscroll(ctx, ext) {
     const config = dragEdgeAutoscrollConfig(ctx.list.clientHeight)
     const horizontal = event.clientX >= rect.left && event.clientX <= rect.right
     const verticalMargin = config.edgeSize * 0.35
-    const relevant = horizontal &&
-      event.clientY >= rect.top - verticalMargin &&
-      event.clientY <= rect.bottom + verticalMargin
+    const relevant = horizontal && event.clientY >= rect.top - verticalMargin && event.clientY <= rect.bottom + verticalMargin
     if (!relevant) {
       stop()
       return
@@ -354,6 +347,11 @@ function installDragAutoscroll(ctx, ext) {
     ext.queueQolDragPointer = {
       clientY: event.clientY,
       observedAt: globalThis.performance?.now?.() ?? Date.now()
+    }
+    const speed = dragEdgeAutoscrollSpeed(event.clientY, rect.top, rect.bottom, config.edgeSize, config.maxSpeed)
+    if (!speed) {
+      stop()
+      return
     }
     if (!ext.queueQolDragFrame) {
       ext.queueQolDragLastAt = 0

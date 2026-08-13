@@ -16,40 +16,48 @@ export function contextTargetIds(items, selectedIds, clickedId) {
 export function jumpPendingItemsToFront(items, selectedIds, clickedId) {
   const source = Array.isArray(items) ? items : []
   const targetIds = new Set(contextTargetIds(source, selectedIds, clickedId))
-  const firstPendingIndex = source.findIndex((item) => item?.status === 'pending')
-  if (firstPendingIndex < 0 || targetIds.size === 0) {
-    return { items: source.slice(), movedIds: [], changed: false, boundaryIndex: -1 }
+  if (!targetIds.size) {
+    return { items: source.slice(), movedIds: [], requeuedIds: [], changed: false, boundaryIndex: -1 }
   }
 
+  // Queued items are already reserved by queued ComfyUI executions and cannot be made to
+  // execute later by merely reordering the live Conveyor state. Leave them in place.
   const jumpers = source.filter((item) => (
-    item?.status === 'pending' && targetIds.has(String(item?.id ?? ''))
+    item?.status !== 'queued' && targetIds.has(String(item?.id ?? ''))
   ))
   if (!jumpers.length) {
-    return {
-      items: source.slice(),
-      movedIds: [],
-      changed: false,
-      boundaryIndex: firstPendingIndex
-    }
+    return { items: source.slice(), movedIds: [], requeuedIds: [], changed: false, boundaryIndex: -1 }
   }
 
   const jumperIds = new Set(jumpers.map((item) => String(item.id)))
-  let insertionIndex = 0
-  for (let index = 0; index < firstPendingIndex; index += 1) {
-    if (!jumperIds.has(String(source[index]?.id ?? ''))) insertionIndex += 1
+  const firstPendingIndex = source.findIndex((item) => item?.status === 'pending')
+  const remainder = source.filter((item) => !jumperIds.has(String(item?.id ?? '')))
+
+  let insertionIndex = remainder.length
+  if (firstPendingIndex >= 0) {
+    insertionIndex = 0
+    for (let index = 0; index < firstPendingIndex; index += 1) {
+      if (!jumperIds.has(String(source[index]?.id ?? ''))) insertionIndex += 1
+    }
   }
 
-  const remainder = source.filter((item) => !jumperIds.has(String(item?.id ?? '')))
+  const requeuedIds = []
+  const normalizedJumpers = jumpers.map((item) => {
+    if (item?.status === 'pending') return item
+    requeuedIds.push(String(item.id))
+    return { ...item, status: 'pending' }
+  })
   const next = [
     ...remainder.slice(0, insertionIndex),
-    ...jumpers,
+    ...normalizedJumpers,
     ...remainder.slice(insertionIndex)
   ]
-  const changed = next.some((item, index) => item !== source[index])
+  const orderChanged = next.some((item, index) => String(item?.id ?? '') !== String(source[index]?.id ?? ''))
   return {
     items: next,
-    movedIds: jumpers.map((item) => String(item.id)),
-    changed,
+    movedIds: normalizedJumpers.map((item) => String(item.id)),
+    requeuedIds,
+    changed: orderChanged || requeuedIds.length > 0,
     boundaryIndex: insertionIndex
   }
 }

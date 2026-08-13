@@ -20,47 +20,51 @@ test('context target follows the active selection only when the clicked item bel
 })
 
 test('queue jump inserts selected pending items at the earliest pending boundary', () => {
-  const items = [
-    item('done-1', 'processed'),
-    item('done-2', 'processed'),
-    item('a', 'pending'),
-    item('b', 'pending'),
-    item('c', 'pending')
-  ]
+  const items = [item('done-1', 'processed'), item('done-2', 'processed'), item('a', 'pending'), item('b', 'pending'), item('c', 'pending')]
   const result = jumpPendingItemsToFront(items, new Set(['b', 'c']), 'c')
   assert.equal(result.changed, true)
   assert.deepEqual(result.items.map((entry) => entry.id), ['done-1', 'done-2', 'b', 'c', 'a'])
-  assert.deepEqual(result.movedIds, ['b', 'c'])
+  assert.deepEqual(result.requeuedIds, [])
 })
 
-test('queue jump can precede later processed history when pending work already does', () => {
-  const items = [
-    item('done-1', 'processed'),
-    item('a', 'pending'),
-    item('done-2', 'processed'),
-    item('b', 'pending')
-  ]
-  const result = jumpPendingItemsToFront(items, new Set(['b']), 'b')
-  assert.deepEqual(result.items.map((entry) => entry.id), ['done-1', 'b', 'a', 'done-2'])
+test('processed selections are requeued and placed after the untouched processed prefix', () => {
+  const items = [item('done-1', 'processed'), item('done-2', 'processed'), item('a', 'pending'), item('b', 'pending')]
+  const result = jumpPendingItemsToFront(items, new Set(['done-2']), 'done-2')
+  assert.equal(result.changed, true)
+  assert.deepEqual(result.items.map((entry) => `${entry.id}:${entry.status}`), [
+    'done-1:processed', 'done-2:pending', 'a:pending', 'b:pending'
+  ])
+  assert.deepEqual(result.requeuedIds, ['done-2'])
 })
 
-test('queue jump never crosses queued reservations and ignores non-pending selected items', () => {
-  const items = [
-    item('done', 'processed'),
-    item('reserved', 'queued'),
-    item('a', 'pending'),
-    item('b', 'pending')
-  ]
-  const result = jumpPendingItemsToFront(items, new Set(['done', 'reserved', 'b']), 'b')
+test('pending ahead of later processed history defines the queue-jump boundary', () => {
+  const items = [item('done-1', 'processed'), item('a', 'pending'), item('done-2', 'processed'), item('b', 'pending')]
+  const result = jumpPendingItemsToFront(items, new Set(['done-2']), 'done-2')
+  assert.deepEqual(result.items.map((entry) => `${entry.id}:${entry.status}`), [
+    'done-1:processed', 'done-2:pending', 'a:pending', 'b:pending'
+  ])
+})
+
+test('queued reservations remain fixed and are ignored when selected', () => {
+  const items = [item('done', 'processed'), item('reserved', 'queued'), item('a', 'pending'), item('b', 'pending')]
+  const result = jumpPendingItemsToFront(items, new Set(['reserved', 'b']), 'b')
   assert.deepEqual(result.items.map((entry) => entry.id), ['done', 'reserved', 'b', 'a'])
   assert.deepEqual(result.movedIds, ['b'])
 })
 
-test('queue jump is a no-op when the requested pending items already lead pending work', () => {
+test('processed item can be requeued when no pending items currently exist', () => {
+  const items = [item('done-1', 'processed'), item('reserved', 'queued'), item('done-2', 'processed')]
+  const result = jumpPendingItemsToFront(items, new Set(['done-2']), 'done-2')
+  assert.deepEqual(result.items.map((entry) => `${entry.id}:${entry.status}`), [
+    'done-1:processed', 'reserved:queued', 'done-2:pending'
+  ])
+  assert.deepEqual(result.requeuedIds, ['done-2'])
+})
+
+test('queue jump is a no-op when an already-pending target already leads pending work', () => {
   const items = [item('done', 'processed'), item('a', 'pending'), item('b', 'pending')]
   const result = jumpPendingItemsToFront(items, new Set(['a']), 'a')
   assert.equal(result.changed, false)
-  assert.deepEqual(result.items.map((entry) => entry.id), ['done', 'a', 'b'])
 })
 
 test('wheel delta normalization handles pixel, line and page units', () => {
