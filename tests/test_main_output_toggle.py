@@ -60,11 +60,19 @@ def reference(name):
     }
 
 
-def snapshot(*, main=False, refs=()):
-    return json.dumps({
+def snapshot(*, main=False, refs=(), queue_slots=None, members=()):
+    payload = {
         "main_output_enabled": main,
         "reference_output_slots": list(refs),
-    })
+    }
+    if queue_slots is not None:
+        payload["queue_output_slots"] = list(queue_slots)
+    members = list(members)
+    if members:
+        payload.update(members[0])
+        if len(members) > 1:
+            payload["items"] = members
+    return json.dumps(payload)
 
 
 class MainOutputToggleTest(unittest.TestCase):
@@ -90,116 +98,166 @@ class MainOutputToggleTest(unittest.TestCase):
         EXISTING_ANNOTATED.add(annotated)
         return path
 
+    def materialize_items(self, *entries):
+        for entry in entries:
+            self.materialize(entry["annotated"], entry["id"].encode())
+
     def test_legacy_snapshot_keeps_main_enabled(self):
         state = conveyor._normalize_state(self.state())
         self.assertTrue(conveyor._main_output_enabled(state, ""))
-        self.assertTrue(conveyor._main_output_enabled(state, json.dumps({"reference_output_slots": []})))
+        self.assertEqual((0,), conveyor._connected_queue_output_slots(state, ""))
+        self.assertEqual(
+            (0,),
+            conveyor._connected_queue_output_slots(
+                state, json.dumps({"reference_output_slots": []})
+            ),
+        )
 
-    def test_malformed_main_snapshot_is_rejected(self):
+    def test_malformed_main_snapshot_is_rejected_for_legacy_prompt(self):
         raw = self.state(output_mode="persistent_refs")
         payload = json.dumps({"main_output_enabled": 0, "reference_output_slots": []})
         self.assertEqual(
             "Image Conveyor: main output enable snapshot is invalid.",
             conveyor.ImageConveyor.VALIDATE_INPUTS(raw, queue_item_json=payload),
         )
-        expected = conveyor._unresolved_change_hash(
-            conveyor._normalize_state(raw),
-            "snapshot|Image Conveyor: main output enable snapshot is invalid.",
-        )
-        first = conveyor.ImageConveyor.IS_CHANGED(raw, queue_item_json=payload)
-        self.assertEqual(expected, first)
+
+    def test_malformed_queue_output_snapshot_is_rejected(self):
+        raw = self.state(output_mode="persistent_refs")
+        payload = snapshot(main=False, refs=(), queue_slots=[2])
         self.assertEqual(
-            first,
-            conveyor.ImageConveyor.IS_CHANGED(raw, queue_item_json=payload),
+            "Image Conveyor: queue output connection snapshot is invalid.",
+            conveyor.ImageConveyor.VALIDATE_INPUTS(raw, queue_item_json=payload),
         )
 
-    def test_disabled_main_validates_and_executes_with_empty_conveyor(self):
+    def test_reference_only_executes_with_empty_conveyor(self):
         raw = self.state(output_mode="persistent_refs")
-        queued = snapshot(main=False, refs=())
+        queued = snapshot(main=False, refs=(), queue_slots=[])
         self.assertIs(True, conveyor.ImageConveyor.VALIDATE_INPUTS(raw, queue_item_json=queued))
 
         output = conveyor.ImageConveyor().load_next(raw, queue_item_json=queued)
         result = output["result"]
-        self.assertEqual(14, len(result))
+        self.assertEqual(15, len(result))
         self.assertIsNone(result[0])
         self.assertIsNone(result[1])
         self.assertEqual("", result[2])
         self.assertEqual(0, result[3])
         self.assertEqual(0, result[4])
         self.assertEqual("", result[5])
-        self.assertEqual([None] * 8, list(result[6:]))
+        self.assertEqual([None] * 8, list(result[6:14]))
+        self.assertIsNone(result[14])
         self.assertEqual({}, output["ui"])
         self.assertEqual([], FakeLoadImage.calls)
 
-    def test_disabled_main_does_not_select_decode_or_consume_pending_image(self):
-        raw = self.state([item("A")], output_mode="persistent_refs")
-        queued = snapshot(main=False, refs=())
+    def test_image_only_uses_first_pending_queue_image(self):
+        first = item("A")
+        self.materialize_items(first)
+        raw = self.state([first], output_mode="persistent_refs")
+        queued = snapshot(main=True, refs=(), queue_slots=[0], members=[first])
+
         output = conveyor.ImageConveyor().load_next(raw, queue_item_json=queued)
+        result = output["result"]
+        self.assertEqual("image:A.png [input]", result[0])
+        self.assertEqual("mask:A.png [input]", result[1])
+        self.assertEqual("A.png [input]", result[2])
+        self.assertEqual(1, result[3])
+        self.assertIsNone(result[14])
+        self.assertEqual(["A.png [input]"], FakeLoadImage.calls)
 
-        self.assertIsNone(output["result"][0])
-        self.assertEqual(1, output["result"][4])
-        self.assertEqual({}, output["ui"])
-        self.assertEqual([], FakeLoadImage.calls)
+    def test_last_frame_only_uses_first_pending_and_keeps_main_metadata_neutral(self):
+        first = item("A")
+        self.materialize_items(first)
+        raw = self.state([first], output_mode="persistent_refs")
+        queued = snapshot(main=False, refs=(), queue_slots=[1], members=[first])
 
-    def test_disabled_main_still_validates_and_loads_active_references(self):
+        output = conveyor.ImageConveyor().load_next(raw, queue_item_json=queued)
+        result = output["result"]
+        self.assertIsNone(result[0])
+        self.assertIsNone(result[1])
+        self.assertEqual("", result[2])
+        self.assertEqual(0, result[3])
+        self.assertEqual("", result[5])
+        self.assertEqual("image:A.png [input]", result[14])
+        self.assertEqual(["A.png [input]"], FakeLoadImage.calls)
+        delta = json.loads(output["ui"]["batch_image_loader_delta"][0])
+        self.assertEqual(["A"], [entry["id"] for entry in delta["processed_items"]])
+
+    def test_image_and_last_frame_reserve_and_map_two_images(self):
+        first = item("A")
+        second = item("B")
+        self.materialize_items(first, second)
+        raw = self.state([first, second], output_mode="persistent_refs")
+        queued = snapshot(
+            main=True,
+            refs=(),
+            queue_slots=[0, 1],
+            members=[first, second],
+        )
+
+        self.assertIs(True, conveyor.ImageConveyor.VALIDATE_INPUTS(raw, queue_item_json=queued))
+        output = conveyor.ImageConveyor().load_next(raw, queue_item_json=queued)
+        result = output["result"]
+        self.assertEqual("image:A.png [input]", result[0])
+        self.assertEqual("mask:A.png [input]", result[1])
+        self.assertEqual("image:B.png [input]", result[14])
+        self.assertEqual(0, result[4])
+        self.assertEqual(["A.png [input]", "B.png [input]"], FakeLoadImage.calls)
+        delta = json.loads(output["ui"]["batch_image_loader_delta"][0])
+        self.assertEqual(["A", "B"], [entry["id"] for entry in delta["processed_items"]])
+
+    def test_two_queue_roles_require_two_available_images(self):
+        first = item("A")
+        raw = self.state([first], output_mode="persistent_refs")
+        queued = snapshot(main=True, refs=(), queue_slots=[0, 1])
+        self.assertEqual(
+            "Image Conveyor: 2 images per execution requested, but only 1 eligible queue images are available.",
+            conveyor.ImageConveyor.VALIDATE_INPUTS(raw, queue_item_json=queued),
+        )
+
+    def test_reference_only_still_validates_and_loads_active_references(self):
         ref = reference("R1")
         self.materialize(ref["annotated"], b"ref")
-        raw = self.state(
-            [],
-            output_mode="persistent_refs",
-            reference_slots=[ref],
-        )
-        queued = snapshot(main=False, refs=(1,))
+        raw = self.state([], output_mode="persistent_refs", reference_slots=[ref])
+        queued = snapshot(main=False, refs=(1,), queue_slots=[])
         self.assertIs(True, conveyor.ImageConveyor.VALIDATE_INPUTS(raw, queue_item_json=queued))
 
         result = conveyor.ImageConveyor().load_next(raw, queue_item_json=queued)["result"]
         self.assertIsNone(result[0])
         self.assertEqual("image:R1.png [input]", result[6])
+        self.assertIsNone(result[14])
         self.assertEqual(["R1.png [input]"], FakeLoadImage.calls)
 
-    def test_disabled_main_reports_missing_active_reference_without_requiring_queue(self):
-        ref = reference("missing")
-        raw = self.state([], output_mode="persistent_refs", reference_slots=[ref])
-        self.assertEqual(
-            "Image Conveyor: reference slot 1 is missing 'missing.png [input]'.",
-            conveyor.ImageConveyor.VALIDATE_INPUTS(
-                raw,
-                queue_item_json=snapshot(main=False, refs=(1,)),
-            ),
+    def test_change_hash_distinguishes_image_and_last_frame_roles(self):
+        first = item("A")
+        self.materialize_items(first)
+        raw = self.state([first], output_mode="persistent_refs")
+        image_only = snapshot(main=True, refs=(), queue_slots=[0], members=[first])
+        last_only = snapshot(main=False, refs=(), queue_slots=[1], members=[first])
+        self.assertNotEqual(
+            conveyor.ImageConveyor.IS_CHANGED(raw, queue_item_json=image_only),
+            conveyor.ImageConveyor.IS_CHANGED(raw, queue_item_json=last_only),
         )
 
-    def test_disabled_main_change_hash_ignores_conveyor_items_and_tracks_reference(self):
-        ref = reference("R1")
-        ref_path = self.materialize(ref["annotated"], b"ref")
-        queued = snapshot(main=False, refs=(1,))
-        first = self.state([], output_mode="persistent_refs", reference_slots=[ref])
-        second = self.state(
-            [item("A"), item("B", status="processed")],
-            output_mode="persistent_refs",
-            reference_slots=[ref],
-        )
-        baseline = conveyor.ImageConveyor.IS_CHANGED(first, queue_item_json=queued)
-        self.assertEqual(baseline, conveyor.ImageConveyor.IS_CHANGED(second, queue_item_json=queued))
-        ref_path.write_bytes(b"changed")
-        self.assertNotEqual(baseline, conveyor.ImageConveyor.IS_CHANGED(first, queue_item_json=queued))
-
-    def test_queue_group_mode_ignores_main_disable_snapshot(self):
-        entry = item("A")
+    def test_queue_group_preserves_reference_mapping_and_aliases_second_as_last_frame(self):
+        first = item("A")
+        second = item("B")
+        third = item("C")
+        self.materialize_items(first, second, third)
         raw = self.state(
-            [entry],
+            [first, second, third],
             output_mode="queue_group",
-            images_per_execution=1,
+            images_per_execution=3,
         )
-        self.assertTrue(conveyor._main_output_enabled(
-            conveyor._normalize_state(raw),
-            snapshot(main=False, refs=()),
-        ))
-        result = conveyor.ImageConveyor().load_next(
-            raw,
-            queue_item_json=snapshot(main=False, refs=()),
-        )["result"]
+        queued = json.dumps({
+            **first,
+            "items": [first, second, third],
+            "main_output_enabled": False,
+            "reference_output_slots": [],
+        })
+        result = conveyor.ImageConveyor().load_next(raw, queue_item_json=queued)["result"]
         self.assertEqual("image:A.png [input]", result[0])
-        self.assertEqual(["A.png [input]"], FakeLoadImage.calls)
+        self.assertEqual("image:B.png [input]", result[6])
+        self.assertEqual("image:C.png [input]", result[7])
+        self.assertEqual("image:B.png [input]", result[14])
 
 
 if __name__ == "__main__":
