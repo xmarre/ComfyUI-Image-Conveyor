@@ -130,12 +130,6 @@ function preserveStateValue(node, stateWidget) {
   return stateWidget.value
 }
 
-function preserveQueueValue(node, queueWidget) {
-  const next = runtimeQueueValue(node, queueWidget.value)
-  if (typeof next === 'string' && next !== queueWidget.value) queueWidget.value = next
-  return queueWidget.value
-}
-
 function wrapSerializer(widget, transform) {
   const previousSerializeValue = widget.serializeValue
   widget.serializeValue = function (...args) {
@@ -157,9 +151,7 @@ function currentQueueState(node, stateWidget) {
   }
 }
 
-function replacePersistentReservation(node, stateWidget, queueWidget) {
-  if (outputMode(node) !== OUTPUT_MODE_PERSISTENT) return
-
+function buildPersistentQueueValue(node, stateWidget) {
   const queueSlots = connectedQueueSlots(node)
   const state = currentQueueState(node, stateWidget)
   let reservation = null
@@ -174,7 +166,17 @@ function replacePersistentReservation(node, stateWidget, queueWidget) {
   }
 
   const raw = reservation ? JSON.stringify(reservation) : '{}'
-  const next = runtimeQueueValue(node, raw)
+  return runtimeQueueValue(node, raw)
+}
+
+function authoritativeQueueValue(node, stateWidget, raw) {
+  if (outputMode(node) !== OUTPUT_MODE_PERSISTENT) return runtimeQueueValue(node, raw)
+  return buildPersistentQueueValue(node, stateWidget)
+}
+
+function replacePersistentReservation(node, stateWidget, queueWidget) {
+  if (outputMode(node) !== OUTPUT_MODE_PERSISTENT) return
+  const next = buildPersistentQueueValue(node, stateWidget)
   queueWidget.value = next
   queueWidget.callback?.(next)
 }
@@ -213,7 +215,23 @@ function installNode(node, attempts = 0) {
     replacePersistentReservation(node, stateWidget, queueWidget)
     return result
   }
-  wrapSerializer(queueWidget, (raw) => runtimeQueueValue(node, raw))
+
+  // Other extensions from older revisions may also wrap beforeQueued and can
+  // rewrite the transient widget after our wrapper. Rebuild the reservation at
+  // the actual serialization boundary, where the API prompt gets its value.
+  wrapSerializer(
+    queueWidget,
+    (raw) => authoritativeQueueValue(node, stateWidget, raw)
+  )
+
+  // afterQueued marks the frozen reservation members as queued. Rebuild the
+  // authoritative value immediately before that lifecycle hook too, so wrapper
+  // registration order cannot make last_frame-only mode lose its reservation.
+  const previousAfterQueued = queueWidget.afterQueued
+  queueWidget.afterQueued = function (...args) {
+    replacePersistentReservation(node, stateWidget, queueWidget)
+    return previousAfterQueued?.apply(this, args)
+  }
 }
 
 app.registerExtension({
