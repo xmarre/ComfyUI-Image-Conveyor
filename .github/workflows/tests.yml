@@ -54,6 +54,8 @@ jobs:
           node --check web/image_conveyor_middle_autoscroll_math.mjs
           node --check web/image_conveyor_reference_toggles.js
           node --check web/image_conveyor_reference_toggles_math.mjs
+          node --check web/image_conveyor_reference_branch_pruning.js
+          node --check web/image_conveyor_reference_branch_pruning_math.mjs
 
       - name: Check Python syntax
         run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py image_conveyor_library_ops.py image_conveyor_drag_ops.py image_conveyor_drag_v2_ops.py
