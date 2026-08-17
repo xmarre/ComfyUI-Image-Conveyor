@@ -1,11 +1,15 @@
 import { app } from '../../scripts/app.js'
+import { snapshotReferenceOutputConnections } from './image_conveyor_math.mjs?v=64d0259bdfdbb853'
 import {
+  applyMainOutputToggleToReservation,
   applyReferenceToggleMaskToReservation,
   calculateReferenceToggleRect,
+  normalizeMainOutputEnabled,
   normalizeReferenceToggleMask,
   referenceToggleHit,
+  toggleMainOutputEnabled,
   toggleReferenceToggleMask
-} from './image_conveyor_reference_toggles_math.mjs?v=20260817a'
+} from './image_conveyor_reference_toggles_math.mjs?v=20260817b'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.ReferenceSlotToggles'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -13,7 +17,8 @@ const QUEUE_WIDGET = 'queue_item_json'
 const OUTPUT_MODE_PERSISTENT = 'persistent_refs'
 const REFERENCE_SLOT_COUNT = 8
 const REFERENCE_OUTPUT_START_INDEX = 6
-const PROPERTY_KEY = 'image_conveyor_reference_enabled'
+const REFERENCE_PROPERTY_KEY = 'image_conveyor_reference_enabled'
+const MAIN_PROPERTY_KEY = 'image_conveyor_main_enabled'
 const INSTALL_RETRY_LIMIT = 120
 const patchedNodes = new Set()
 
@@ -22,17 +27,38 @@ function getWidget(node, name) {
 }
 
 function currentMask(node) {
-  return normalizeReferenceToggleMask(node?.properties?.[PROPERTY_KEY], REFERENCE_SLOT_COUNT)
+  return normalizeReferenceToggleMask(node?.properties?.[REFERENCE_PROPERTY_KEY], REFERENCE_SLOT_COUNT)
+}
+
+function currentMainEnabled(node) {
+  return normalizeMainOutputEnabled(node?.properties?.[MAIN_PROPERTY_KEY])
+}
+
+function ensureProperties(node) {
+  if (!node.properties || typeof node.properties !== 'object') node.properties = {}
+  return node.properties
+}
+
+function commitProperties(node) {
+  node.graph?.change?.()
+  node.setDirtyCanvas?.(true, true)
 }
 
 function setMask(node, mask) {
   if (!node) return
-  if (!node.properties || typeof node.properties !== 'object') node.properties = {}
+  const properties = ensureProperties(node)
   const normalized = normalizeReferenceToggleMask(mask, REFERENCE_SLOT_COUNT)
-  if (normalized.every(Boolean)) delete node.properties[PROPERTY_KEY]
-  else node.properties[PROPERTY_KEY] = normalized
-  node.graph?.change?.()
-  node.setDirtyCanvas?.(true, true)
+  if (normalized.every(Boolean)) delete properties[REFERENCE_PROPERTY_KEY]
+  else properties[REFERENCE_PROPERTY_KEY] = normalized
+  commitProperties(node)
+}
+
+function setMainEnabled(node, enabled) {
+  if (!node) return
+  const properties = ensureProperties(node)
+  if (normalizeMainOutputEnabled(enabled)) delete properties[MAIN_PROPERTY_KEY]
+  else properties[MAIN_PROPERTY_KEY] = false
+  commitProperties(node)
 }
 
 function outputMode(node) {
@@ -47,15 +73,21 @@ function outputMode(node) {
   }
 }
 
-function referenceOutputIndex(node, slotIndex) {
-  const expectedName = `ref_image_${slotIndex + 1}`
+function outputIndexByName(node, expectedName, fallback = -1) {
   const outputs = Array.isArray(node?.outputs) ? node.outputs : []
   const namedIndex = outputs.findIndex((output) => (
     String(output?.name ?? '') === expectedName || String(output?.label ?? '') === expectedName
   ))
   if (namedIndex >= 0) return namedIndex
-  const fallback = REFERENCE_OUTPUT_START_INDEX + slotIndex
-  return fallback < outputs.length ? fallback : -1
+  return fallback >= 0 && fallback < outputs.length ? fallback : -1
+}
+
+function referenceOutputIndex(node, slotIndex) {
+  return outputIndexByName(
+    node,
+    `ref_image_${slotIndex + 1}`,
+    REFERENCE_OUTPUT_START_INDEX + slotIndex
+  )
 }
 
 function roundedRect(context, x, y, width, height, radius) {
@@ -88,46 +120,59 @@ function drawToggle(context, rect, enabled, hovered) {
   context.fill()
 }
 
-function drawReferenceToggles(node, context) {
+function outputToggleRect(node, context, outputIndex, shelfRight) {
+  if (outputIndex < 0 || typeof node.getConnectionPos !== 'function') return null
+  const output = node.outputs?.[outputIndex]
+  if (!output) return null
+  const graphPosition = [0, 0]
+  const returned = node.getConnectionPos(false, outputIndex, graphPosition) ?? graphPosition
+  const nodeX = Number(node.pos?.[0] || 0)
+  const nodeY = Number(node.pos?.[1] || 0)
+  const socketX = Number(returned?.[0] ?? graphPosition[0]) - nodeX
+  const centerY = Number(returned?.[1] ?? graphPosition[1]) - nodeY
+  if (!Number.isFinite(socketX) || !Number.isFinite(centerY)) return null
+  const label = String(output.label || output.name || '')
+  const labelWidth = context.measureText(label).width
+  const labelLeft = socketX - 11 - labelWidth
+  return calculateReferenceToggleRect(shelfRight, labelLeft, centerY)
+}
+
+function expandedHitbox(index, rect) {
+  return {
+    index,
+    x: rect.x - 3,
+    y: rect.y - 3,
+    width: rect.width + 6,
+    height: rect.height + 6
+  }
+}
+
+function drawOutputToggles(node, context) {
   const ctx = node?.__bil
   const ext = ctx?.referenceToggles
   if (!ctx || !ext || ctx.removed) return
   ext.hitboxes = []
+  ext.mainHitbox = null
   if (node.flags?.collapsed || outputMode(node) !== OUTPUT_MODE_PERSISTENT) return
   const shelf = ctx.referenceShelfLayout
   if (!shelf?.usable || typeof node.getConnectionPos !== 'function') return
 
-  const mask = currentMask(node)
-  const nodeX = Number(node.pos?.[0] || 0)
-  const nodeY = Number(node.pos?.[1] || 0)
   context.save()
+
+  const mainIndex = outputIndexByName(node, 'image', 0)
+  const mainRect = outputToggleRect(node, context, mainIndex, shelf.right)
+  if (mainRect) {
+    ext.mainHitbox = expandedHitbox(0, mainRect)
+    drawToggle(context, mainRect, currentMainEnabled(node), ext.hoverTarget === 'main')
+  }
+
+  const mask = currentMask(node)
   for (let index = 0; index < REFERENCE_SLOT_COUNT; index += 1) {
     const outputIndex = referenceOutputIndex(node, index)
-    if (outputIndex < 0) continue
-    const output = node.outputs?.[outputIndex]
-    if (!output) continue
-
-    const graphPosition = [0, 0]
-    const returned = node.getConnectionPos(false, outputIndex, graphPosition) ?? graphPosition
-    const socketX = Number(returned?.[0] ?? graphPosition[0]) - nodeX
-    const centerY = Number(returned?.[1] ?? graphPosition[1]) - nodeY
-    if (!Number.isFinite(socketX) || !Number.isFinite(centerY)) continue
-
-    const label = String(output.label || output.name || `ref_image_${index + 1}`)
-    const labelWidth = context.measureText(label).width
-    const labelLeft = socketX - 11 - labelWidth
-    const rect = calculateReferenceToggleRect(shelf.right, labelLeft, centerY)
+    const rect = outputToggleRect(node, context, outputIndex, shelf.right)
     if (!rect) continue
-
-    const hitbox = {
-      index,
-      x: rect.x - 3,
-      y: rect.y - 3,
-      width: rect.width + 6,
-      height: rect.height + 6
-    }
-    ext.hitboxes.push(hitbox)
-    drawToggle(context, rect, mask[index], ext.hoverIndex === index)
+    ext.hitboxes.push(expandedHitbox(index, rect))
+    drawToggle(context, rect, mask[index], ext.hoverTarget === `reference:${index}`)
   }
   context.restore()
 }
@@ -152,7 +197,12 @@ function toggleAtEvent(node, event, localPosition = null) {
   const ext = node?.__bil?.referenceToggles
   if (!ext || outputMode(node) !== OUTPUT_MODE_PERSISTENT) return null
   const point = eventLocalPoint(node, event, localPosition)
-  return point ? referenceToggleHit(ext.hitboxes, point.x, point.y) : null
+  if (!point) return null
+  if (referenceToggleHit(ext.mainHitbox ? [ext.mainHitbox] : [], point.x, point.y) != null) {
+    return { kind: 'main' }
+  }
+  const referenceIndex = referenceToggleHit(ext.hitboxes, point.x, point.y)
+  return referenceIndex == null ? null : { kind: 'reference', index: referenceIndex }
 }
 
 function clearTransientQueueSnapshot(node) {
@@ -162,40 +212,62 @@ function clearTransientQueueSnapshot(node) {
   queueWidget.callback?.('')
 }
 
-function toggleSlot(node, slotIndex) {
-  if (!Number.isInteger(slotIndex) || slotIndex < 0 || slotIndex >= REFERENCE_SLOT_COUNT) return false
-  const next = toggleReferenceToggleMask(currentMask(node), slotIndex, REFERENCE_SLOT_COUNT)
+function toggleTarget(node, target) {
+  if (target?.kind === 'main') {
+    setMainEnabled(node, toggleMainOutputEnabled(currentMainEnabled(node)))
+    clearTransientQueueSnapshot(node)
+    return true
+  }
+  if (
+    target?.kind !== 'reference' ||
+    !Number.isInteger(target.index) ||
+    target.index < 0 ||
+    target.index >= REFERENCE_SLOT_COUNT
+  ) return false
+  const next = toggleReferenceToggleMask(currentMask(node), target.index, REFERENCE_SLOT_COUNT)
   setMask(node, next)
   clearTransientQueueSnapshot(node)
   return true
 }
 
-function applyToggleMaskToQueuedSnapshot(node, queueWidget) {
-  if (!queueWidget || typeof queueWidget.value !== 'string' || !queueWidget.value.trim()) return
-  let payload
+function parseQueuedPayload(queueWidget) {
+  if (!queueWidget || typeof queueWidget.value !== 'string' || !queueWidget.value.trim()) return null
   try {
-    payload = JSON.parse(queueWidget.value)
+    const payload = JSON.parse(queueWidget.value)
+    return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null
   } catch {
+    return null
+  }
+}
+
+function writeQueuedPayload(queueWidget, payload) {
+  const value = JSON.stringify(payload)
+  queueWidget.value = value
+  queueWidget.callback?.(value)
+}
+
+function applyOutputTogglesToQueuedSnapshot(node, queueWidget) {
+  if (outputMode(node) !== OUTPUT_MODE_PERSISTENT || !queueWidget) return
+  const mainEnabled = currentMainEnabled(node)
+  let payload = parseQueuedPayload(queueWidget)
+
+  if (!mainEnabled) {
+    // Rebuild a reference-only snapshot. This intentionally discards any queue
+    // reservation produced by the core beforeQueued hook, so afterQueued has no
+    // members to mark as queued and the backend has no image to consume.
+    payload = snapshotReferenceOutputConnections({}, OUTPUT_MODE_PERSISTENT, node.outputs)
+  } else if (!payload) {
     return
   }
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return
-  if (!Object.hasOwn(payload, 'reference_output_slots')) return
 
-  const masked = applyReferenceToggleMaskToReservation(
+  payload = applyReferenceToggleMaskToReservation(
     payload,
     currentMask(node),
     REFERENCE_SLOT_COUNT
   )
-  if (masked === payload || !Array.isArray(masked?.reference_output_slots)) return
-  if (
-    Array.isArray(payload.reference_output_slots) &&
-    masked.reference_output_slots.length === payload.reference_output_slots.length &&
-    masked.reference_output_slots.every((slot, index) => slot === payload.reference_output_slots[index])
-  ) return
-
-  const value = JSON.stringify(masked)
-  queueWidget.value = value
-  queueWidget.callback?.(value)
+  payload = applyMainOutputToggleToReservation(payload, mainEnabled)
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return
+  writeQueuedPayload(queueWidget, payload)
 }
 
 function wrapBeforeQueued(node, queueWidget, ext) {
@@ -203,7 +275,7 @@ function wrapBeforeQueued(node, queueWidget, ext) {
   ext.previousBeforeQueued = previous
   queueWidget.beforeQueued = function (...args) {
     const result = previous?.apply(this, args)
-    applyToggleMaskToQueuedSnapshot(node, queueWidget)
+    applyOutputTogglesToQueuedSnapshot(node, queueWidget)
     return result
   }
 }
@@ -222,7 +294,8 @@ function installNode(node, attempts = 0) {
 
   const ext = {
     hitboxes: [],
-    hoverIndex: null,
+    mainHitbox: null,
+    hoverTarget: null,
     previousBeforeQueued: null
   }
   ctx.referenceToggles = ext
@@ -231,15 +304,15 @@ function installNode(node, attempts = 0) {
   const previousDrawForeground = node.onDrawForeground
   node.onDrawForeground = function (context, ...args) {
     const result = previousDrawForeground?.call(this, context, ...args)
-    drawReferenceToggles(node, context)
+    drawOutputToggles(node, context)
     return result
   }
 
   const previousMouseDown = node.onMouseDown
   node.onMouseDown = function (event, localPosition, graphCanvas) {
-    const slotIndex = toggleAtEvent(node, event, localPosition)
-    if (slotIndex != null && event?.button === 0) {
-      toggleSlot(node, slotIndex)
+    const target = toggleAtEvent(node, event, localPosition)
+    if (target && event?.button === 0) {
+      toggleTarget(node, target)
       event.preventDefault?.()
       event.stopPropagation?.()
       event.stopImmediatePropagation?.()
@@ -250,9 +323,14 @@ function installNode(node, attempts = 0) {
 
   const previousMouseMove = node.onMouseMove
   node.onMouseMove = function (event, localPosition, graphCanvas) {
-    const nextHover = toggleAtEvent(node, event, localPosition)
-    if (ext.hoverIndex !== nextHover) {
-      ext.hoverIndex = nextHover
+    const target = toggleAtEvent(node, event, localPosition)
+    const nextHover = target?.kind === 'main'
+      ? 'main'
+      : target?.kind === 'reference'
+        ? `reference:${target.index}`
+        : null
+    if (ext.hoverTarget !== nextHover) {
+      ext.hoverTarget = nextHover
       node.setDirtyCanvas?.(true, false)
     }
     return previousMouseMove?.call(this, event, localPosition, graphCanvas)
@@ -260,8 +338,8 @@ function installNode(node, attempts = 0) {
 
   const previousMouseLeave = node.onMouseLeave
   node.onMouseLeave = function (...args) {
-    if (ext.hoverIndex != null) {
-      ext.hoverIndex = null
+    if (ext.hoverTarget != null) {
+      ext.hoverTarget = null
       node.setDirtyCanvas?.(true, false)
     }
     return previousMouseLeave?.apply(this, args)
@@ -272,7 +350,8 @@ function installNode(node, attempts = 0) {
     patchedNodes.delete(node)
     if (ctx.referenceToggles === ext) ctx.referenceToggles = null
     ext.hitboxes = []
-    ext.hoverIndex = null
+    ext.mainHitbox = null
+    ext.hoverTarget = null
     return previousRemoved?.apply(this, args)
   }
 
