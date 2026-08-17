@@ -6,6 +6,7 @@ import {
   applyReferenceToggleMaskToReservation,
   calculateReferenceToggleRect,
   filterReferenceOutputSlotsByToggleMask,
+  inputRequiredFromNodeDef,
   normalizeMainOutputEnabled,
   normalizeReferenceToggleMask,
   pruneDisabledOutputBranches,
@@ -76,7 +77,28 @@ test('disabling main output strips queue reservation members but preserves refer
   })
 })
 
-test('disabled main prompt pruning removes a required transform chain at an optional boundary', () => {
+test('object-info input contracts distinguish required and optional sockets', () => {
+  const h3Definition = {
+    input: {
+      required: {
+        model: ['MODEL', {}],
+        positive: ['CONDITIONING', {}]
+      },
+      optional: {
+        first_frame: ['IMAGE', {}],
+        reference_image_1: ['IMAGE', {}]
+      }
+    }
+  }
+
+  assert.equal(inputRequiredFromNodeDef(h3Definition, 'model'), true)
+  assert.equal(inputRequiredFromNodeDef(h3Definition, 'first_frame'), false)
+  assert.equal(inputRequiredFromNodeDef(h3Definition, 'reference_image_1'), false)
+  assert.equal(inputRequiredFromNodeDef(h3Definition, 'missing'), null)
+  assert.equal(inputRequiredFromNodeDef(null, 'first_frame'), null)
+})
+
+test('disabled main prompt pruning uses object-info contracts at the scaler-to-Continuum boundary', () => {
   const prompt = {
     '164': { inputs: {}, class_type: 'ImageConveyor' },
     '123': {
@@ -93,12 +115,32 @@ test('disabled main prompt pruning removes a required transform chain at an opti
     },
     '300': { inputs: {}, class_type: 'ModelLoader' }
   }
-  const required = new Set(['123:image', '200:model'])
+  const nodeDefs = {
+    ImageScaleToTotalPixelsX: {
+      input: {
+        required: { image: ['IMAGE', {}], megapixels: ['FLOAT', {}] },
+        optional: {}
+      }
+    },
+    H3ContinuumSamplerProduction: {
+      input: {
+        required: { model: ['MODEL', {}] },
+        optional: {
+          first_frame: ['IMAGE', {}],
+          reference_image_1: ['IMAGE', {}]
+        }
+      }
+    }
+  }
+  const resolve = (nodeId, inputName) => {
+    const classType = prompt[String(nodeId)]?.class_type
+    return inputRequiredFromNodeDef(nodeDefs[classType], inputName) ?? true
+  }
 
   pruneDisabledOutputBranches(
     prompt,
     [{ nodeId: '164', outputIndexes: [0, 1] }],
-    (nodeId, inputName) => required.has(`${nodeId}:${inputName}`)
+    resolve
   )
 
   assert.equal(prompt['123'], undefined)
