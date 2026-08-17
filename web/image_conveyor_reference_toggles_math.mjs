@@ -55,6 +55,87 @@ export function applyMainOutputToggleToReservation(payload, enabled) {
   return referenceOnly
 }
 
+function promptLink(value) {
+  if (!Array.isArray(value) || value.length !== 2) return null
+  const nodeId = String(value[0] ?? '')
+  const outputIndex = Number(value[1])
+  if (!nodeId || !Number.isInteger(outputIndex)) return null
+  return { nodeId, outputIndex }
+}
+
+/**
+ * Remove disabled output branches from a freshly serialized ComfyUI API prompt.
+ * Required consumers are pruned recursively until an optional input boundary is
+ * reached; optional inputs are simply omitted. The workflow graph is never
+ * mutated, so editor links remain connected and saved workflow topology is
+ * unchanged.
+ */
+export function pruneDisabledOutputBranches(
+  prompt,
+  disabledOutputs,
+  isRequiredInput = () => true
+) {
+  if (!prompt || typeof prompt !== 'object' || Array.isArray(prompt)) return prompt
+
+  const disabled = new Set()
+  for (const source of Array.isArray(disabledOutputs) ? disabledOutputs : []) {
+    const nodeId = String(source?.nodeId ?? '')
+    if (!nodeId) continue
+    for (const value of Array.isArray(source?.outputIndexes) ? source.outputIndexes : []) {
+      const outputIndex = Number(value)
+      if (Number.isInteger(outputIndex)) disabled.add(`${nodeId}:${outputIndex}`)
+    }
+  }
+  if (!disabled.size) return prompt
+
+  const deletionQueue = []
+  const queued = new Set()
+  const deleted = new Set()
+  const enqueue = (nodeId) => {
+    const id = String(nodeId)
+    if (!id || queued.has(id) || deleted.has(id)) return
+    queued.add(id)
+    deletionQueue.push(id)
+  }
+  const required = (nodeId, inputName) => {
+    try {
+      return isRequiredInput(String(nodeId), String(inputName)) !== false
+    } catch {
+      return true
+    }
+  }
+
+  for (const [nodeId, node] of Object.entries(prompt)) {
+    if (!node?.inputs || typeof node.inputs !== 'object') continue
+    for (const [inputName, value] of Object.entries(node.inputs)) {
+      const link = promptLink(value)
+      if (!link || !disabled.has(`${link.nodeId}:${link.outputIndex}`)) continue
+      if (required(nodeId, inputName)) enqueue(nodeId)
+      else delete node.inputs[inputName]
+    }
+  }
+
+  while (deletionQueue.length) {
+    const sourceId = deletionQueue.shift()
+    queued.delete(sourceId)
+    if (deleted.has(sourceId)) continue
+    deleted.add(sourceId)
+    delete prompt[sourceId]
+
+    for (const [nodeId, node] of Object.entries(prompt)) {
+      if (!node?.inputs || typeof node.inputs !== 'object') continue
+      for (const [inputName, value] of Object.entries(node.inputs)) {
+        const link = promptLink(value)
+        if (!link || link.nodeId !== sourceId) continue
+        if (required(nodeId, inputName)) enqueue(nodeId)
+        else delete node.inputs[inputName]
+      }
+    }
+  }
+
+  return prompt
+}
+
 export function calculateReferenceToggleRect(
   shelfRight,
   labelLeft,
