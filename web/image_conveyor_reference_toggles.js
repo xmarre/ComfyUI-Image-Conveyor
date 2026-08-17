@@ -132,6 +132,7 @@ function outputToggleRect(node, context, outputIndex, shelfRight) {
   const centerY = Number(returned?.[1] ?? graphPosition[1]) - nodeY
   if (!Number.isFinite(socketX) || !Number.isFinite(centerY)) return null
   const label = String(output.label || output.name || '')
+  context.font = node.innerFontStyle
   const labelWidth = context.measureText(label).width
   const labelLeft = socketX - 11 - labelWidth
   return calculateReferenceToggleRect(shelfRight, labelLeft, centerY)
