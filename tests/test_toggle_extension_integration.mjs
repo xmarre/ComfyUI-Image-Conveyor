@@ -28,10 +28,14 @@ test('reference/main toggle extension owns direct state sync and reference pruni
   assert.match(loadedToggleSource, /pruneDisabledOutputBranches\(/)
 })
 
-test('dedicated last-frame extension owns its switch and independent prompt pruning', () => {
+test('dedicated last-frame extension owns switch, pruning, and append-only migration', () => {
   assert.match(lastFrameToggleSource, /LAST_FRAME_PROPERTY_KEY = 'image_conveyor_last_frame_enabled'/)
+  assert.match(lastFrameToggleSource, /LAST_FRAME_OUTPUT_FALLBACK_INDEX = 14/)
   assert.match(lastFrameToggleSource, /function currentLastFrameEnabled\(node\)/)
   assert.match(lastFrameToggleSource, /function lastFrameOutputIndex\(node\)/)
+  assert.match(lastFrameToggleSource, /function ensureLastFrameOutput\(node\)/)
+  assert.match(lastFrameToggleSource, /node\.outputs\.length === LAST_FRAME_OUTPUT_FALLBACK_INDEX/)
+  assert.match(lastFrameToggleSource, /node\.addOutput\?\.\('last_frame', 'IMAGE'\)/)
   assert.match(lastFrameToggleSource, /function disabledLastFrameOutputs\(graph\)/)
   assert.match(lastFrameToggleSource, /pruneDisabledOutputBranches\(/)
   assert.match(lastFrameToggleSource, /outputIndexByName\(node, 'last_frame'/)
