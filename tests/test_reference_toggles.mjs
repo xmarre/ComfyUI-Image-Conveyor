@@ -8,6 +8,7 @@ import {
   filterReferenceOutputSlotsByToggleMask,
   normalizeMainOutputEnabled,
   normalizeReferenceToggleMask,
+  pruneDisabledOutputBranches,
   referenceToggleHit,
   toggleMainOutputEnabled,
   toggleReferenceToggleMask
@@ -73,6 +74,70 @@ test('disabling main output strips queue reservation members but preserves refer
     ...payload,
     main_output_enabled: true
   })
+})
+
+test('disabled main prompt pruning removes a required transform chain at an optional boundary', () => {
+  const prompt = {
+    '164': { inputs: {}, class_type: 'ImageConveyor' },
+    '123': {
+      inputs: { image: ['164', 0], megapixels: 0.7 },
+      class_type: 'ImageScaleToTotalPixelsX'
+    },
+    '200': {
+      inputs: {
+        first_frame: ['123', 0],
+        reference_image_1: ['164', 6],
+        model: ['300', 0]
+      },
+      class_type: 'H3ContinuumSamplerProduction'
+    },
+    '300': { inputs: {}, class_type: 'ModelLoader' }
+  }
+  const required = new Set(['123:image', '200:model'])
+
+  pruneDisabledOutputBranches(
+    prompt,
+    [{ nodeId: '164', outputIndexes: [0, 1] }],
+    (nodeId, inputName) => required.has(`${nodeId}:${inputName}`)
+  )
+
+  assert.equal(prompt['123'], undefined)
+  assert.equal(Object.hasOwn(prompt['200'].inputs, 'first_frame'), false)
+  assert.deepEqual(prompt['200'].inputs.reference_image_1, ['164', 6])
+  assert.deepEqual(prompt['200'].inputs.model, ['300', 0])
+  assert.ok(prompt['164'])
+  assert.ok(prompt['200'])
+})
+
+test('disabled main prompt pruning removes image and mask consumers independently', () => {
+  const prompt = {
+    '1': { inputs: {}, class_type: 'ImageConveyor' },
+    '2': { inputs: { image: ['1', 0] }, class_type: 'RequiredImageNode' },
+    '3': { inputs: { mask: ['1', 1] }, class_type: 'RequiredMaskNode' },
+    '4': {
+      inputs: { optional_image: ['2', 0], optional_mask: ['3', 0], keep: 1 },
+      class_type: 'OptionalConsumer'
+    }
+  }
+
+  pruneDisabledOutputBranches(
+    prompt,
+    [{ nodeId: 1, outputIndexes: [0, 1] }],
+    (nodeId, inputName) => nodeId === '2' || nodeId === '3'
+  )
+
+  assert.equal(prompt['2'], undefined)
+  assert.equal(prompt['3'], undefined)
+  assert.deepEqual(prompt['4'].inputs, { keep: 1 })
+})
+
+test('unknown prompt input contracts fail closed as required', () => {
+  const prompt = {
+    '1': { inputs: {}, class_type: 'ImageConveyor' },
+    '2': { inputs: { mystery: ['1', 0] }, class_type: 'UnknownNode' }
+  }
+  pruneDisabledOutputBranches(prompt, [{ nodeId: '1', outputIndexes: [0] }])
+  assert.equal(prompt['2'], undefined)
 })
 
 test('toggle geometry stays between the shelf and output label and hit testing is exact', () => {
