@@ -2,11 +2,14 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  applyMainOutputToggleToReservation,
   applyReferenceToggleMaskToReservation,
   calculateReferenceToggleRect,
   filterReferenceOutputSlotsByToggleMask,
+  normalizeMainOutputEnabled,
   normalizeReferenceToggleMask,
   referenceToggleHit,
+  toggleMainOutputEnabled,
   toggleReferenceToggleMask
 } from '../web/image_conveyor_reference_toggles_math.mjs'
 
@@ -16,6 +19,14 @@ test('reference toggles default enabled and only explicit false disables a slot'
     normalizeReferenceToggleMask([false, true, null, 0, '', false]),
     [false, true, true, true, true, false, true, true]
   )
+})
+
+test('main output toggle defaults enabled and round-trips explicit disable', () => {
+  assert.equal(normalizeMainOutputEnabled(undefined), true)
+  assert.equal(normalizeMainOutputEnabled(null), true)
+  assert.equal(normalizeMainOutputEnabled(false), false)
+  assert.equal(toggleMainOutputEnabled(undefined), false)
+  assert.equal(toggleMainOutputEnabled(false), true)
 })
 
 test('toggling preserves the fixed eight-slot shape', () => {
@@ -45,6 +56,23 @@ test('reservation masking preserves unrelated payload fields', () => {
   })
   assert.equal(applyReferenceToggleMaskToReservation(null, [false]), null)
   assert.deepEqual(applyReferenceToggleMaskToReservation({ id: 'A' }, [false]), { id: 'A' })
+})
+
+test('disabling main output strips queue reservation members but preserves reference snapshot', () => {
+  const payload = {
+    id: 'A',
+    annotated: 'A.png [input]',
+    items: [{ id: 'A', annotated: 'A.png [input]' }],
+    reference_output_slots: [1, 4, 8]
+  }
+  assert.deepEqual(applyMainOutputToggleToReservation(payload, false), {
+    main_output_enabled: false,
+    reference_output_slots: [1, 4, 8]
+  })
+  assert.deepEqual(applyMainOutputToggleToReservation(payload, true), {
+    ...payload,
+    main_output_enabled: true
+  })
 })
 
 test('toggle geometry stays between the shelf and output label and hit testing is exact', () => {
