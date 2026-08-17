@@ -41,15 +41,19 @@ test('reference pruning sidecar cannot install a duplicate graph wrapper', () =>
   assert.doesNotMatch(referenceSidecar, /registerExtension|graphToPrompt/)
 })
 
-test('widget guard replaces persistent reservations with exact queue-driven roles', () => {
+test('widget guard owns exact persistent reservations independent of wrapper order', () => {
   assert.match(stateGuard, /ToggleStateWidgetGuard/)
   assert.match(stateGuard, /LAST_FRAME_PROPERTY_KEY = 'image_conveyor_last_frame_enabled'/)
   assert.match(stateGuard, /function connectedQueueSlots\(node\)/)
   assert.match(stateGuard, /outputConnected\(node, 'last_frame'/)
   assert.match(stateGuard, /selectExecutionGroup\(/)
   assert.match(stateGuard, /makeQueueReservationPayload\(/)
+  assert.match(stateGuard, /function buildPersistentQueueValue\(node, stateWidget\)/)
+  assert.match(stateGuard, /function authoritativeQueueValue\(node, stateWidget, raw\)/)
   assert.match(stateGuard, /replacePersistentReservation\(/)
   assert.match(stateGuard, /queueWidget\.beforeQueued = function/)
+  assert.match(stateGuard, /wrapSerializer\([\s\S]*queueWidget,[\s\S]*authoritativeQueueValue/)
+  assert.match(stateGuard, /queueWidget\.afterQueued = function/)
   assert.match(stateGuard, /serializeToggleQueueSnapshot\(/)
   assert.doesNotMatch(stateGuard, /graphToPrompt/)
 })
