@@ -61,6 +61,20 @@ function lastFrameOutputIndex(node) {
   return outputIndexByName(node, 'last_frame', LAST_FRAME_OUTPUT_FALLBACK_INDEX)
 }
 
+function ensureLastFrameOutput(node) {
+  const existing = lastFrameOutputIndex(node)
+  if (existing >= 0) return existing
+
+  // Older saved workflows serialize the node's original 14-output array. The
+  // current backend schema appends last_frame at 14, but loading that saved
+  // array can temporarily hide the new socket. Append it in place instead of
+  // requiring node recreation. Existing 0..13 output indices never move.
+  if (Array.isArray(node?.outputs) && node.outputs.length === LAST_FRAME_OUTPUT_FALLBACK_INDEX) {
+    node.addOutput?.('last_frame', 'IMAGE')
+  }
+  return lastFrameOutputIndex(node)
+}
+
 function conveyorNodes(graph) {
   const nodes = typeof graph?.computeExecutionOrder === 'function'
     ? graph.computeExecutionOrder(false)
@@ -204,7 +218,8 @@ function installNode(node, attempts = 0) {
   if (!node || attempts > INSTALL_RETRY_LIMIT || patchedNodes.has(node)) return
   const type = String(node?.comfyClass || node?.type || '')
   if (!NODE_CLASSES.has(type)) return
-  if (!node.__bil || lastFrameOutputIndex(node) < 0) {
+  const lastFrameIndex = ensureLastFrameOutput(node)
+  if (!node.__bil || lastFrameIndex < 0) {
     requestAnimationFrame(() => installNode(node, attempts + 1))
     return
   }
