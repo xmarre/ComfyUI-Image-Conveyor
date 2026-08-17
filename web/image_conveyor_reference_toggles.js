@@ -203,12 +203,6 @@ function wrapBeforeQueued(node, queueWidget, ext) {
   ext.previousBeforeQueued = previous
   queueWidget.beforeQueued = function (...args) {
     const result = previous?.apply(this, args)
-    if (result && typeof result.then === 'function') {
-      return result.then((value) => {
-        applyToggleMaskToQueuedSnapshot(node, queueWidget)
-        return value
-      })
-    }
     applyToggleMaskToQueuedSnapshot(node, queueWidget)
     return result
   }
@@ -217,8 +211,9 @@ function wrapBeforeQueued(node, queueWidget, ext) {
 function installNode(node, attempts = 0) {
   if (!node || attempts > INSTALL_RETRY_LIMIT) return
   const ctx = node.__bil
+  if (ctx?.removed) return
   const queueWidget = getWidget(node, QUEUE_WIDGET)
-  if (!ctx || ctx.removed || !queueWidget || typeof queueWidget.beforeQueued !== 'function') {
+  if (!ctx || !queueWidget || typeof queueWidget.beforeQueued !== 'function') {
     requestAnimationFrame(() => installNode(node, attempts + 1))
     return
   }
