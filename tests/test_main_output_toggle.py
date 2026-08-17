@@ -5,6 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 
@@ -17,7 +18,7 @@ fake_folder_paths.exists_annotated_filepath = lambda annotated: annotated in EXI
 
 
 class FakeLoadImage:
-    calls = []
+    calls: ClassVar[list[str]] = []
 
     def load_image(self, annotated):
         self.calls.append(annotated)
@@ -100,6 +101,16 @@ class MainOutputToggleTest(unittest.TestCase):
         self.assertEqual(
             "Image Conveyor: main output enable snapshot is invalid.",
             conveyor.ImageConveyor.VALIDATE_INPUTS(raw, queue_item_json=payload),
+        )
+        expected = conveyor._unresolved_change_hash(
+            conveyor._normalize_state(raw),
+            "snapshot|Image Conveyor: main output enable snapshot is invalid.",
+        )
+        first = conveyor.ImageConveyor.IS_CHANGED(raw, queue_item_json=payload)
+        self.assertEqual(expected, first)
+        self.assertEqual(
+            first,
+            conveyor.ImageConveyor.IS_CHANGED(raw, queue_item_json=payload),
         )
 
     def test_disabled_main_validates_and_executes_with_empty_conveyor(self):
