@@ -10,7 +10,7 @@ const referenceSidecar = await readFile(
   new URL('../web/image_conveyor_reference_branch_pruning.js', import.meta.url),
   'utf8'
 )
-const stateSidecar = await readFile(
+const stateGuard = await readFile(
   new URL('../web/image_conveyor_toggle_state_sync.js', import.meta.url),
   'utf8'
 )
@@ -25,7 +25,15 @@ test('the visible toggle extension owns backend state sync and all disabled-outp
   assert.match(loadedToggleSource, /pruneDisabledOutputBranches\(/)
 })
 
-test('old sidecar extension files cannot install duplicate queue or graph wrappers', () => {
+test('reference pruning sidecar cannot install a duplicate graph wrapper', () => {
   assert.doesNotMatch(referenceSidecar, /registerExtension|graphToPrompt/)
-  assert.doesNotMatch(stateSidecar, /registerExtension|beforeQueued/)
+})
+
+test('state widget guard preserves toggle fields across core rewrites and final serialization', () => {
+  assert.match(stateGuard, /ToggleStateWidgetGuard/)
+  assert.match(stateGuard, /stateWidget\.callback = function/)
+  assert.match(stateGuard, /stateWidget\.serializeValue = function/)
+  assert.match(stateGuard, /preserveCurrentValue\(node, stateWidget\)/)
+  assert.match(stateGuard, /serializeToggleRuntimeState\(/)
+  assert.doesNotMatch(stateGuard, /graphToPrompt|beforeQueued/)
 })
