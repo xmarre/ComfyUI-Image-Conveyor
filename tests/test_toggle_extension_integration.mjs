@@ -15,7 +15,7 @@ const stateGuard = await readFile(
   'utf8'
 )
 
-test('the visible toggle extension owns backend state sync and all disabled-output pruning', () => {
+test('the visible toggle extension owns direct state sync and disabled-output prompt pruning', () => {
   assert.match(loadedToggleSource, /const REFERENCE_STATE_KEY = 'reference_output_enabled'/)
   assert.match(loadedToggleSource, /const MAIN_STATE_KEY = 'main_output_enabled'/)
   assert.match(loadedToggleSource, /function syncToggleRuntimeState\(node\)/)
@@ -29,11 +29,14 @@ test('reference pruning sidecar cannot install a duplicate graph wrapper', () =>
   assert.doesNotMatch(referenceSidecar, /registerExtension|graphToPrompt/)
 })
 
-test('state widget guard preserves toggle fields across core rewrites and final serialization', () => {
+test('widget guard makes both backend-visible toggle channels authoritative at serialization', () => {
   assert.match(stateGuard, /ToggleStateWidgetGuard/)
   assert.match(stateGuard, /stateWidget\.callback = function/)
-  assert.match(stateGuard, /stateWidget\.serializeValue = function/)
-  assert.match(stateGuard, /preserveCurrentValue\(node, stateWidget\)/)
+  assert.match(stateGuard, /wrapSerializer\(stateWidget/)
+  assert.match(stateGuard, /queueWidget\.beforeQueued = function/)
+  assert.match(stateGuard, /wrapSerializer\(queueWidget/)
   assert.match(stateGuard, /serializeToggleRuntimeState\(/)
-  assert.doesNotMatch(stateGuard, /graphToPrompt|beforeQueued/)
+  assert.match(stateGuard, /serializeToggleQueueSnapshot\(/)
+  assert.match(stateGuard, /connectedReferenceSlots\(node\)/)
+  assert.doesNotMatch(stateGuard, /graphToPrompt/)
 })
