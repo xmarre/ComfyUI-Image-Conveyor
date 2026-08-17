@@ -1,12 +1,16 @@
 import logging
 
+from . import image_conveyor as _image_conveyor
 from .image_conveyor import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .image_conveyor_drag_v2_ops import register_drag_routes
 from .image_conveyor_library_ops import register_library_routes
 from .image_conveyor_server import register_routes
+from .image_conveyor_toggle_runtime import install_toggle_runtime
 
 WEB_DIRECTORY = "./web"
 LOGGER = logging.getLogger(__name__)
+
+install_toggle_runtime(_image_conveyor)
 
 
 def _register_route_group(name, register):
