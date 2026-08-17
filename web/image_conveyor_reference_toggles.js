@@ -6,10 +6,11 @@ import {
   calculateReferenceToggleRect,
   normalizeMainOutputEnabled,
   normalizeReferenceToggleMask,
+  pruneDisabledOutputBranches,
   referenceToggleHit,
   toggleMainOutputEnabled,
   toggleReferenceToggleMask
-} from './image_conveyor_reference_toggles_math.mjs?v=20260817b'
+} from './image_conveyor_reference_toggles_math.mjs?v=20260817c'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.ReferenceSlotToggles'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -21,6 +22,7 @@ const REFERENCE_PROPERTY_KEY = 'image_conveyor_reference_enabled'
 const MAIN_PROPERTY_KEY = 'image_conveyor_main_enabled'
 const INSTALL_RETRY_LIMIT = 120
 const patchedNodes = new Set()
+let graphToPromptPatched = false
 
 function getWidget(node, name) {
   return (node.widgets ?? []).find((entry) => entry?.name === name) ?? null
@@ -88,6 +90,65 @@ function referenceOutputIndex(node, slotIndex) {
     `ref_image_${slotIndex + 1}`,
     REFERENCE_OUTPUT_START_INDEX + slotIndex
   )
+}
+
+function graphNodeByPromptId(graph, nodeId) {
+  if (!graph || typeof graph.getNodeById !== 'function') return null
+  const direct = graph.getNodeById(nodeId)
+  if (direct) return direct
+  const numeric = Number(nodeId)
+  if (Number.isFinite(numeric)) return graph.getNodeById(numeric) ?? null
+  return null
+}
+
+function promptInputRequired(graph, nodeId, inputName) {
+  const node = graphNodeByPromptId(graph, nodeId)
+  const nodeData = node?.constructor?.nodeData ?? node?.nodeData
+  const required = nodeData?.input?.required
+  const optional = nodeData?.input?.optional
+  if (required && typeof required === 'object' && Object.hasOwn(required, inputName)) return true
+  if (optional && typeof optional === 'object' && Object.hasOwn(optional, inputName)) return false
+
+  // Unknown contracts fail closed. Removing the consumer is safer than leaving
+  // a required image-processing node in the API prompt with a missing input.
+  return true
+}
+
+function disabledMainPromptOutputs(graph) {
+  const nodes = typeof graph?.computeExecutionOrder === 'function'
+    ? graph.computeExecutionOrder(false)
+    : (Array.isArray(graph?._nodes) ? graph._nodes : [])
+  const disabled = []
+  for (const node of nodes) {
+    const type = String(node?.comfyClass || node?.type || '')
+    if (!NODE_CLASSES.has(type)) continue
+    if (outputMode(node) !== OUTPUT_MODE_PERSISTENT || currentMainEnabled(node)) continue
+    const outputIndexes = [
+      outputIndexByName(node, 'image', 0),
+      outputIndexByName(node, 'mask', 1)
+    ].filter((index, offset, all) => index >= 0 && all.indexOf(index) === offset)
+    if (outputIndexes.length) disabled.push({ nodeId: String(node.id), outputIndexes })
+  }
+  return disabled
+}
+
+function installGraphToPromptFilter() {
+  if (graphToPromptPatched || typeof app.graphToPrompt !== 'function') return
+  graphToPromptPatched = true
+  const previous = app.graphToPrompt
+  app.graphToPrompt = async function (...args) {
+    const graph = args[0] ?? this.rootGraph ?? app.graph
+    const result = await previous.apply(this, args)
+    const disabled = disabledMainPromptOutputs(graph)
+    if (disabled.length && result?.output && typeof result.output === 'object') {
+      pruneDisabledOutputBranches(
+        result.output,
+        disabled,
+        (nodeId, inputName) => promptInputRequired(graph, nodeId, inputName)
+      )
+    }
+    return result
+  }
 }
 
 function roundedRect(context, x, y, width, height, radius) {
@@ -361,6 +422,9 @@ function installNode(node, attempts = 0) {
 
 app.registerExtension({
   name: EXTENSION_NAME,
+  setup() {
+    installGraphToPromptFilter()
+  },
   nodeCreated(node) {
     const type = String(node?.comfyClass || node?.type || '')
     if (!NODE_CLASSES.has(type)) return
