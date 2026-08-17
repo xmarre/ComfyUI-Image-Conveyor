@@ -12,6 +12,9 @@ _STATE_VERSION = 2
 _MAX_IMAGES_PER_EXECUTION = 9
 _REFERENCE_SLOT_COUNT = 8
 _REFERENCE_OUTPUT_SLOTS_KEY = "reference_output_slots"
+_QUEUE_OUTPUT_SLOTS_KEY = "queue_output_slots"
+_QUEUE_SLOT_IMAGE = 0
+_QUEUE_SLOT_LAST_FRAME = 1
 _MAIN_OUTPUT_ENABLED_KEY = "main_output_enabled"
 _OUTPUT_MODE_PERSISTENT = "persistent_refs"
 _OUTPUT_MODE_QUEUE_GROUP = "queue_group"
@@ -295,6 +298,51 @@ def _main_output_enabled(state: Dict[str, Any], queue_item_json: Any) -> bool:
     return value
 
 
+def _connected_queue_output_slots(
+    state: Dict[str, Any], queue_item_json: Any
+) -> Tuple[int, ...]:
+    """Resolve queue-driven output roles for this execution.
+
+    Persistent mode accepts only role 0 (image) and role 1 (last_frame). Newly
+    queued prompts carry this explicitly. Legacy prompts preserve their released
+    main-image-only behavior when the field is absent.
+
+    Queue-group mode keeps its released 1..9 grouping semantics; last_frame is an
+    additional alias of the second grouped image and does not change group size.
+    """
+    if state.get("output_mode") != _OUTPUT_MODE_PERSISTENT:
+        return tuple(range(_effective_images_per_execution(state)))
+
+    payload = _safe_json_load(queue_item_json, {})
+    if isinstance(payload, dict) and _QUEUE_OUTPUT_SLOTS_KEY in payload:
+        raw_slots = payload.get(_QUEUE_OUTPUT_SLOTS_KEY)
+        if not isinstance(raw_slots, list):
+            raise RuntimeError("Image Conveyor: queue output connection snapshot is invalid.")
+
+        slots: List[int] = []
+        seen = set()
+        for raw_slot in raw_slots:
+            if (
+                isinstance(raw_slot, bool)
+                or not isinstance(raw_slot, int)
+                or raw_slot < _QUEUE_SLOT_IMAGE
+                or raw_slot > _QUEUE_SLOT_LAST_FRAME
+                or raw_slot in seen
+            ):
+                raise RuntimeError("Image Conveyor: queue output connection snapshot is invalid.")
+            seen.add(raw_slot)
+            slots.append(raw_slot)
+        if slots != sorted(slots):
+            raise RuntimeError("Image Conveyor: queue output connection snapshot is invalid.")
+        return tuple(slots)
+
+    return (_QUEUE_SLOT_IMAGE,) if _main_output_enabled(state, queue_item_json) else ()
+
+
+def _requested_queue_image_count(state: Dict[str, Any], queue_item_json: Any) -> int:
+    return len(_connected_queue_output_slots(state, queue_item_json))
+
+
 def _connected_reference_slots(queue_item_json: Any) -> Optional[Tuple[int, ...]]:
     """Return the queued 1-based reference-output snapshot, or None for legacy prompts."""
     payload = _safe_json_load(queue_item_json, {})
@@ -368,7 +416,9 @@ def _select_group(
     allow_processed: bool = False,
 ) -> List[Tuple[int, Dict[str, Any]]]:
     """Resolve one complete ordered execution group from reservation or queue state."""
-    count = _effective_images_per_execution(state)
+    count = _requested_queue_image_count(state, queue_item_json)
+    if count == 0:
+        return []
     reservation = _parse_queue_item(queue_item_json)
 
     if reservation is not None and reservation.get("grouped"):
@@ -485,6 +535,7 @@ class ImageConveyor:
         "IMAGE",
         "IMAGE",
         "IMAGE",
+        "IMAGE",
     )
     RETURN_NAMES = (
         "image",
@@ -501,6 +552,7 @@ class ImageConveyor:
         "ref_image_6",
         "ref_image_7",
         "ref_image_8",
+        "last_frame",
     )
     SEARCH_ALIASES = [
         "image conveyor",
@@ -546,20 +598,22 @@ class ImageConveyor:
         del ui_state_json
         state = _normalize_state(state_json)
         try:
-            main_output_enabled = _main_output_enabled(state, queue_item_json)
+            queue_output_slots = _connected_queue_output_slots(state, queue_item_json)
             active_reference_slots = _active_reference_slots(state, queue_item_json)
         except RuntimeError as exc:
             return _unresolved_change_hash(state, f"snapshot|{exc}")
 
-        if main_output_enabled and not state["items"]:
+        requested_count = len(queue_output_slots)
+        if requested_count > 0 and not state["items"]:
             empty_identity = (
                 f"{state_json}|output_mode={state['output_mode']}|"
-                f"images_per_execution={_effective_images_per_execution(state)}"
+                f"images_per_execution={_effective_images_per_execution(state)}|"
+                f"queue_outputs={','.join(map(str, queue_output_slots))}"
             )
             return hashlib.sha256(empty_identity.encode("utf-8")).hexdigest()
 
         selected: List[Tuple[int, Dict[str, Any]]] = []
-        if main_output_enabled:
+        if requested_count > 0:
             try:
                 selected = _select_group(
                     state, queue_item_json, allow_processed=state["dont_consume"]
@@ -568,24 +622,24 @@ class ImageConveyor:
                 return _unresolved_change_hash(state, f"selection|{exc}")
 
         hasher = hashlib.sha256()
-        if main_output_enabled:
-            hasher.update(b"dont_consume=1" if state["dont_consume"] else b"dont_consume=0")
-            hasher.update(f"|output_mode={state['output_mode']}".encode("utf-8"))
-            hasher.update(
-                f"|images_per_execution={_effective_images_per_execution(state)}".encode("utf-8")
-            )
-            for slot, (index, item) in enumerate(selected, start=1):
-                hasher.update(f"|slot={slot}|index={index}|".encode("utf-8"))
-                hasher.update(item["id"].encode("utf-8"))
-                hasher.update(b"|")
-                hasher.update(item["annotated"].encode("utf-8"))
-                if not _hash_annotated_file(hasher, item["annotated"]):
-                    return _unresolved_change_hash(
-                        state,
-                        f"missing|slot={slot}|index={index}|id={item['id']}|annotated={item['annotated']}",
-                    )
-        else:
-            hasher.update(b"output_mode=persistent_refs|main_output_enabled=0")
+        hasher.update(b"dont_consume=1" if state["dont_consume"] else b"dont_consume=0")
+        hasher.update(f"|output_mode={state['output_mode']}".encode("utf-8"))
+        hasher.update(
+            f"|images_per_execution={_effective_images_per_execution(state)}".encode("utf-8")
+        )
+        hasher.update(
+            ("|queue_outputs=" + ",".join(map(str, queue_output_slots))).encode("utf-8")
+        )
+        for slot, (index, item) in enumerate(selected, start=1):
+            hasher.update(f"|slot={slot}|index={index}|".encode("utf-8"))
+            hasher.update(item["id"].encode("utf-8"))
+            hasher.update(b"|")
+            hasher.update(item["annotated"].encode("utf-8"))
+            if not _hash_annotated_file(hasher, item["annotated"]):
+                return _unresolved_change_hash(
+                    state,
+                    f"missing|slot={slot}|index={index}|id={item['id']}|annotated={item['annotated']}",
+                )
 
         if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
             hasher.update(
@@ -610,13 +664,13 @@ class ImageConveyor:
         del ui_state_json
         state = _normalize_state(state_json)
         try:
-            main_output_enabled = _main_output_enabled(state, queue_item_json)
+            queue_output_slots = _connected_queue_output_slots(state, queue_item_json)
             active_reference_slots = _active_reference_slots(state, queue_item_json)
         except RuntimeError as exc:
             return str(exc)
 
         selected: List[Tuple[int, Dict[str, Any]]] = []
-        if main_output_enabled:
+        if queue_output_slots:
             if not state["items"]:
                 return "Image Conveyor: no images have been added to the node."
             try:
@@ -647,59 +701,38 @@ class ImageConveyor:
         state = _normalize_state(state_json)
         ui_state = _normalize_ui_state(ui_state_json)
         dont_consume = state["dont_consume"]
-        main_output_enabled = _main_output_enabled(state, queue_item_json)
+        queue_output_slots = _connected_queue_output_slots(state, queue_item_json)
         active_reference_slots = _active_reference_slots(state, queue_item_json)
-        selected: List[Tuple[int, Dict[str, Any]]] = []
-        if main_output_enabled:
-            selected = _select_group(
-                state, queue_item_json, allow_processed=dont_consume
-            )
+        selected = _select_group(
+            state, queue_item_json, allow_processed=dont_consume
+        ) if queue_output_slots else []
 
         loader = nodes.LoadImage()
-        loaded_images: List[Any] = []
-        first_mask = None
-        for slot, (_index, item) in enumerate(selected):
+        loaded_selected: List[Tuple[int, Dict[str, Any], Any, Any]] = []
+        for index, item in selected:
             image, mask = loader.load_image(item["annotated"])
-            loaded_images.append(image)
-            if slot == 0:
-                first_mask = mask
+            loaded_selected.append((index, item, image, mask))
 
-        if main_output_enabled:
-            first_index, first_item = selected[0]
-            annotated = first_item["annotated"]
-            source_path = _get_runtime_source_path(ui_state, first_item)
-            selected_ids = {item["id"] for _index, item in selected}
-            remaining_pending = sum(
-                1
-                for item in state["items"]
-                if item["status"] == "pending"
-                and (dont_consume or item["id"] not in selected_ids)
-            )
-            processed_items = [
-                {"id": item["id"], "annotated": item["annotated"]}
-                for _index, item in selected
-            ]
-            delta = {
-                "version": _STATE_VERSION,
-                "processed_item_id": first_item["id"],
-                "processed_annotated": annotated,
-                "processed_items": processed_items,
-                "new_status": "processed",
-                "consumed": not dont_consume,
-            }
-            main_image = loaded_images[0]
-            output_index = first_index + 1
-        else:
-            annotated = ""
-            source_path = ""
-            remaining_pending = sum(
-                1 for item in state["items"] if item["status"] == "pending"
-            )
-            delta = None
-            main_image = None
-            output_index = 0
+        main_image = None
+        main_mask = None
+        annotated = ""
+        output_index = 0
+        source_path = ""
+        last_frame = None
 
         if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
+            for queue_slot, (index, item, image, mask) in zip(
+                queue_output_slots, loaded_selected
+            ):
+                if queue_slot == _QUEUE_SLOT_IMAGE:
+                    main_image = image
+                    main_mask = mask
+                    annotated = item["annotated"]
+                    output_index = index + 1
+                    source_path = _get_runtime_source_path(ui_state, item)
+                elif queue_slot == _QUEUE_SLOT_LAST_FRAME:
+                    last_frame = image
+
             additional_images = [None] * _REFERENCE_SLOT_COUNT
             reference_cache: Dict[str, Any] = {}
             for slot in active_reference_slots:
@@ -712,9 +745,45 @@ class ImageConveyor:
                     reference_cache[annotated_reference] = image
                 additional_images[slot - 1] = reference_cache[annotated_reference]
         else:
+            loaded_images = [entry[2] for entry in loaded_selected]
+            loaded_masks = [entry[3] for entry in loaded_selected]
+            if loaded_selected:
+                first_index, first_item, main_image, _mask = loaded_selected[0]
+                main_mask = loaded_masks[0]
+                annotated = first_item["annotated"]
+                output_index = first_index + 1
+                source_path = _get_runtime_source_path(ui_state, first_item)
+            # Preserve released queue-group reference mapping. last_frame is an
+            # additional alias of the second grouped image rather than shifting
+            # ref_image_1..8 or reducing their established capacity.
+            last_frame = loaded_images[1] if len(loaded_images) > 1 else None
             additional_images = loaded_images[1:] + [None] * (
                 _MAX_IMAGES_PER_EXECUTION - len(loaded_images)
             )
+
+        selected_ids = {item["id"] for _index, item in selected}
+        remaining_pending = sum(
+            1
+            for item in state["items"]
+            if item["status"] == "pending"
+            and (dont_consume or item["id"] not in selected_ids)
+        )
+
+        delta = None
+        if selected:
+            _first_selected_index, first_selected_item = selected[0]
+            processed_items = [
+                {"id": item["id"], "annotated": item["annotated"]}
+                for _index, item in selected
+            ]
+            delta = {
+                "version": _STATE_VERSION,
+                "processed_item_id": first_selected_item["id"],
+                "processed_annotated": first_selected_item["annotated"],
+                "processed_items": processed_items,
+                "new_status": "processed",
+                "consumed": not dont_consume,
+            }
 
         ui = {}
         if delta is not None:
@@ -722,12 +791,13 @@ class ImageConveyor:
         return {
             "result": (
                 main_image,
-                first_mask,
+                main_mask,
                 annotated,
                 output_index,
                 remaining_pending,
                 source_path,
                 *additional_images,
+                last_frame,
             ),
             "ui": ui,
         }
