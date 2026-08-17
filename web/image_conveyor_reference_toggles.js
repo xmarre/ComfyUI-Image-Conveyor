@@ -1,16 +1,18 @@
 import { app } from '../../scripts/app.js'
+import { api } from '../../scripts/api.js'
 import { snapshotReferenceOutputConnections } from './image_conveyor_math.mjs?v=64d0259bdfdbb853'
 import {
   applyMainOutputToggleToReservation,
   applyReferenceToggleMaskToReservation,
   calculateReferenceToggleRect,
+  inputRequiredFromNodeDef,
   normalizeMainOutputEnabled,
   normalizeReferenceToggleMask,
   pruneDisabledOutputBranches,
   referenceToggleHit,
   toggleMainOutputEnabled,
   toggleReferenceToggleMask
-} from './image_conveyor_reference_toggles_math.mjs?v=20260817c'
+} from './image_conveyor_reference_toggles_math.mjs?v=20260817d'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.ReferenceSlotToggles'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -23,6 +25,7 @@ const MAIN_PROPERTY_KEY = 'image_conveyor_main_enabled'
 const INSTALL_RETRY_LIMIT = 120
 const patchedNodes = new Set()
 let graphToPromptPatched = false
+let promptNodeDefsPromise = null
 
 function getWidget(node, name) {
   return (node.widgets ?? []).find((entry) => entry?.name === name) ?? null
@@ -92,25 +95,32 @@ function referenceOutputIndex(node, slotIndex) {
   )
 }
 
-function graphNodeByPromptId(graph, nodeId) {
-  if (!graph || typeof graph.getNodeById !== 'function') return null
-  const direct = graph.getNodeById(nodeId)
-  if (direct) return direct
-  const numeric = Number(nodeId)
-  if (Number.isFinite(numeric)) return graph.getNodeById(numeric) ?? null
-  return null
+async function getPromptNodeDefs() {
+  if (!promptNodeDefsPromise) {
+    promptNodeDefsPromise = Promise.resolve(api.getNodeDefs())
+      .then((nodeDefs) => {
+        if (!nodeDefs || typeof nodeDefs !== 'object' || Array.isArray(nodeDefs)) {
+          throw new Error('ComfyUI returned an invalid /object_info node-definition payload')
+        }
+        return nodeDefs
+      })
+      .catch((error) => {
+        // Permit a later queue attempt to retry a transient /object_info failure.
+        promptNodeDefsPromise = null
+        throw error
+      })
+  }
+  return await promptNodeDefsPromise
 }
 
-function promptInputRequired(graph, nodeId, inputName) {
-  const node = graphNodeByPromptId(graph, nodeId)
-  const nodeData = node?.constructor?.nodeData ?? node?.nodeData
-  const required = nodeData?.input?.required
-  const optional = nodeData?.input?.optional
-  if (required && typeof required === 'object' && Object.hasOwn(required, inputName)) return true
-  if (optional && typeof optional === 'object' && Object.hasOwn(optional, inputName)) return false
+function promptInputRequired(prompt, nodeDefs, nodeId, inputName) {
+  const classType = String(prompt?.[String(nodeId)]?.class_type ?? '')
+  const contract = inputRequiredFromNodeDef(nodeDefs?.[classType], inputName)
+  if (contract !== null) return contract
 
-  // Unknown contracts fail closed. Removing the consumer is safer than leaving
-  // a required image-processing node in the API prompt with a missing input.
+  // Frontend-only routing helpers such as Reroute may not exist in /object_info.
+  // Unknown contracts still fail closed as required, but ordinary backend nodes
+  // now use the authoritative required/optional schema instead of nodeData.
   return true
 }
 
@@ -141,10 +151,13 @@ function installGraphToPromptFilter() {
     const result = await previous.apply(this, args)
     const disabled = disabledMainPromptOutputs(graph)
     if (disabled.length && result?.output && typeof result.output === 'object') {
+      // Current LGraphNode.nodeData intentionally contains only high-level node
+      // metadata. Required/optional input categories come from /object_info.
+      const nodeDefs = await getPromptNodeDefs()
       pruneDisabledOutputBranches(
         result.output,
         disabled,
-        (nodeId, inputName) => promptInputRequired(graph, nodeId, inputName)
+        (nodeId, inputName) => promptInputRequired(result.output, nodeDefs, nodeId, inputName)
       )
     }
     return result
@@ -423,6 +436,11 @@ function installNode(node, attempts = 0) {
 app.registerExtension({
   name: EXTENSION_NAME,
   setup() {
+    // Pre-warm the authoritative input contract cache. Queue-time lookup still
+    // awaits/retries it if this request is transiently unavailable.
+    void getPromptNodeDefs().catch((error) => {
+      console.warn('Image Conveyor: unable to pre-load ComfyUI node definitions.', error)
+    })
     installGraphToPromptFilter()
   },
   nodeCreated(node) {
