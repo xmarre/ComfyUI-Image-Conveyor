@@ -14,6 +14,14 @@ export function toggleReferenceToggleMask(value, index, count = REFERENCE_TOGGLE
   return mask
 }
 
+export function normalizeMainOutputEnabled(value) {
+  return value !== false
+}
+
+export function toggleMainOutputEnabled(value) {
+  return !normalizeMainOutputEnabled(value)
+}
+
 export function filterReferenceOutputSlotsByToggleMask(slots, enabled, count = REFERENCE_TOGGLE_COUNT) {
   if (!Array.isArray(slots)) return slots
   const mask = normalizeReferenceToggleMask(enabled, count)
@@ -29,6 +37,22 @@ export function applyReferenceToggleMaskToReservation(payload, enabled, count = 
   const filtered = filterReferenceOutputSlotsByToggleMask(payload.reference_output_slots, enabled, count)
   if (!Array.isArray(filtered)) return payload
   return { ...payload, reference_output_slots: filtered }
+}
+
+export function applyMainOutputToggleToReservation(payload, enabled) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload
+  if (normalizeMainOutputEnabled(enabled)) {
+    return { ...payload, main_output_enabled: true }
+  }
+
+  // A disabled main output must never carry a conveyor reservation. Keeping an
+  // id/items member would make the core afterQueued hook mark that image queued
+  // even though the backend intentionally does not select or consume it.
+  const referenceOnly = { main_output_enabled: false }
+  if (Object.hasOwn(payload, 'reference_output_slots')) {
+    referenceOnly.reference_output_slots = payload.reference_output_slots
+  }
+  return referenceOnly
 }
 
 export function calculateReferenceToggleRect(
