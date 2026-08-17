@@ -55,6 +55,20 @@ export function applyMainOutputToggleToReservation(payload, enabled) {
   return referenceOnly
 }
 
+/**
+ * Resolve whether an input is required from ComfyUI's authoritative V1 node
+ * definition schema returned by /object_info. Returns null when the definition
+ * does not describe the input.
+ */
+export function inputRequiredFromNodeDef(nodeDef, inputName) {
+  const name = String(inputName ?? '')
+  const required = nodeDef?.input?.required
+  if (required && typeof required === 'object' && Object.hasOwn(required, name)) return true
+  const optional = nodeDef?.input?.optional
+  if (optional && typeof optional === 'object' && Object.hasOwn(optional, name)) return false
+  return null
+}
+
 function promptLink(value) {
   if (!Array.isArray(value) || value.length !== 2) return null
   const nodeId = String(value[0] ?? '')
