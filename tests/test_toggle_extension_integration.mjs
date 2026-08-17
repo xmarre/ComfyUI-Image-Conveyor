@@ -6,6 +6,10 @@ const loadedToggleSource = await readFile(
   new URL('../web/image_conveyor_reference_toggles.js', import.meta.url),
   'utf8'
 )
+const lastFrameToggleSource = await readFile(
+  new URL('../web/image_conveyor_last_frame_toggle.js', import.meta.url),
+  'utf8'
+)
 const referenceSidecar = await readFile(
   new URL('../web/image_conveyor_reference_branch_pruning.js', import.meta.url),
   'utf8'
@@ -15,28 +19,37 @@ const stateGuard = await readFile(
   'utf8'
 )
 
-test('the visible toggle extension owns direct state sync and disabled-output prompt pruning', () => {
+test('reference/main toggle extension owns direct state sync and reference pruning', () => {
   assert.match(loadedToggleSource, /const REFERENCE_STATE_KEY = 'reference_output_enabled'/)
   assert.match(loadedToggleSource, /const MAIN_STATE_KEY = 'main_output_enabled'/)
   assert.match(loadedToggleSource, /function syncToggleRuntimeState\(node\)/)
   assert.match(loadedToggleSource, /function disabledPromptOutputs\(graph\)/)
   assert.match(loadedToggleSource, /outputIndexes\.push\(referenceOutputIndex\(node, slot\)\)/)
-  assert.match(loadedToggleSource, /for \(const node of conveyorNodes\(graph\)\) syncToggleRuntimeState\(node\)/)
   assert.match(loadedToggleSource, /pruneDisabledOutputBranches\(/)
+})
+
+test('dedicated last-frame extension owns its switch and independent prompt pruning', () => {
+  assert.match(lastFrameToggleSource, /LAST_FRAME_PROPERTY_KEY = 'image_conveyor_last_frame_enabled'/)
+  assert.match(lastFrameToggleSource, /function currentLastFrameEnabled\(node\)/)
+  assert.match(lastFrameToggleSource, /function lastFrameOutputIndex\(node\)/)
+  assert.match(lastFrameToggleSource, /function disabledLastFrameOutputs\(graph\)/)
+  assert.match(lastFrameToggleSource, /pruneDisabledOutputBranches\(/)
+  assert.match(lastFrameToggleSource, /outputIndexByName\(node, 'last_frame'/)
 })
 
 test('reference pruning sidecar cannot install a duplicate graph wrapper', () => {
   assert.doesNotMatch(referenceSidecar, /registerExtension|graphToPrompt/)
 })
 
-test('widget guard makes both backend-visible toggle channels authoritative at serialization', () => {
+test('widget guard replaces persistent reservations with exact queue-driven roles', () => {
   assert.match(stateGuard, /ToggleStateWidgetGuard/)
-  assert.match(stateGuard, /stateWidget\.callback = function/)
-  assert.match(stateGuard, /wrapSerializer\(stateWidget/)
+  assert.match(stateGuard, /LAST_FRAME_PROPERTY_KEY = 'image_conveyor_last_frame_enabled'/)
+  assert.match(stateGuard, /function connectedQueueSlots\(node\)/)
+  assert.match(stateGuard, /outputConnected\(node, 'last_frame'/)
+  assert.match(stateGuard, /selectExecutionGroup\(/)
+  assert.match(stateGuard, /makeQueueReservationPayload\(/)
+  assert.match(stateGuard, /replacePersistentReservation\(/)
   assert.match(stateGuard, /queueWidget\.beforeQueued = function/)
-  assert.match(stateGuard, /wrapSerializer\(queueWidget/)
-  assert.match(stateGuard, /serializeToggleRuntimeState\(/)
   assert.match(stateGuard, /serializeToggleQueueSnapshot\(/)
-  assert.match(stateGuard, /connectedReferenceSlots\(node\)/)
   assert.doesNotMatch(stateGuard, /graphToPrompt/)
 })
