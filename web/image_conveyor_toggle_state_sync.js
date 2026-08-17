@@ -1,10 +1,14 @@
 import { app } from '../../scripts/app.js'
 import {
+  makeQueueReservationPayload,
+  selectExecutionGroup
+} from './image_conveyor_math.mjs?v=64d0259bdfdbb853'
+import {
   normalizeMainEnabled,
   normalizeReferenceEnabled,
   serializeToggleQueueSnapshot,
   serializeToggleRuntimeState
-} from './image_conveyor_toggle_state_math.mjs?v=20260817c'
+} from './image_conveyor_toggle_state_math.mjs?v=20260817d'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.ToggleStateWidgetGuard'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -13,8 +17,10 @@ const QUEUE_WIDGET = 'queue_item_json'
 const OUTPUT_MODE_PERSISTENT = 'persistent_refs'
 const REFERENCE_PROPERTY_KEY = 'image_conveyor_reference_enabled'
 const MAIN_PROPERTY_KEY = 'image_conveyor_main_enabled'
+const LAST_FRAME_PROPERTY_KEY = 'image_conveyor_last_frame_enabled'
 const REFERENCE_SLOT_COUNT = 8
 const REFERENCE_OUTPUT_START_INDEX = 6
+const LAST_FRAME_OUTPUT_FALLBACK_INDEX = 14
 const INSTALL_RETRY_LIMIT = 120
 const guardedNodes = new WeakSet()
 
@@ -33,6 +39,10 @@ function currentMainEnabled(node) {
   return normalizeMainEnabled(node?.properties?.[MAIN_PROPERTY_KEY])
 }
 
+function currentLastFrameEnabled(node) {
+  return normalizeMainEnabled(node?.properties?.[LAST_FRAME_PROPERTY_KEY])
+}
+
 function outputMode(node) {
   const cached = node?.__bil?.state?.output_mode
   if (cached) return String(cached)
@@ -45,15 +55,21 @@ function outputMode(node) {
   }
 }
 
-function referenceOutputIndex(node, slotIndex) {
-  const expected = `ref_image_${slotIndex + 1}`
+function outputIndexByName(node, expected, fallback = -1) {
   const outputs = Array.isArray(node?.outputs) ? node.outputs : []
   const named = outputs.findIndex((output) => (
     String(output?.name ?? '') === expected || String(output?.label ?? '') === expected
   ))
   if (named >= 0) return named
-  const fallback = REFERENCE_OUTPUT_START_INDEX + slotIndex
-  return fallback < outputs.length ? fallback : -1
+  return fallback >= 0 && fallback < outputs.length ? fallback : -1
+}
+
+function referenceOutputIndex(node, slotIndex) {
+  return outputIndexByName(
+    node,
+    `ref_image_${slotIndex + 1}`,
+    REFERENCE_OUTPUT_START_INDEX + slotIndex
+  )
 }
 
 function connectedReferenceSlots(node) {
@@ -66,12 +82,32 @@ function connectedReferenceSlots(node) {
   return slots
 }
 
+function outputConnected(node, name, fallback) {
+  const index = outputIndexByName(node, name, fallback)
+  const links = index >= 0 ? node?.outputs?.[index]?.links : null
+  return Array.isArray(links) && links.length > 0
+}
+
+function connectedQueueSlots(node) {
+  if (outputMode(node) !== OUTPUT_MODE_PERSISTENT) return []
+  const slots = []
+  if (currentMainEnabled(node) && outputConnected(node, 'image', 0)) slots.push(0)
+  if (
+    currentLastFrameEnabled(node) &&
+    outputConnected(node, 'last_frame', LAST_FRAME_OUTPUT_FALLBACK_INDEX)
+  ) {
+    slots.push(1)
+  }
+  return slots
+}
+
 function runtimeStateValue(node, raw) {
   return serializeToggleRuntimeState(
     raw,
     currentReferenceEnabled(node),
     currentMainEnabled(node),
-    REFERENCE_SLOT_COUNT
+    REFERENCE_SLOT_COUNT,
+    currentLastFrameEnabled(node)
   )
 }
 
@@ -82,7 +118,9 @@ function runtimeQueueValue(node, raw) {
     connectedReferenceSlots(node),
     currentReferenceEnabled(node),
     currentMainEnabled(node),
-    REFERENCE_SLOT_COUNT
+    REFERENCE_SLOT_COUNT,
+    connectedQueueSlots(node),
+    currentLastFrameEnabled(node)
   )
 }
 
@@ -107,6 +145,38 @@ function wrapSerializer(widget, transform) {
     if (raw && typeof raw.then === 'function') return raw.then(transform)
     return transform(raw)
   }
+}
+
+function currentQueueState(node, stateWidget) {
+  if (node?.__bil?.state && typeof node.__bil.state === 'object') return node.__bil.state
+  try {
+    const parsed = JSON.parse(String(stateWidget?.value ?? ''))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function replacePersistentReservation(node, stateWidget, queueWidget) {
+  if (outputMode(node) !== OUTPUT_MODE_PERSISTENT) return
+
+  const queueSlots = connectedQueueSlots(node)
+  const state = currentQueueState(node, stateWidget)
+  let reservation = null
+
+  if (queueSlots.length && state) {
+    const group = selectExecutionGroup(
+      Array.isArray(state.items) ? state.items : [],
+      queueSlots.length,
+      Boolean(state.dont_consume)
+    )
+    if (group.length === queueSlots.length) reservation = makeQueueReservationPayload(group)
+  }
+
+  const raw = reservation ? JSON.stringify(reservation) : '{}'
+  const next = runtimeQueueValue(node, raw)
+  queueWidget.value = next
+  queueWidget.callback?.(next)
 }
 
 function installNode(node, attempts = 0) {
@@ -134,21 +204,16 @@ function installNode(node, attempts = 0) {
   wrapSerializer(stateWidget, (raw) => runtimeStateValue(node, raw))
   preserveStateValue(node, stateWidget)
 
-  // queue_item_json is the backend's released topology contract. Crucially,
-  // always serialize reference_output_slots in persistent mode even when there
-  // is no main Conveyor reservation. Without that field the backend deliberately
-  // falls back to the legacy "all slots active" behavior.
+  // The core persistent reservation is historically fixed at one queue image.
+  // Let it run first for compatibility, then replace that reservation with the
+  // exact 0/1/2 members required by the connected+enabled image roles.
   const previousBeforeQueued = queueWidget.beforeQueued
   queueWidget.beforeQueued = function (...args) {
     const result = previousBeforeQueued?.apply(this, args)
-    preserveQueueValue(node, queueWidget)
+    replacePersistentReservation(node, stateWidget, queueWidget)
     return result
   }
   wrapSerializer(queueWidget, (raw) => runtimeQueueValue(node, raw))
-
-  // Do not eagerly create a queue snapshot before a queue action. The core
-  // beforeQueued hook first freezes any real reservation; our wrapper then adds
-  // the filtered topology without disturbing normal reservation ordering.
 }
 
 app.registerExtension({
