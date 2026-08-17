@@ -263,7 +263,7 @@ class ImageConveyorStateTest(unittest.TestCase):
         selected = conveyor._select_group(state, grouped_payload(a, b, c))
         self.assertEqual(["A", "B", "C"], [entry["id"] for _, entry in selected])
 
-    def test_output_layout_preserves_first_six_slots_and_appends_images(self):
+    def test_output_layout_preserves_existing_slots_and_appends_last_frame(self):
         self.assertEqual(
             ("IMAGE", "MASK", "STRING", "INT", "INT", "STRING"),
             conveyor.ImageConveyor.RETURN_TYPES[:6],
@@ -283,22 +283,24 @@ class ImageConveyorStateTest(unittest.TestCase):
                 "ref_image_7",
                 "ref_image_8",
             ),
-            conveyor.ImageConveyor.RETURN_NAMES[6:],
+            conveyor.ImageConveyor.RETURN_NAMES[6:14],
         )
-        self.assertEqual(("IMAGE",) * 8, conveyor.ImageConveyor.RETURN_TYPES[6:])
-        self.assertEqual(14, len(conveyor.ImageConveyor.RETURN_TYPES))
-        self.assertEqual(14, len(conveyor.ImageConveyor.RETURN_NAMES))
+        self.assertEqual("last_frame", conveyor.ImageConveyor.RETURN_NAMES[14])
+        self.assertEqual(("IMAGE",) * 9, conveyor.ImageConveyor.RETURN_TYPES[6:])
+        self.assertEqual(15, len(conveyor.ImageConveyor.RETURN_TYPES))
+        self.assertEqual(15, len(conveyor.ImageConveyor.RETURN_NAMES))
 
     def test_result_mapping_and_inactive_image_outputs(self):
         entries = [item("A"), item("B"), item("C"), item("D")]
         result = conveyor.ImageConveyor().load_next(
             self.state(entries, images_per_execution=3)
         )["result"]
-        self.assertEqual(14, len(result))
+        self.assertEqual(15, len(result))
         self.assertEqual("image:A.png [input]", result[0])
         self.assertEqual("image:B.png [input]", result[6])
         self.assertEqual("image:C.png [input]", result[7])
         self.assertEqual([None] * 6, list(result[8:14]))
+        self.assertEqual("image:B.png [input]", result[14])
         self.assertEqual(
             ["A.png [input]", "B.png [input]", "C.png [input]"],
             FakeLoadImage.calls,
@@ -318,7 +320,8 @@ class ImageConveyorStateTest(unittest.TestCase):
         self.assertEqual("image:R1.png [input]", result[6])
         self.assertIsNone(result[7])
         self.assertEqual("image:R3.png [input]", result[8])
-        self.assertEqual([None] * 5, list(result[9:]))
+        self.assertEqual([None] * 5, list(result[9:14]))
+        self.assertIsNone(result[14])
         self.assertEqual(1, result[4])
         self.assertEqual(["A.png [input]", "R1.png [input]", "R3.png [input]"], FakeLoadImage.calls)
         output_by_name = dict(zip(conveyor.ImageConveyor.RETURN_NAMES, result))
@@ -326,6 +329,7 @@ class ImageConveyorStateTest(unittest.TestCase):
         self.assertEqual("image:R1.png [input]", output_by_name["ref_image_1"])
         self.assertIsNone(output_by_name["ref_image_2"])
         self.assertEqual("image:R3.png [input]", output_by_name["ref_image_3"])
+        self.assertIsNone(output_by_name["last_frame"])
         delta = json.loads(conveyor.ImageConveyor().load_next(
             self.state(entries, output_mode="persistent_refs", reference_slots=refs)
         )["ui"]["batch_image_loader_delta"][0])
