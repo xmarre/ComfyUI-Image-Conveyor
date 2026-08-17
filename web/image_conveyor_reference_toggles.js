@@ -12,27 +12,33 @@ import {
   referenceToggleHit,
   toggleMainOutputEnabled,
   toggleReferenceToggleMask
-} from './image_conveyor_reference_toggles_math.mjs?v=20260817d'
+} from './image_conveyor_reference_toggles_math.mjs?v=20260817e'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.ReferenceSlotToggles'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
+const STATE_WIDGET = 'state_json'
 const QUEUE_WIDGET = 'queue_item_json'
 const OUTPUT_MODE_PERSISTENT = 'persistent_refs'
 const REFERENCE_SLOT_COUNT = 8
 const REFERENCE_OUTPUT_START_INDEX = 6
 const REFERENCE_PROPERTY_KEY = 'image_conveyor_reference_enabled'
 const MAIN_PROPERTY_KEY = 'image_conveyor_main_enabled'
+const REFERENCE_STATE_KEY = 'reference_output_enabled'
+const MAIN_STATE_KEY = 'main_output_enabled'
 const INSTALL_RETRY_LIMIT = 120
 const patchedNodes = new Set()
 let graphToPromptPatched = false
 let promptNodeDefsPromise = null
 
 function getWidget(node, name) {
-  return (node.widgets ?? []).find((entry) => entry?.name === name) ?? null
+  return (node?.widgets ?? []).find((entry) => entry?.name === name) ?? null
 }
 
 function currentMask(node) {
-  return normalizeReferenceToggleMask(node?.properties?.[REFERENCE_PROPERTY_KEY], REFERENCE_SLOT_COUNT)
+  return normalizeReferenceToggleMask(
+    node?.properties?.[REFERENCE_PROPERTY_KEY],
+    REFERENCE_SLOT_COUNT
+  )
 }
 
 function currentMainEnabled(node) {
@@ -49,12 +55,37 @@ function commitProperties(node) {
   node.setDirtyCanvas?.(true, true)
 }
 
+function syncToggleRuntimeState(node) {
+  const stateWidget = getWidget(node, STATE_WIDGET)
+  if (!stateWidget || typeof stateWidget.value !== 'string') return false
+
+  let state
+  try {
+    state = JSON.parse(stateWidget.value)
+  } catch {
+    return false
+  }
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return false
+
+  const next = JSON.stringify({
+    ...state,
+    [REFERENCE_STATE_KEY]: currentMask(node),
+    [MAIN_STATE_KEY]: currentMainEnabled(node)
+  })
+  if (next === stateWidget.value) return false
+
+  stateWidget.value = next
+  stateWidget.callback?.(next)
+  return true
+}
+
 function setMask(node, mask) {
   if (!node) return
   const properties = ensureProperties(node)
   const normalized = normalizeReferenceToggleMask(mask, REFERENCE_SLOT_COUNT)
   if (normalized.every(Boolean)) delete properties[REFERENCE_PROPERTY_KEY]
   else properties[REFERENCE_PROPERTY_KEY] = normalized
+  syncToggleRuntimeState(node)
   commitProperties(node)
 }
 
@@ -63,13 +94,14 @@ function setMainEnabled(node, enabled) {
   const properties = ensureProperties(node)
   if (normalizeMainOutputEnabled(enabled)) delete properties[MAIN_PROPERTY_KEY]
   else properties[MAIN_PROPERTY_KEY] = false
+  syncToggleRuntimeState(node)
   commitProperties(node)
 }
 
 function outputMode(node) {
   const cached = node?.__bil?.state?.output_mode
   if (cached) return String(cached)
-  const stateWidget = getWidget(node, 'state_json')
+  const stateWidget = getWidget(node, STATE_WIDGET)
   if (typeof stateWidget?.value !== 'string') return ''
   try {
     return String(JSON.parse(stateWidget.value)?.output_mode ?? '')
@@ -81,7 +113,8 @@ function outputMode(node) {
 function outputIndexByName(node, expectedName, fallback = -1) {
   const outputs = Array.isArray(node?.outputs) ? node.outputs : []
   const namedIndex = outputs.findIndex((output) => (
-    String(output?.name ?? '') === expectedName || String(output?.label ?? '') === expectedName
+    String(output?.name ?? '') === expectedName ||
+    String(output?.label ?? '') === expectedName
   ))
   if (namedIndex >= 0) return namedIndex
   return fallback >= 0 && fallback < outputs.length ? fallback : -1
@@ -95,6 +128,16 @@ function referenceOutputIndex(node, slotIndex) {
   )
 }
 
+function conveyorNodes(graph) {
+  const nodes = typeof graph?.computeExecutionOrder === 'function'
+    ? graph.computeExecutionOrder(false)
+    : (Array.isArray(graph?._nodes) ? graph._nodes : [])
+  return nodes.filter((node) => {
+    const type = String(node?.comfyClass || node?.type || '')
+    return NODE_CLASSES.has(type)
+  })
+}
+
 async function getPromptNodeDefs() {
   if (!promptNodeDefsPromise) {
     promptNodeDefsPromise = Promise.resolve(api.getNodeDefs())
@@ -105,7 +148,6 @@ async function getPromptNodeDefs() {
         return nodeDefs
       })
       .catch((error) => {
-        // Permit a later queue attempt to retry a transient /object_info failure.
         promptNodeDefsPromise = null
         throw error
       })
@@ -116,29 +158,38 @@ async function getPromptNodeDefs() {
 function promptInputRequired(prompt, nodeDefs, nodeId, inputName) {
   const classType = String(prompt?.[String(nodeId)]?.class_type ?? '')
   const contract = inputRequiredFromNodeDef(nodeDefs?.[classType], inputName)
-  if (contract !== null) return contract
-
-  // Frontend-only routing helpers such as Reroute may not exist in /object_info.
-  // Unknown contracts still fail closed as required, but ordinary backend nodes
-  // now use the authoritative required/optional schema instead of nodeData.
-  return true
+  return contract !== null ? contract : true
 }
 
-function disabledMainPromptOutputs(graph) {
-  const nodes = typeof graph?.computeExecutionOrder === 'function'
-    ? graph.computeExecutionOrder(false)
-    : (Array.isArray(graph?._nodes) ? graph._nodes : [])
+function disabledPromptOutputs(graph) {
   const disabled = []
-  for (const node of nodes) {
-    const type = String(node?.comfyClass || node?.type || '')
-    if (!NODE_CLASSES.has(type)) continue
-    if (outputMode(node) !== OUTPUT_MODE_PERSISTENT || currentMainEnabled(node)) continue
-    const outputIndexes = [
-      outputIndexByName(node, 'image', 0),
-      outputIndexByName(node, 'mask', 1)
-    ].filter((index, offset, all) => index >= 0 && all.indexOf(index) === offset)
-    if (outputIndexes.length) disabled.push({ nodeId: String(node.id), outputIndexes })
+
+  for (const node of conveyorNodes(graph)) {
+    if (outputMode(node) !== OUTPUT_MODE_PERSISTENT) continue
+
+    const outputIndexes = []
+
+    if (!currentMainEnabled(node)) {
+      outputIndexes.push(
+        outputIndexByName(node, 'image', 0),
+        outputIndexByName(node, 'mask', 1)
+      )
+    }
+
+    const mask = currentMask(node)
+    for (let slot = 0; slot < REFERENCE_SLOT_COUNT; slot += 1) {
+      if (mask[slot]) continue
+      outputIndexes.push(referenceOutputIndex(node, slot))
+    }
+
+    const unique = outputIndexes.filter(
+      (index, offset, all) => index >= 0 && all.indexOf(index) === offset
+    )
+    if (unique.length) {
+      disabled.push({ nodeId: String(node.id), outputIndexes: unique })
+    }
   }
+
   return disabled
 }
 
@@ -146,28 +197,41 @@ function installGraphToPromptFilter() {
   if (graphToPromptPatched || typeof app.graphToPrompt !== 'function') return
   graphToPromptPatched = true
   const previous = app.graphToPrompt
+
   app.graphToPrompt = async function (...args) {
     const graph = args[0] ?? this.rootGraph ?? app.graph
+
+    // This extension is the code that owns the visible switches, so synchronize
+    // their state here immediately before serialization. This makes the toggle
+    // state backend-visible even if another extension replaced a beforeQueued
+    // callback after this node was installed.
+    for (const node of conveyorNodes(graph)) syncToggleRuntimeState(node)
+
     const result = await previous.apply(this, args)
-    const disabled = disabledMainPromptOutputs(graph)
+    const disabled = disabledPromptOutputs(graph)
+
     if (disabled.length && result?.output && typeof result.output === 'object') {
-      // Current LGraphNode.nodeData intentionally contains only high-level node
-      // metadata. Required/optional input categories come from /object_info.
       const nodeDefs = await getPromptNodeDefs()
       pruneDisabledOutputBranches(
         result.output,
         disabled,
-        (nodeId, inputName) => promptInputRequired(result.output, nodeDefs, nodeId, inputName)
+        (nodeId, inputName) => (
+          promptInputRequired(result.output, nodeDefs, nodeId, inputName)
+        )
       )
     }
+
     return result
   }
 }
 
 function roundedRect(context, x, y, width, height, radius) {
   context.beginPath()
-  if (typeof context.roundRect === 'function') context.roundRect(x, y, width, height, radius)
-  else context.rect(x, y, width, height)
+  if (typeof context.roundRect === 'function') {
+    context.roundRect(x, y, width, height, radius)
+  } else {
+    context.rect(x, y, width, height)
+  }
 }
 
 function drawToggle(context, rect, enabled, hovered) {
@@ -190,7 +254,9 @@ function drawToggle(context, rect, enabled, hovered) {
   const knobY = rect.y + rect.height / 2
   context.beginPath()
   context.arc(knobX, knobY, knobRadius, 0, Math.PI * 2)
-  context.fillStyle = enabled ? 'rgba(248,251,255,.98)' : 'rgba(220,224,230,.82)'
+  context.fillStyle = enabled
+    ? 'rgba(248,251,255,.98)'
+    : 'rgba(220,224,230,.82)'
   context.fill()
 }
 
@@ -198,6 +264,7 @@ function outputToggleRect(node, context, outputIndex, shelfRight) {
   if (outputIndex < 0 || typeof node.getConnectionPos !== 'function') return null
   const output = node.outputs?.[outputIndex]
   if (!output) return null
+
   const graphPosition = [0, 0]
   const returned = node.getConnectionPos(false, outputIndex, graphPosition) ?? graphPosition
   const nodeX = Number(node.pos?.[0] || 0)
@@ -205,6 +272,7 @@ function outputToggleRect(node, context, outputIndex, shelfRight) {
   const socketX = Number(returned?.[0] ?? graphPosition[0]) - nodeX
   const centerY = Number(returned?.[1] ?? graphPosition[1]) - nodeY
   if (!Number.isFinite(socketX) || !Number.isFinite(centerY)) return null
+
   const label = String(output.label || output.name || '')
   context.font = node.innerFontStyle
   const labelWidth = context.measureText(label).width
@@ -226,9 +294,11 @@ function drawOutputToggles(node, context) {
   const ctx = node?.__bil
   const ext = ctx?.referenceToggles
   if (!ctx || !ext || ctx.removed) return
+
   ext.hitboxes = []
   ext.mainHitbox = null
   if (node.flags?.collapsed || outputMode(node) !== OUTPUT_MODE_PERSISTENT) return
+
   const shelf = ctx.referenceShelfLayout
   if (!shelf?.usable || typeof node.getConnectionPos !== 'function') return
 
@@ -238,7 +308,12 @@ function drawOutputToggles(node, context) {
   const mainRect = outputToggleRect(node, context, mainIndex, shelf.right)
   if (mainRect) {
     ext.mainHitbox = expandedHitbox(0, mainRect)
-    drawToggle(context, mainRect, currentMainEnabled(node), ext.hoverTarget === 'main')
+    drawToggle(
+      context,
+      mainRect,
+      currentMainEnabled(node),
+      ext.hoverTarget === 'main'
+    )
   }
 
   const mask = currentMask(node)
@@ -246,9 +321,16 @@ function drawOutputToggles(node, context) {
     const outputIndex = referenceOutputIndex(node, index)
     const rect = outputToggleRect(node, context, outputIndex, shelf.right)
     if (!rect) continue
+
     ext.hitboxes.push(expandedHitbox(index, rect))
-    drawToggle(context, rect, mask[index], ext.hoverTarget === `reference:${index}`)
+    drawToggle(
+      context,
+      rect,
+      mask[index],
+      ext.hoverTarget === `reference:${index}`
+    )
   }
+
   context.restore()
 }
 
@@ -258,7 +340,11 @@ function eventLocalPoint(node, event, localPosition = null) {
     const y = Number(localPosition[1])
     return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null
   }
-  try { app.canvas?.adjustMouseEvent?.(event) } catch {}
+
+  try {
+    app.canvas?.adjustMouseEvent?.(event)
+  } catch {}
+
   const canvasX = Number(event?.canvasX)
   const canvasY = Number(event?.canvasY)
   if (!Number.isFinite(canvasX) || !Number.isFinite(canvasY)) return null
@@ -271,13 +357,24 @@ function eventLocalPoint(node, event, localPosition = null) {
 function toggleAtEvent(node, event, localPosition = null) {
   const ext = node?.__bil?.referenceToggles
   if (!ext || outputMode(node) !== OUTPUT_MODE_PERSISTENT) return null
+
   const point = eventLocalPoint(node, event, localPosition)
   if (!point) return null
-  if (referenceToggleHit(ext.mainHitbox ? [ext.mainHitbox] : [], point.x, point.y) != null) {
+
+  if (
+    referenceToggleHit(
+      ext.mainHitbox ? [ext.mainHitbox] : [],
+      point.x,
+      point.y
+    ) != null
+  ) {
     return { kind: 'main' }
   }
+
   const referenceIndex = referenceToggleHit(ext.hitboxes, point.x, point.y)
-  return referenceIndex == null ? null : { kind: 'reference', index: referenceIndex }
+  return referenceIndex == null
+    ? null
+    : { kind: 'reference', index: referenceIndex }
 }
 
 function clearTransientQueueSnapshot(node) {
@@ -293,23 +390,40 @@ function toggleTarget(node, target) {
     clearTransientQueueSnapshot(node)
     return true
   }
+
   if (
     target?.kind !== 'reference' ||
     !Number.isInteger(target.index) ||
     target.index < 0 ||
     target.index >= REFERENCE_SLOT_COUNT
-  ) return false
-  const next = toggleReferenceToggleMask(currentMask(node), target.index, REFERENCE_SLOT_COUNT)
+  ) {
+    return false
+  }
+
+  const next = toggleReferenceToggleMask(
+    currentMask(node),
+    target.index,
+    REFERENCE_SLOT_COUNT
+  )
   setMask(node, next)
   clearTransientQueueSnapshot(node)
   return true
 }
 
 function parseQueuedPayload(queueWidget) {
-  if (!queueWidget || typeof queueWidget.value !== 'string' || !queueWidget.value.trim()) return null
+  if (
+    !queueWidget ||
+    typeof queueWidget.value !== 'string' ||
+    !queueWidget.value.trim()
+  ) {
+    return null
+  }
+
   try {
     const payload = JSON.parse(queueWidget.value)
-    return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null
+    return payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? payload
+      : null
   } catch {
     return null
   }
@@ -323,14 +437,18 @@ function writeQueuedPayload(queueWidget, payload) {
 
 function applyOutputTogglesToQueuedSnapshot(node, queueWidget) {
   if (outputMode(node) !== OUTPUT_MODE_PERSISTENT || !queueWidget) return
+
   const mainEnabled = currentMainEnabled(node)
   let payload = parseQueuedPayload(queueWidget)
 
   if (!mainEnabled) {
-    // Rebuild a reference-only snapshot. This intentionally discards any queue
-    // reservation produced by the core beforeQueued hook, so afterQueued has no
-    // members to mark as queued and the backend has no image to consume.
-    payload = snapshotReferenceOutputConnections({}, OUTPUT_MODE_PERSISTENT, node.outputs)
+    // Drop any main-image reservation while preserving the current connected
+    // reference topology. The mask below then removes disabled reference slots.
+    payload = snapshotReferenceOutputConnections(
+      {},
+      OUTPUT_MODE_PERSISTENT,
+      node.outputs
+    )
   } else if (!payload) {
     return
   }
@@ -341,6 +459,7 @@ function applyOutputTogglesToQueuedSnapshot(node, queueWidget) {
     REFERENCE_SLOT_COUNT
   )
   payload = applyMainOutputToggleToReservation(payload, mainEnabled)
+
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return
   writeQueuedPayload(queueWidget, payload)
 }
@@ -348,8 +467,10 @@ function applyOutputTogglesToQueuedSnapshot(node, queueWidget) {
 function wrapBeforeQueued(node, queueWidget, ext) {
   const previous = queueWidget.beforeQueued
   ext.previousBeforeQueued = previous
+
   queueWidget.beforeQueued = function (...args) {
     const result = previous?.apply(this, args)
+    syncToggleRuntimeState(node)
     applyOutputTogglesToQueuedSnapshot(node, queueWidget)
     return result
   }
@@ -357,8 +478,10 @@ function wrapBeforeQueued(node, queueWidget, ext) {
 
 function installNode(node, attempts = 0) {
   if (!node || attempts > INSTALL_RETRY_LIMIT) return
+
   const ctx = node.__bil
   if (ctx?.removed) return
+
   const queueWidget = getWidget(node, QUEUE_WIDGET)
   if (!ctx || !queueWidget || typeof queueWidget.beforeQueued !== 'function') {
     requestAnimationFrame(() => installNode(node, attempts + 1))
@@ -375,6 +498,7 @@ function installNode(node, attempts = 0) {
   }
   ctx.referenceToggles = ext
   wrapBeforeQueued(node, queueWidget, ext)
+  syncToggleRuntimeState(node)
 
   const previousDrawForeground = node.onDrawForeground
   node.onDrawForeground = function (context, ...args) {
@@ -404,6 +528,7 @@ function installNode(node, attempts = 0) {
       : target?.kind === 'reference'
         ? `reference:${target.index}`
         : null
+
     if (ext.hoverTarget !== nextHover) {
       ext.hoverTarget = nextHover
       node.setDirtyCanvas?.(true, false)
@@ -435,17 +560,24 @@ function installNode(node, attempts = 0) {
 
 app.registerExtension({
   name: EXTENSION_NAME,
+
   setup() {
-    // Pre-warm the authoritative input contract cache. Queue-time lookup still
-    // awaits/retries it if this request is transiently unavailable.
     void getPromptNodeDefs().catch((error) => {
-      console.warn('Image Conveyor: unable to pre-load ComfyUI node definitions.', error)
+      console.warn(
+        'Image Conveyor: unable to pre-load ComfyUI node definitions.',
+        error
+      )
     })
     installGraphToPromptFilter()
   },
+
   nodeCreated(node) {
     const type = String(node?.comfyClass || node?.type || '')
     if (!NODE_CLASSES.has(type)) return
     queueMicrotask(() => installNode(node))
+  },
+
+  afterConfigureGraph() {
+    for (const node of conveyorNodes(app.rootGraph)) installNode(node)
   }
 })
