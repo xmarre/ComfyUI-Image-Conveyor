@@ -92,8 +92,31 @@ class CharacterConsistencyTest(unittest.TestCase):
         registry.add_members(stale["id"], [shared_path])
         return registry, owner, owner_character, stale, stale_character, shared_path
 
+    def test_unmanaged_reference_still_materializes_into_target_character(self):
+        source = self.image("incoming/portrait.png", b"portrait")
+        preset = self.service.preset_store.create("Target", slots())
+        registry, character = self.character(preset)
+
+        result = drag.materialize_character_files(
+            self.service,
+            preset["id"],
+            ["incoming/portrait.png"],
+        )
+
+        self.assertFalse(source.exists())
+        self.assertEqual(len(result["moved"]), 1)
+        canonical = result["moved"][0]["keep_path"]
+        self.assertTrue(canonical.startswith(f"{character['folder']}/"))
+        self.assertTrue((self.input / Path(canonical)).is_file())
+        refreshed = next(
+            entry
+            for entry in registry.ensure_for_presets(self.service.preset_store.list())
+            if entry["preset_id"] == preset["id"]
+        )
+        self.assertIn(canonical, refreshed["members"])
+
     def test_cross_character_reference_is_shared_without_rehoming_the_file(self):
-        registry, owner, owner_character, stale, stale_character, shared_path = self.make_shared_reference_state()
+        registry, owner, _owner_character, stale, stale_character, shared_path = self.make_shared_reference_state()
 
         result = drag.materialize_character_files(self.service, stale["id"], [shared_path])
 
@@ -112,7 +135,7 @@ class CharacterConsistencyTest(unittest.TestCase):
         self.assertEqual(saved_owner["slots"][0]["annotated"], f"{shared_path} [input]")
 
     def test_repeated_migration_of_stale_unsaved_preset_state_is_idempotent(self):
-        _registry, owner, owner_character, stale, stale_character, shared_path = self.make_shared_reference_state()
+        _registry, owner, _owner_character, stale, stale_character, shared_path = self.make_shared_reference_state()
 
         first = drag.migrate_character_libraries(self.service)
         second = drag.migrate_character_libraries(self.service)
