@@ -12,7 +12,7 @@ import {
   referenceToggleHit,
   toggleMainOutputEnabled,
   toggleReferenceToggleMask
-} from './image_conveyor_reference_toggles_math.mjs?v=20260817e'
+} from './image_conveyor_reference_toggles_math.mjs?v=20260818a'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.ReferenceSlotToggles'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -128,14 +128,27 @@ function referenceOutputIndex(node, slotIndex) {
   )
 }
 
-function conveyorNodes(graph) {
-  const nodes = typeof graph?.computeExecutionOrder === 'function'
+function graphNodes(graph) {
+  return typeof graph?.computeExecutionOrder === 'function'
     ? graph.computeExecutionOrder(false)
     : (Array.isArray(graph?._nodes) ? graph._nodes : [])
-  return nodes.filter((node) => {
+}
+
+function conveyorNodes(graph) {
+  return graphNodes(graph).filter((node) => {
     const type = String(node?.comfyClass || node?.type || '')
     return NODE_CLASSES.has(type)
   })
+}
+
+function graphNodeById(graph, nodeId) {
+  const wanted = String(nodeId ?? '')
+  if (!wanted) return null
+  try {
+    const direct = graph?.getNodeById?.(nodeId) ?? graph?.getNodeById?.(Number(nodeId))
+    if (direct) return direct
+  } catch {}
+  return graphNodes(graph).find((node) => String(node?.id ?? '') === wanted) ?? null
 }
 
 async function getPromptNodeDefs() {
@@ -155,10 +168,14 @@ async function getPromptNodeDefs() {
   return await promptNodeDefsPromise
 }
 
-function promptInputRequired(prompt, nodeDefs, nodeId, inputName) {
+function promptInputRequired(prompt, nodeDefs, graph, nodeId, inputName) {
   const classType = String(prompt?.[String(nodeId)]?.class_type ?? '')
-  const contract = inputRequiredFromNodeDef(nodeDefs?.[classType], inputName)
-  return contract !== null ? contract : true
+  const objectInfoContract = inputRequiredFromNodeDef(nodeDefs?.[classType], inputName)
+  if (objectInfoContract !== null) return objectInfoContract
+
+  const liveNode = graphNodeById(graph, nodeId)
+  const liveNodeDef = liveNode?.constructor?.nodeData ?? liveNode?.nodeData ?? null
+  return inputRequiredFromNodeDef(liveNodeDef, inputName)
 }
 
 function disabledPromptOutputs(graph) {
@@ -216,7 +233,7 @@ function installGraphToPromptFilter() {
         result.output,
         disabled,
         (nodeId, inputName) => (
-          promptInputRequired(result.output, nodeDefs, nodeId, inputName)
+          promptInputRequired(result.output, nodeDefs, graph, nodeId, inputName)
         )
       )
     }
