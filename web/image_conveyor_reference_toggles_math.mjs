@@ -80,14 +80,16 @@ function promptLink(value) {
 /**
  * Remove disabled output branches from a freshly serialized ComfyUI API prompt.
  * Required consumers are pruned recursively until an optional input boundary is
- * reached; optional inputs are simply omitted. The workflow graph is never
- * mutated, so editor links remain connected and saved workflow topology is
- * unchanged.
+ * reached; optional inputs are simply omitted. Unknown contracts are also
+ * omitted instead of deleting their consumer, leaving ComfyUI's backend input
+ * validation authoritative if that socket is actually required. The workflow
+ * graph is never mutated, so editor links remain connected and saved workflow
+ * topology is unchanged.
  */
 export function pruneDisabledOutputBranches(
   prompt,
   disabledOutputs,
-  isRequiredInput = () => true
+  isRequiredInput = () => null
 ) {
   if (!prompt || typeof prompt !== 'object' || Array.isArray(prompt)) return prompt
 
@@ -111,11 +113,14 @@ export function pruneDisabledOutputBranches(
     queued.add(id)
     deletionQueue.push(id)
   }
-  const required = (nodeId, inputName) => {
+  const requirement = (nodeId, inputName) => {
     try {
-      return isRequiredInput(String(nodeId), String(inputName)) !== false
+      const value = isRequiredInput(String(nodeId), String(inputName))
+      if (value === true) return true
+      if (value === false) return false
+      return null
     } catch {
-      return true
+      return null
     }
   }
 
@@ -124,7 +129,7 @@ export function pruneDisabledOutputBranches(
     for (const [inputName, value] of Object.entries(node.inputs)) {
       const link = promptLink(value)
       if (!link || !disabled.has(`${link.nodeId}:${link.outputIndex}`)) continue
-      if (required(nodeId, inputName)) enqueue(nodeId)
+      if (requirement(nodeId, inputName) === true) enqueue(nodeId)
       else delete node.inputs[inputName]
     }
   }
@@ -141,7 +146,7 @@ export function pruneDisabledOutputBranches(
       for (const [inputName, value] of Object.entries(node.inputs)) {
         const link = promptLink(value)
         if (!link || link.nodeId !== sourceId) continue
-        if (required(nodeId, inputName)) enqueue(nodeId)
+        if (requirement(nodeId, inputName) === true) enqueue(nodeId)
         else delete node.inputs[inputName]
       }
     }
