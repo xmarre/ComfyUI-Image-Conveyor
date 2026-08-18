@@ -46,7 +46,7 @@ test('disabled direct reference link is omitted while Continuum first frame rema
   }
   const required = (nodeId, inputName) => {
     const classType = prompt[String(nodeId)]?.class_type
-    return inputRequiredFromNodeDef(nodeDefs[classType], inputName) ?? true
+    return inputRequiredFromNodeDef(nodeDefs[classType], inputName)
   }
 
   pruneDisabledOutputBranches(
@@ -62,7 +62,7 @@ test('disabled direct reference link is omitted while Continuum first frame rema
   assert.ok(prompt['214'])
 })
 
-test('disabled reference branch prunes required transforms and stops at Continuum optional input', () => {
+test('disabled reference branch propagates through required transforms and stops at Continuum optional input', () => {
   const prompt = {
     '164': { inputs: {}, class_type: 'ImageConveyor' },
     '123': {
@@ -99,7 +99,7 @@ test('disabled reference branch prunes required transforms and stops at Continuu
   }
   const required = (nodeId, inputName) => {
     const classType = prompt[String(nodeId)]?.class_type
-    return inputRequiredFromNodeDef(nodeDefs[classType], inputName) ?? true
+    return inputRequiredFromNodeDef(nodeDefs[classType], inputName)
   }
 
   pruneDisabledOutputBranches(
@@ -108,7 +108,12 @@ test('disabled reference branch prunes required transforms and stops at Continuu
     required
   )
 
-  assert.equal(prompt['123'], undefined)
+  // Required transforms remain serialized but are disconnected and therefore
+  // unreachable. The optional Continuum reference boundary is severed without
+  // deleting the sampler or any terminal/output path.
+  assert.ok(prompt['123'])
+  assert.equal(Object.hasOwn(prompt['123'].inputs, 'image'), false)
+  assert.deepEqual(prompt['123'].inputs.megapixels, 0.7)
   assert.equal(Object.hasOwn(prompt['214'].inputs, 'reference_image_1'), false)
   assert.deepEqual(prompt['214'].inputs.first_frame, ['219', 0])
   assert.deepEqual(prompt['214'].inputs.model, ['300', 0])
