@@ -26,6 +26,16 @@ def _managed_character_owner(relative_path: str, characters: Sequence[Dict[str, 
     return ""
 
 
+def _shared_file(path: str) -> Dict[str, Any]:
+    return {
+        "source_path": path,
+        "relative_path": path,
+        "moved": False,
+        "reused": True,
+        "deduplicated": False,
+    }
+
+
 def install_character_consistency(drag_module) -> None:
     """Patch character materialization before the HTTP routes capture it.
 
@@ -47,6 +57,7 @@ def install_character_consistency(drag_module) -> None:
     ) -> Dict[str, Any]:
         normalized_id = drag_module._normalize_preset_id(preset_id)
         paths = _normalize_path_batch(relative_paths)
+        protected = drag_module._protected_set(protected_paths)
         registry = _registry_for_service(service)
         presets = service.preset_store.list()
         characters = registry.ensure_for_presets(presets)
@@ -61,6 +72,11 @@ def install_character_consistency(drag_module) -> None:
         shared_paths = []
         movable_paths = []
         for path in paths:
+            # A protected/queued file must retain the original materialization
+            # semantics, including being reported as skipped instead of assigned.
+            if path in protected:
+                movable_paths.append(path)
+                continue
             owner = _managed_character_owner(path, characters)
             if owner and owner != normalized_id:
                 try:
@@ -88,16 +104,24 @@ def install_character_consistency(drag_module) -> None:
         except Exception as exc:  # pragma: no cover - exercised by existing registry failure paths
             membership_warning = "; ".join(filter(None, (membership_warning, str(exc))))
 
-        result["shared"] = [
-            {
-                "source_path": path,
-                "relative_path": path,
-                "moved": False,
-                "reused": True,
-                "deduplicated": False,
-            }
-            for path in shared_paths
+        shared_files = [_shared_file(path) for path in shared_paths]
+        result["shared"] = shared_files
+
+        # ``files`` is the established materialization response consumed by the
+        # frontend to populate Reference Shelf slots. Shared canonical files are
+        # successful materializations too, even though no physical move occurs.
+        # Preserve original request order when movable and shared paths are mixed.
+        resolved_by_source = {
+            str(entry.get("source_path") or ""): entry
+            for entry in list(result.get("files", [])) + shared_files
+            if isinstance(entry, dict) and entry.get("source_path")
+        }
+        result["files"] = [
+            resolved_by_source[path]
+            for path in paths
+            if path in resolved_by_source
         ]
+
         result["membership_warning"] = membership_warning
         try:
             refreshed = next(
