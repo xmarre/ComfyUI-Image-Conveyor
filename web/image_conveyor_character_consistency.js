@@ -49,7 +49,15 @@ function replacePresetSlots(ctx, presetId, slots) {
   return previous
 }
 
-async function persistPreset(node, desired, previousSlots, revision) {
+function upsertPreset(ctx, preset) {
+  if (!preset?.id) return
+  const index = (ctx.presets ?? []).findIndex((entry) => String(entry?.id || '') === String(preset.id))
+  const normalized = { ...preset, slots: normalizeReferenceSlots(preset.slots) }
+  if (index >= 0) ctx.presets[index] = normalized
+  else ctx.presets = [...(ctx.presets ?? []), normalized]
+}
+
+async function persistPreset(node, desired, revision) {
   const ctx = node.__bil
   const ext = ctx?.characterConsistency
   if (!ctx || !ext || ctx.removed) return
@@ -67,9 +75,10 @@ async function persistPreset(node, desired, previousSlots, revision) {
 
   const latest = ext.desiredByPreset.get(desired.presetId)
   if (!latest || latest.revision !== revision) return
-  const savedSlots = normalizeReferenceSlots(payload?.preset?.slots ?? desired.slots)
-  replacePresetSlots(ctx, desired.presetId, savedSlots)
+  if (payload?.preset) upsertPreset(ctx, payload.preset)
+  else replacePresetSlots(ctx, desired.presetId, desired.slots)
   ext.desiredByPreset.delete(desired.presetId)
+  ext.autosaveFailureShown = false
   node.setDirtyCanvas?.(true, false)
 }
 
@@ -77,13 +86,12 @@ function queuePresetAutosave(node, desired) {
   const ctx = node.__bil
   const ext = ctx?.characterConsistency
   if (!ctx || !ext || ctx.removed) return
+
   const preset = presetById(ctx, desired.presetId)
-  if (!preset) return
-  const savedSignature = referenceSlotSignature(preset.slots)
-  if (savedSignature === desired.signature) return
+  if (preset && referenceSlotSignature(preset.slots) === desired.signature) return
 
   const revision = ++ext.saveRevision
-  const previousSlots = replacePresetSlots(ctx, desired.presetId, desired.slots)
+  const previousSlots = preset ? replacePresetSlots(ctx, desired.presetId, desired.slots) : null
   ext.desiredByPreset.set(desired.presetId, { ...desired, revision })
   node.setDirtyCanvas?.(true, false)
 
@@ -92,7 +100,7 @@ function queuePresetAutosave(node, desired) {
     .then(async () => {
       const latest = ext.desiredByPreset.get(desired.presetId)
       if (!latest || latest.revision !== revision) return
-      await persistPreset(node, desired, previousSlots, revision)
+      await persistPreset(node, desired, revision)
     })
     .catch((error) => {
       const latest = ext.desiredByPreset.get(desired.presetId)
