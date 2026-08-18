@@ -12,7 +12,7 @@ import {
   referenceToggleHit,
   toggleMainOutputEnabled,
   toggleReferenceToggleMask
-} from './image_conveyor_reference_toggles_math.mjs?v=20260818a'
+} from './image_conveyor_reference_toggles_math.mjs?v=20260818b'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.ReferenceSlotToggles'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
