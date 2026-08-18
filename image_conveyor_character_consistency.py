@@ -88,18 +88,16 @@ def install_character_consistency(drag_module) -> None:
         except Exception as exc:  # pragma: no cover - exercised by existing registry failure paths
             membership_warning = "; ".join(filter(None, (membership_warning, str(exc))))
 
-        shared_files = [
+        result["shared"] = [
             {
                 "source_path": path,
                 "relative_path": path,
                 "moved": False,
                 "reused": True,
                 "deduplicated": False,
-                "shared": True,
             }
             for path in shared_paths
         ]
-        result["files"] = list(result.get("files", [])) + shared_files
         result["membership_warning"] = membership_warning
         try:
             refreshed = next(
