@@ -134,7 +134,7 @@ test('disabled main prompt pruning uses object-info contracts at the scaler-to-C
   }
   const resolve = (nodeId, inputName) => {
     const classType = prompt[String(nodeId)]?.class_type
-    return inputRequiredFromNodeDef(nodeDefs[classType], inputName) ?? true
+    return inputRequiredFromNodeDef(nodeDefs[classType], inputName)
   }
 
   pruneDisabledOutputBranches(
@@ -173,13 +173,54 @@ test('disabled main prompt pruning removes image and mask consumers independentl
   assert.deepEqual(prompt['4'].inputs, { keep: 1 })
 })
 
-test('unknown prompt input contracts fail closed as required', () => {
+test('unknown prompt input contracts remove only the disabled link and preserve the consumer', () => {
   const prompt = {
     '1': { inputs: {}, class_type: 'ImageConveyor' },
-    '2': { inputs: { mystery: ['1', 0] }, class_type: 'UnknownNode' }
+    '2': { inputs: { mystery: ['1', 0], keep: 7 }, class_type: 'UnknownNode' }
   }
   pruneDisabledOutputBranches(prompt, [{ nodeId: '1', outputIndexes: [0] }])
-  assert.equal(prompt['2'], undefined)
+  assert.ok(prompt['2'])
+  assert.deepEqual(prompt['2'].inputs, { keep: 7 })
+})
+
+test('unknown first-frame contract cannot erase a ref2va output branch', () => {
+  const prompt = {
+    '1': { inputs: {}, class_type: 'ImageConveyor' },
+    '2': {
+      inputs: {
+        first_frame: ['1', 0],
+        reference_image_1: ['1', 6],
+        reference_image_2: ['1', 7],
+        reference_image_3: ['1', 8],
+        model: ['10', 0]
+      },
+      class_type: 'H3ContinuumSamplerProduction'
+    },
+    '3': {
+      inputs: { samples: ['2', 0], vae: ['11', 0] },
+      class_type: 'VAEDecode'
+    },
+    '4': {
+      inputs: { images: ['3', 0] },
+      class_type: 'VideoCombine'
+    },
+    '10': { inputs: {}, class_type: 'ModelLoader' },
+    '11': { inputs: {}, class_type: 'VAELoader' }
+  }
+
+  pruneDisabledOutputBranches(
+    prompt,
+    [{ nodeId: '1', outputIndexes: [0, 1] }],
+    () => null
+  )
+
+  assert.ok(prompt['2'])
+  assert.equal(Object.hasOwn(prompt['2'].inputs, 'first_frame'), false)
+  assert.deepEqual(prompt['2'].inputs.reference_image_1, ['1', 6])
+  assert.deepEqual(prompt['2'].inputs.reference_image_2, ['1', 7])
+  assert.deepEqual(prompt['2'].inputs.reference_image_3, ['1', 8])
+  assert.ok(prompt['3'])
+  assert.ok(prompt['4'])
 })
 
 test('toggle geometry stays between the shelf and output label and hit testing is exact', () => {
