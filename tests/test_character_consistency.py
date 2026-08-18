@@ -108,6 +108,8 @@ class CharacterConsistencyTest(unittest.TestCase):
         canonical = result["moved"][0]["keep_path"]
         self.assertTrue(canonical.startswith(f"{character['folder']}/"))
         self.assertTrue((self.input / Path(canonical)).is_file())
+        self.assertEqual([entry["source_path"] for entry in result["files"]], ["incoming/portrait.png"])
+        self.assertEqual([entry["relative_path"] for entry in result["files"]], [canonical])
         refreshed = next(
             entry
             for entry in registry.ensure_for_presets(self.service.preset_store.list())
@@ -124,6 +126,9 @@ class CharacterConsistencyTest(unittest.TestCase):
         self.assertFalse((self.input / Path(stale_character["folder"]) / "portrait.png").exists())
         self.assertEqual(result["moved"], [])
         self.assertEqual([entry["relative_path"] for entry in result["shared"]], [shared_path])
+        # The frontend consumes payload.files, not the auxiliary shared field.
+        self.assertEqual([entry["source_path"] for entry in result["files"]], [shared_path])
+        self.assertEqual([entry["relative_path"] for entry in result["files"]], [shared_path])
 
         characters = {
             entry["preset_id"]: entry
@@ -133,6 +138,41 @@ class CharacterConsistencyTest(unittest.TestCase):
         self.assertIn(shared_path, characters[stale["id"]]["members"])
         saved_owner = next(entry for entry in self.service.preset_store.list() if entry["id"] == owner["id"])
         self.assertEqual(saved_owner["slots"][0]["annotated"], f"{shared_path} [input]")
+
+    def test_mixed_shared_and_unmanaged_results_keep_drop_order(self):
+        _registry, _owner, _owner_character, stale, stale_character, shared_path = self.make_shared_reference_state()
+        incoming = self.image("incoming/second.png", b"second")
+
+        result = drag.materialize_character_files(
+            self.service,
+            stale["id"],
+            [shared_path, "incoming/second.png"],
+        )
+
+        self.assertFalse(incoming.exists())
+        self.assertEqual(
+            [entry["source_path"] for entry in result["files"]],
+            [shared_path, "incoming/second.png"],
+        )
+        self.assertEqual(result["files"][0]["relative_path"], shared_path)
+        moved_second = result["files"][1]["relative_path"]
+        self.assertTrue(moved_second.startswith(f"{stale_character['folder']}/"))
+        self.assertTrue((self.input / Path(moved_second)).is_file())
+
+    def test_protected_shared_reference_remains_skipped(self):
+        _registry, _owner, _owner_character, stale, _stale_character, shared_path = self.make_shared_reference_state()
+
+        result = drag.materialize_character_files(
+            self.service,
+            stale["id"],
+            [shared_path],
+            protected_paths=[shared_path],
+        )
+
+        self.assertEqual(result["files"], [])
+        self.assertEqual(result.get("shared", []), [])
+        self.assertEqual([entry["relative_path"] for entry in result["skipped"]], [shared_path])
+        self.assertTrue((self.input / Path(shared_path)).is_file())
 
     def test_repeated_migration_of_stale_unsaved_preset_state_is_idempotent(self):
         _registry, owner, _owner_character, stale, stale_character, shared_path = self.make_shared_reference_state()
