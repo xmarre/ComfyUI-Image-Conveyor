@@ -98,7 +98,7 @@ test('object-info input contracts distinguish required and optional sockets', ()
   assert.equal(inputRequiredFromNodeDef(null, 'first_frame'), null)
 })
 
-test('disabled main prompt pruning uses object-info contracts at the scaler-to-Continuum boundary', () => {
+test('disabled main pruning propagates through required preprocessing and stops at optional Continuum first_frame', () => {
   const prompt = {
     '164': { inputs: {}, class_type: 'ImageConveyor' },
     '123': {
@@ -113,7 +113,16 @@ test('disabled main prompt pruning uses object-info contracts at the scaler-to-C
       },
       class_type: 'H3ContinuumSamplerProduction'
     },
-    '300': { inputs: {}, class_type: 'ModelLoader' }
+    '210': {
+      inputs: { samples: ['200', 0], vae: ['301', 0] },
+      class_type: 'VAEDecode'
+    },
+    '220': {
+      inputs: { images: ['210', 0] },
+      class_type: 'VideoCombine'
+    },
+    '300': { inputs: {}, class_type: 'ModelLoader' },
+    '301': { inputs: {}, class_type: 'VAELoader' }
   }
   const nodeDefs = {
     ImageScaleToTotalPixelsX: {
@@ -143,15 +152,19 @@ test('disabled main prompt pruning uses object-info contracts at the scaler-to-C
     resolve
   )
 
-  assert.equal(prompt['123'], undefined)
+  // Required preprocessing becomes unreachable instead of being deleted from
+  // the serialized prompt. The optional first_frame boundary is severed.
+  assert.ok(prompt['123'])
+  assert.equal(Object.hasOwn(prompt['123'].inputs, 'image'), false)
   assert.equal(Object.hasOwn(prompt['200'].inputs, 'first_frame'), false)
   assert.deepEqual(prompt['200'].inputs.reference_image_1, ['164', 6])
   assert.deepEqual(prompt['200'].inputs.model, ['300', 0])
-  assert.ok(prompt['164'])
   assert.ok(prompt['200'])
+  assert.ok(prompt['210'])
+  assert.ok(prompt['220'])
 })
 
-test('disabled main prompt pruning removes image and mask consumers independently', () => {
+test('disabled main pruning keeps required image and mask consumers serialized but unreachable', () => {
   const prompt = {
     '1': { inputs: {}, class_type: 'ImageConveyor' },
     '2': { inputs: { image: ['1', 0] }, class_type: 'RequiredImageNode' },
@@ -165,12 +178,34 @@ test('disabled main prompt pruning removes image and mask consumers independentl
   pruneDisabledOutputBranches(
     prompt,
     [{ nodeId: 1, outputIndexes: [0, 1] }],
-    (nodeId, inputName) => nodeId === '2' || nodeId === '3'
+    (nodeId) => nodeId === '2' || nodeId === '3'
   )
 
-  assert.equal(prompt['2'], undefined)
-  assert.equal(prompt['3'], undefined)
+  assert.ok(prompt['2'])
+  assert.ok(prompt['3'])
+  assert.deepEqual(prompt['2'].inputs, {})
+  assert.deepEqual(prompt['3'].inputs, {})
   assert.deepEqual(prompt['4'].inputs, { keep: 1 })
+})
+
+test('pruning never deletes terminal nodes even through an all-required chain', () => {
+  const prompt = {
+    '1': { inputs: {}, class_type: 'ImageConveyor' },
+    '2': { inputs: { image: ['1', 0] }, class_type: 'RequiredA' },
+    '3': { inputs: { image: ['2', 0] }, class_type: 'RequiredB' },
+    '4': { inputs: { images: ['3', 0] }, class_type: 'OutputNode' }
+  }
+
+  pruneDisabledOutputBranches(
+    prompt,
+    [{ nodeId: '1', outputIndexes: [0] }],
+    () => true
+  )
+
+  assert.deepEqual(Object.keys(prompt).sort(), ['1', '2', '3', '4'])
+  assert.deepEqual(prompt['2'].inputs, {})
+  assert.deepEqual(prompt['3'].inputs, {})
+  assert.deepEqual(prompt['4'].inputs, {})
 })
 
 test('unknown prompt input contracts remove only the disabled link and preserve the consumer', () => {
