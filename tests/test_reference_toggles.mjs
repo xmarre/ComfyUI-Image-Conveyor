@@ -42,12 +42,7 @@ test('toggling preserves the fixed eight-slot shape', () => {
 test('queue snapshot filtering removes only valid disabled reference slots', () => {
   const mask = [true, false, true, true, false, true, true, false]
   assert.deepEqual(filterReferenceOutputSlotsByToggleMask([1, 2, 5, 8], mask), [1])
-
-  // Preserve malformed entries so backend validation remains authoritative instead of hiding corruption.
-  assert.deepEqual(
-    filterReferenceOutputSlotsByToggleMask([1, '2', 9, 2], mask),
-    [1, '2', 9]
-  )
+  assert.deepEqual(filterReferenceOutputSlotsByToggleMask([1, '2', 9, 2], mask), [1, '2', 9])
   assert.equal(filterReferenceOutputSlotsByToggleMask(null, mask), null)
 })
 
@@ -90,7 +85,6 @@ test('object-info input contracts distinguish required and optional sockets', ()
       }
     }
   }
-
   assert.equal(inputRequiredFromNodeDef(h3Definition, 'model'), true)
   assert.equal(inputRequiredFromNodeDef(h3Definition, 'first_frame'), false)
   assert.equal(inputRequiredFromNodeDef(h3Definition, 'reference_image_1'), false)
@@ -98,79 +92,61 @@ test('object-info input contracts distinguish required and optional sockets', ()
   assert.equal(inputRequiredFromNodeDef(null, 'first_frame'), null)
 })
 
-test('disabled main prompt pruning uses object-info contracts at the scaler-to-Continuum boundary', () => {
+test('disabled main pruning propagates through required preprocessing and stops at optional Continuum first_frame', () => {
   const prompt = {
     '164': { inputs: {}, class_type: 'ImageConveyor' },
-    '123': {
-      inputs: { image: ['164', 0], megapixels: 0.7 },
-      class_type: 'ImageScaleToTotalPixelsX'
-    },
+    '123': { inputs: { image: ['164', 0], megapixels: 0.7 }, class_type: 'ImageScaleToTotalPixelsX' },
     '200': {
-      inputs: {
-        first_frame: ['123', 0],
-        reference_image_1: ['164', 6],
-        model: ['300', 0]
-      },
+      inputs: { first_frame: ['123', 0], reference_image_1: ['164', 6], model: ['300', 0] },
       class_type: 'H3ContinuumSamplerProduction'
     },
-    '300': { inputs: {}, class_type: 'ModelLoader' }
+    '210': { inputs: { samples: ['200', 0], vae: ['301', 0] }, class_type: 'VAEDecode' },
+    '220': { inputs: { images: ['210', 0] }, class_type: 'VideoCombine' },
+    '300': { inputs: {}, class_type: 'ModelLoader' },
+    '301': { inputs: {}, class_type: 'VAELoader' }
   }
   const nodeDefs = {
-    ImageScaleToTotalPixelsX: {
-      input: {
-        required: { image: ['IMAGE', {}], megapixels: ['FLOAT', {}] },
-        optional: {}
-      }
-    },
-    H3ContinuumSamplerProduction: {
-      input: {
-        required: { model: ['MODEL', {}] },
-        optional: {
-          first_frame: ['IMAGE', {}],
-          reference_image_1: ['IMAGE', {}]
-        }
-      }
-    }
+    ImageScaleToTotalPixelsX: { input: { required: { image: ['IMAGE', {}], megapixels: ['FLOAT', {}] }, optional: {} } },
+    H3ContinuumSamplerProduction: { input: { required: { model: ['MODEL', {}] }, optional: { first_frame: ['IMAGE', {}], reference_image_1: ['IMAGE', {}] } } }
   }
-  const resolve = (nodeId, inputName) => {
-    const classType = prompt[String(nodeId)]?.class_type
-    return inputRequiredFromNodeDef(nodeDefs[classType], inputName)
-  }
-
-  pruneDisabledOutputBranches(
-    prompt,
-    [{ nodeId: '164', outputIndexes: [0, 1] }],
-    resolve
-  )
-
-  assert.equal(prompt['123'], undefined)
+  const resolve = (nodeId, inputName) => inputRequiredFromNodeDef(nodeDefs[prompt[String(nodeId)]?.class_type], inputName)
+  pruneDisabledOutputBranches(prompt, [{ nodeId: '164', outputIndexes: [0, 1] }], resolve)
+  assert.ok(prompt['123'])
+  assert.equal(Object.hasOwn(prompt['123'].inputs, 'image'), false)
   assert.equal(Object.hasOwn(prompt['200'].inputs, 'first_frame'), false)
   assert.deepEqual(prompt['200'].inputs.reference_image_1, ['164', 6])
-  assert.deepEqual(prompt['200'].inputs.model, ['300', 0])
-  assert.ok(prompt['164'])
   assert.ok(prompt['200'])
+  assert.ok(prompt['210'])
+  assert.ok(prompt['220'])
 })
 
-test('disabled main prompt pruning removes image and mask consumers independently', () => {
+test('disabled main pruning keeps required image and mask consumers serialized but unreachable', () => {
   const prompt = {
     '1': { inputs: {}, class_type: 'ImageConveyor' },
     '2': { inputs: { image: ['1', 0] }, class_type: 'RequiredImageNode' },
     '3': { inputs: { mask: ['1', 1] }, class_type: 'RequiredMaskNode' },
-    '4': {
-      inputs: { optional_image: ['2', 0], optional_mask: ['3', 0], keep: 1 },
-      class_type: 'OptionalConsumer'
-    }
+    '4': { inputs: { optional_image: ['2', 0], optional_mask: ['3', 0], keep: 1 }, class_type: 'OptionalConsumer' }
   }
-
-  pruneDisabledOutputBranches(
-    prompt,
-    [{ nodeId: 1, outputIndexes: [0, 1] }],
-    (nodeId, inputName) => nodeId === '2' || nodeId === '3'
-  )
-
-  assert.equal(prompt['2'], undefined)
-  assert.equal(prompt['3'], undefined)
+  pruneDisabledOutputBranches(prompt, [{ nodeId: 1, outputIndexes: [0, 1] }], (nodeId) => nodeId === '2' || nodeId === '3')
+  assert.ok(prompt['2'])
+  assert.ok(prompt['3'])
+  assert.deepEqual(prompt['2'].inputs, {})
+  assert.deepEqual(prompt['3'].inputs, {})
   assert.deepEqual(prompt['4'].inputs, { keep: 1 })
+})
+
+test('pruning never deletes terminal nodes even through an all-required chain', () => {
+  const prompt = {
+    '1': { inputs: {}, class_type: 'ImageConveyor' },
+    '2': { inputs: { image: ['1', 0] }, class_type: 'RequiredA' },
+    '3': { inputs: { image: ['2', 0] }, class_type: 'RequiredB' },
+    '4': { inputs: { images: ['3', 0] }, class_type: 'OutputNode' }
+  }
+  pruneDisabledOutputBranches(prompt, [{ nodeId: '1', outputIndexes: [0] }], () => true)
+  assert.deepEqual(Object.keys(prompt).sort(), ['1', '2', '3', '4'])
+  assert.deepEqual(prompt['2'].inputs, {})
+  assert.deepEqual(prompt['3'].inputs, {})
+  assert.deepEqual(prompt['4'].inputs, {})
 })
 
 test('unknown prompt input contracts remove only the disabled link and preserve the consumer', () => {
@@ -187,33 +163,15 @@ test('unknown first-frame contract cannot erase a ref2va output branch', () => {
   const prompt = {
     '1': { inputs: {}, class_type: 'ImageConveyor' },
     '2': {
-      inputs: {
-        first_frame: ['1', 0],
-        reference_image_1: ['1', 6],
-        reference_image_2: ['1', 7],
-        reference_image_3: ['1', 8],
-        model: ['10', 0]
-      },
+      inputs: { first_frame: ['1', 0], reference_image_1: ['1', 6], reference_image_2: ['1', 7], reference_image_3: ['1', 8], model: ['10', 0] },
       class_type: 'H3ContinuumSamplerProduction'
     },
-    '3': {
-      inputs: { samples: ['2', 0], vae: ['11', 0] },
-      class_type: 'VAEDecode'
-    },
-    '4': {
-      inputs: { images: ['3', 0] },
-      class_type: 'VideoCombine'
-    },
+    '3': { inputs: { samples: ['2', 0], vae: ['11', 0] }, class_type: 'VAEDecode' },
+    '4': { inputs: { images: ['3', 0] }, class_type: 'VideoCombine' },
     '10': { inputs: {}, class_type: 'ModelLoader' },
     '11': { inputs: {}, class_type: 'VAELoader' }
   }
-
-  pruneDisabledOutputBranches(
-    prompt,
-    [{ nodeId: '1', outputIndexes: [0, 1] }],
-    () => null
-  )
-
+  pruneDisabledOutputBranches(prompt, [{ nodeId: '1', outputIndexes: [0, 1] }], () => null)
   assert.ok(prompt['2'])
   assert.equal(Object.hasOwn(prompt['2'].inputs, 'first_frame'), false)
   assert.deepEqual(prompt['2'].inputs.reference_image_1, ['1', 6])
