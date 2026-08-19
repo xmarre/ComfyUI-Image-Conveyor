@@ -1,7 +1,11 @@
 import { app } from '../../scripts/app.js'
 import { api } from '../../scripts/api.js'
 import { normalizeReferenceSlots, referenceShelfHit } from './image_conveyor_math.mjs'
-import { cardIntentInsertionIndex, reorderSelectedItems } from './image_conveyor_drag_math.mjs'
+import {
+  cardIntentInsertionIndex,
+  materializationNeedsLibraryRefresh,
+  reorderSelectedItems
+} from './image_conveyor_drag_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.BatchDragOperations'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -701,7 +705,12 @@ async function materializeCharacterDrop(node, startIndex, batch, externalFiles) 
   }
   next.reference_slots = slots
   commitState(node, next)
-  refreshInputs()
+
+  // Reference-slot assignment itself does not mutate a source collection. Only
+  // refresh library views when the materialization response proves that a file
+  // was physically relocated/deduplicated and the collection contents changed.
+  if (materializationNeedsLibraryRefresh(payload)) refreshInputs()
+
   if (uploadErrors.length) {
     window.alert(`${uploadErrors.length} image${uploadErrors.length === 1 ? '' : 's'} failed to import; successful images were kept.`)
   }
