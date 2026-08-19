@@ -1,5 +1,6 @@
 import { app } from '../../scripts/app.js'
 import { api } from '../../scripts/api.js'
+import { libraryRefreshScrollRestore } from './image_conveyor_drag_math.mjs'
 import { referenceShelfHit } from './image_conveyor_math.mjs'
 import {
   characterEntriesFromIndex,
@@ -69,6 +70,10 @@ function characterReferenceDrop(node, event) {
   return hit?.type === 'slot' ? presetId : ''
 }
 
+function browserForView(ctx, view) {
+  return ctx.browser?.[view] ?? ctx.browser?.folderViews?.get(view) ?? null
+}
+
 function syncSharedInputIndex(ctx) {
   const ext = ctx?.icx
   if (!ext) return false
@@ -99,6 +104,35 @@ function syncSharedInputIndex(ctx) {
   ext.directoryCacheRevision = -1
   ctx.renderedRangeKey = ''
   return true
+}
+
+function refreshInputPreservingView(node) {
+  const ctx = node.__bil
+  if (!ctx || ctx.removed) return
+  const view = ctx.browser?.activeView
+  const browser = browserForView(ctx, view)
+  const restore = libraryRefreshScrollRestore(
+    view,
+    browser?.scrollTop,
+    ctx.list?.scrollTop,
+    ctx.list?.clientWidth,
+    ctx.list?.clientHeight
+  )
+  if (restore && browser) {
+    browser.scrollTop = restore.scrollTop
+    ctx.pendingScrollRestore = restore
+  }
+  ctx.refreshBtn?.click?.()
+}
+
+function requestCharacterCacheRefresh(node) {
+  const ctx = node.__bil
+  if (!ctx?.icx || ctx.removed) return
+  // library_ops treats presetSignature as the cache key for authoritative character metadata.
+  // Invalidating only that key asks its existing draw hook to perform one normal registry sync;
+  // it does not invoke migration or materialization.
+  ctx.icx.presetSignature = null
+  node.setDirtyCanvas?.(true, false)
 }
 
 async function fetchCharacter(presetId) {
@@ -173,7 +207,7 @@ function ensureReferenceIndexContainsLiveSlots(node, inputRequestBefore) {
     syncSharedInputIndex(ctx)
     const slots = ctx.state?.reference_slots
     if (!characterReferenceIndexNeedsRefresh(slots, ctx.icx.allFiles)) return
-    ctx.refreshBtn?.click?.()
+    refreshInputPreservingView(node)
   }
 
   check()
@@ -214,7 +248,9 @@ function installNode(node, attempts = 0) {
     ensureReferenceIndexContainsLiveSlots(node, inputRequestBefore)
 
     // Membership can change without a physical move (shared canonical references). Reconcile
-    // the visible character collection from authoritative registry metadata independently.
+    // the visible character collection immediately and invalidate library_ops' metadata cache
+    // so future rebuilds also use the authoritative registry state.
+    requestCharacterCacheRefresh(node)
     refreshCharacterMetadata(node, presetId)
     return result
   }
