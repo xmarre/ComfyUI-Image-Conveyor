@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   cardIntentInsertionIndex,
+  libraryRefreshScrollRestore,
   materializationNeedsLibraryRefresh,
   reorderSelectedItems
 } from '../web/image_conveyor_drag_math.mjs'
@@ -86,4 +87,19 @@ test('reference-slot materialization refreshes libraries after a physical reloca
     }),
     true
   )
+})
+
+test('library refresh restores the live scroll position for a visible active collection', () => {
+  assert.deepEqual(
+    libraryRefreshScrollRestore('folder:character-a:', 240, 876, 900, 500),
+    { view: 'folder:character-a:', scrollTop: 876 }
+  )
+})
+
+test('library refresh falls back to saved per-view scroll when the widget is not measurable', () => {
+  assert.deepEqual(
+    libraryRefreshScrollRestore('folder:character-a:', 876, 0, 0, 0),
+    { view: 'folder:character-a:', scrollTop: 876 }
+  )
+  assert.equal(libraryRefreshScrollRestore('', 876, 876, 900, 500), null)
 })
