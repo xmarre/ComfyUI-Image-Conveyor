@@ -152,10 +152,7 @@ test('disabled main pruning propagates through required preprocessing and stops 
     resolve
   )
 
-  // Required preprocessing becomes unreachable instead of being deleted from
-  // the serialized prompt. The optional first_frame boundary is severed.
-  assert.ok(prompt['123'])
-  assert.equal(Object.hasOwn(prompt['123'].inputs, 'image'), false)
+  assert.equal(Object.hasOwn(prompt, '123'), false)
   assert.equal(Object.hasOwn(prompt['200'].inputs, 'first_frame'), false)
   assert.deepEqual(prompt['200'].inputs.reference_image_1, ['164', 6])
   assert.deepEqual(prompt['200'].inputs.model, ['300', 0])
@@ -164,7 +161,7 @@ test('disabled main pruning propagates through required preprocessing and stops 
   assert.ok(prompt['220'])
 })
 
-test('disabled main pruning keeps required image and mask consumers serialized but unreachable', () => {
+test('disabled main pruning removes required image and mask consumers and severs optional downstream links', () => {
   const prompt = {
     '1': { inputs: {}, class_type: 'ImageConveyor' },
     '2': { inputs: { image: ['1', 0] }, class_type: 'RequiredImageNode' },
@@ -181,14 +178,12 @@ test('disabled main pruning keeps required image and mask consumers serialized b
     (nodeId) => nodeId === '2' || nodeId === '3'
   )
 
-  assert.ok(prompt['2'])
-  assert.ok(prompt['3'])
-  assert.deepEqual(prompt['2'].inputs, {})
-  assert.deepEqual(prompt['3'].inputs, {})
+  assert.equal(Object.hasOwn(prompt, '2'), false)
+  assert.equal(Object.hasOwn(prompt, '3'), false)
   assert.deepEqual(prompt['4'].inputs, { keep: 1 })
 })
 
-test('pruning never deletes terminal nodes even through an all-required chain', () => {
+test('all-required invalidation removes the terminal output target', () => {
   const prompt = {
     '1': { inputs: {}, class_type: 'ImageConveyor' },
     '2': { inputs: { image: ['1', 0] }, class_type: 'RequiredA' },
@@ -202,10 +197,7 @@ test('pruning never deletes terminal nodes even through an all-required chain', 
     () => true
   )
 
-  assert.deepEqual(Object.keys(prompt).sort(), ['1', '2', '3', '4'])
-  assert.deepEqual(prompt['2'].inputs, {})
-  assert.deepEqual(prompt['3'].inputs, {})
-  assert.deepEqual(prompt['4'].inputs, {})
+  assert.deepEqual(Object.keys(prompt), ['1'])
 })
 
 test('unknown prompt input contracts remove only the disabled link and preserve the consumer', () => {
