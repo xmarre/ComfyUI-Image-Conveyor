@@ -74,7 +74,7 @@ test('autosave frontend persists presets without character-library migration or 
   )
   assert.match(source, /\/image-conveyor\/reference-presets\//)
   assert.match(source, /method: 'PUT'/)
+  assert.match(source, /shouldAutosaveReferencePreset\(previous, current\)/)
   assert.equal(source.includes('/image-conveyor/character-folders/migrate'), false)
   assert.equal(source.includes('/materialize'), false)
-  assert.match(source, /previous\.presetId !== current\.presetId/)
 })
