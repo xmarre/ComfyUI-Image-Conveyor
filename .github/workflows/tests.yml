@@ -60,6 +60,8 @@ jobs:
           node --check web/image_conveyor_reference_autosave_math.mjs
           node --check web/image_conveyor_toggle_state_sync.js
           node --check web/image_conveyor_toggle_state_math.mjs
+          node --check web/image_conveyor_character_folder_readiness.js
+          node --check web/image_conveyor_character_folder_readiness_math.mjs
 
       - name: Check Python syntax
         run: python -m py_compile __init__.py image_conveyor.py image_conveyor_server.py image_conveyor_library_ops.py image_conveyor_drag_ops.py image_conveyor_drag_v2_ops.py image_conveyor_toggle_runtime.py image_conveyor_character_consistency.py
