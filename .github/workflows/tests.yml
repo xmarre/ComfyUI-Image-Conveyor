@@ -56,6 +56,8 @@ jobs:
           node --check web/image_conveyor_reference_toggles_math.mjs
           node --check web/image_conveyor_reference_branch_pruning.js
           node --check web/image_conveyor_reference_branch_pruning_math.mjs
+          node --check web/image_conveyor_reference_autosave.js
+          node --check web/image_conveyor_reference_autosave_math.mjs
           node --check web/image_conveyor_toggle_state_sync.js
           node --check web/image_conveyor_toggle_state_math.mjs
 
