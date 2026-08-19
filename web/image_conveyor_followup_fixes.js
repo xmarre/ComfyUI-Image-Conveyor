@@ -25,7 +25,6 @@ let relocationSequence = 0
 let relocationSyncPromise = null
 let relocationSyncRequested = 0
 let relocationSyncCompleted = 0
-let migrationPromise = null
 
 function widget(node, name) {
   return (node.widgets ?? []).find((entry) => entry?.name === name) ?? null
@@ -108,18 +107,6 @@ async function jsonRequest(path, options = {}) {
   try { payload = await response.json() } catch {}
   if (!response.ok) throw new Error(payload?.error || `${response.status} ${response.statusText}`)
   return payload
-}
-
-function queuedPaths() {
-  const result = new Set()
-  for (const node of nodes) {
-    for (const item of readState(node).items) {
-      if (item?.status !== 'queued') continue
-      const path = itemPath(item)
-      if (path) result.add(path)
-    }
-  }
-  return result
 }
 
 function patchLibraryCaches(mapping) {
@@ -264,88 +251,12 @@ async function syncRelocations() {
   return await ensureRelocationGeneration(targetGeneration)
 }
 
-function setMigrationDeferred(deferred) {
-  for (const node of nodes) {
-    const ext = node.__bil?.icx
-    if (!ext) continue
-    ext.followupMigrationDeferred = Boolean(deferred)
-  }
-}
-
-async function migrateCharacters() {
-  if (migrationPromise) return migrationPromise
-  migrationPromise = (async () => {
-    const aggregate = []
-    let deferred = false
-    const protectedPaths = Array.from(queuedPaths())
-    const payload = await jsonRequest('/image-conveyor/character-folders/migrate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ protected_paths: protectedPaths })
-    })
-    if (payload?.moved?.length) aggregate.push(...payload.moved)
-    if (payload?.skipped?.length) deferred = true
-
-    const live = new Map()
-    for (const node of nodes) {
-      const state = readState(node)
-      const presetId = String(state.active_reference_preset_id || '')
-      if (!presetId) continue
-      let paths = live.get(presetId)
-      if (!paths) {
-        paths = new Set()
-        live.set(presetId, paths)
-      }
-      for (const slot of normalizeReferenceSlots(state.reference_slots)) {
-        const path = itemPath(slot)
-        if (path) paths.add(path)
-      }
-    }
-    for (const [presetId, paths] of live) {
-      if (!paths.size) continue
-      try {
-        const result = await jsonRequest(
-          `/image-conveyor/character-folders/${encodeURIComponent(presetId)}/materialize`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              relative_paths: Array.from(paths),
-              protected_paths: protectedPaths
-            })
-          }
-        )
-        if (result?.moved?.length) aggregate.push(...result.moved)
-        if (result?.skipped?.length) deferred = true
-      } catch (error) {
-        deferred = true
-        console.warn(`Image Conveyor: unable to migrate live references for character '${presetId}'.`, error)
-      }
-    }
-    if (aggregate.length) applyMappings(aggregate)
-    await syncRelocations()
-    await refreshPresetCaches()
-    setMigrationDeferred(deferred)
-    for (const node of nodes) node.__bil?.refreshBtn?.click?.()
-    return payload
-  })().catch((error) => {
-    console.warn('Image Conveyor: character-folder migration failed.', error)
-    setMigrationDeferred(true)
-    return null
-  }).finally(() => {
-    migrationPromise = null
-  })
-  return migrationPromise
-}
-
 function installNode(node) {
   const ctx = node.__bil
   if (!ctx?.icx || ctx.icx.followupFixes || ctx.removed) return false
   const ext = ctx.icx
   ext.followupFixes = true
   ext.followupInputVersion = ctx.inputVersion
-  ext.followupMigrationSignature = ''
-  ext.followupMigrationDeferred = false
   nodes.add(node)
 
   // Extension layers use a synthetic search event as their request for an authoritative
@@ -378,10 +289,11 @@ function installNode(node) {
   }
   ctx.list?.addEventListener('pointerdown', ext.followupScrollbarGuard, true)
 
+  // Refresh may synchronize relocation records produced by explicit drag/file
+  // operations. It must never launch whole-character-library migration.
   ext.followupRefresh = () => {
     queueMicrotask(() => {
       void syncRelocations()
-      void migrateCharacters()
     })
   }
   ctx.refreshBtn?.addEventListener('click', ext.followupRefresh)
@@ -392,20 +304,6 @@ function installNode(node) {
     if (ext.followupInputVersion !== ctx.inputVersion) {
       ext.followupInputVersion = ctx.inputVersion
       renderPreservingScroll(node)
-    }
-    const state = readState(node)
-    const saved = (ctx.presets ?? [])
-      .map((preset) => `${preset.id}:${(preset.slots ?? []).map((slot) => slot?.annotated || '').join(',')}`)
-      .join('|')
-    const live = `${state.active_reference_preset_id || ''}:${normalizeReferenceSlots(state.reference_slots).map((slot) => slot?.annotated || '').join(',')}`
-    const signature = `${saved}|live=${live}`
-    if (signature !== ext.followupMigrationSignature) {
-      ext.followupMigrationSignature = signature
-      void migrateCharacters()
-    } else if (ext.followupMigrationDeferred && queuedPaths().size === 0) {
-      // A protected migration is retried once when the queue drains, not on every queue-state repaint.
-      ext.followupMigrationDeferred = false
-      void migrateCharacters()
     }
     return result
   }
@@ -419,9 +317,12 @@ function installNode(node) {
     return previousRemoved?.apply(this, args)
   }
 
+  // Synchronization is read-only from the frontend's perspective: it consumes
+  // relocation records produced by explicit operations. Legacy character migration
+  // is a maintenance operation and is deliberately not coupled to node installation,
+  // drawing, preset switching, queue transitions, or refresh.
   queueMicrotask(() => {
     void syncRelocations()
-    void migrateCharacters()
   })
   return true
 }
