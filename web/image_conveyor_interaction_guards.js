@@ -6,6 +6,7 @@ const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
 const INTERNAL_REFERENCE_MIME = 'application/x-image-conveyor-reference'
 const SERVER_INPUT_SOURCE_ID = '__image_conveyor_input__'
 const patchedNodes = new WeakSet()
+const presetAutoLoadHandlers = new WeakMap()
 
 function normalizePath(value) {
   const raw = String(value ?? '').trim().replace(/\\/g, '/')
@@ -345,6 +346,9 @@ function installManagedLibraryDeleteShortcut(node, ctx, ext) {
 }
 
 function installPresetAutoLoad(node, ctx) {
+  const existing = presetAutoLoadHandlers.get(node)
+  if (existing) return existing
+
   const documentChange = (event) => {
     const target = event.target
     const popover = ctx.presetPopover
@@ -352,20 +356,43 @@ function installPresetAutoLoad(node, ctx) {
     if (!String(target.value || '').trim()) return
 
     // Reuse the preset popover's canonical Load action so changing the selection gets exactly
-    // the same state normalization, persistence, redraw, and migration behavior as pressing Load.
+    // the same state normalization, persistence, and redraw as pressing Load. Character-library
+    // migration is intentionally not part of selecting/loading a preset.
     const loadButton = Array.from(popover.querySelectorAll('button'))
       .find((button) => String(button.textContent || '').trim() === 'Load')
     loadButton?.click?.()
   }
   document.addEventListener('change', documentChange, true)
+  presetAutoLoadHandlers.set(node, documentChange)
+
+  // Preset selection is a core Reference Shelf interaction. Its lifecycle must not depend on
+  // the batch-drag extension becoming ready. Own cleanup here so the listener is safe even if
+  // drag-specific initialization never completes.
+  const previousRemoved = node.onRemoved
+  node.onRemoved = function (...args) {
+    if (presetAutoLoadHandlers.get(node) === documentChange) {
+      document.removeEventListener('change', documentChange, true)
+      presetAutoLoadHandlers.delete(node)
+    }
+    return previousRemoved?.apply(this, args)
+  }
   return documentChange
 }
 
 function installNode(node, attempts = 0) {
   if (!node || node.__bil?.removed || attempts > 120) return
   const ctx = node.__bil
-  const ext = ctx?.icx
-  if (!ctx || !ext || !ext.batchWindowDrop) {
+  if (!ctx) {
+    requestAnimationFrame(() => installNode(node, attempts + 1))
+    return
+  }
+
+  // Install character-preset auto-load as soon as the core node context exists. It is unrelated
+  // to batch dragging and must keep working even if the drag extension is delayed or unavailable.
+  installPresetAutoLoad(node, ctx)
+
+  const ext = ctx.icx
+  if (!ext || !ext.batchWindowDrop) {
     requestAnimationFrame(() => installNode(node, attempts + 1))
     return
   }
@@ -375,7 +402,6 @@ function installNode(node, attempts = 0) {
   installFolderModeRefreshGuard(node, ctx, ext)
   installBatchDropGuard(ctx, ext)
   const documentKeyDown = installManagedLibraryDeleteShortcut(node, ctx, ext)
-  const documentChange = installPresetAutoLoad(node, ctx)
 
   const documentMouseUp = () => {
     // LiteGraph's canvas mouseup gets first chance to finish a legitimate shelf reorder.
@@ -402,7 +428,6 @@ function installNode(node, attempts = 0) {
   const previousRemoved = node.onRemoved
   node.onRemoved = function (...args) {
     document.removeEventListener('keydown', documentKeyDown, true)
-    document.removeEventListener('change', documentChange, true)
     document.removeEventListener('mouseup', documentMouseUp)
     document.removeEventListener('pointerdown', documentPointerDown, true)
     document.removeEventListener('pointercancel', documentPointerCancel, true)
