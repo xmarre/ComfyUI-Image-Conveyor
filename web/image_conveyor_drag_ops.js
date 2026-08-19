@@ -3,6 +3,7 @@ import { api } from '../../scripts/api.js'
 import { normalizeReferenceSlots, referenceShelfHit } from './image_conveyor_math.mjs'
 import {
   cardIntentInsertionIndex,
+  libraryRefreshScrollRestore,
   materializationNeedsLibraryRefresh,
   reorderSelectedItems
 } from './image_conveyor_drag_math.mjs'
@@ -299,7 +300,24 @@ function rewriteLivePaths(replacements) {
 }
 
 function refreshInputs() {
-  for (const node of patchedNodes) node.__bil?.refreshBtn?.click?.()
+  for (const node of patchedNodes) {
+    const ctx = node.__bil
+    if (!ctx || ctx.removed) continue
+    const view = ctx.browser?.activeView
+    const browser = browserForView(ctx, view)
+    const restore = libraryRefreshScrollRestore(
+      view,
+      browser?.scrollTop,
+      ctx.list?.scrollTop,
+      ctx.list?.clientWidth,
+      ctx.list?.clientHeight
+    )
+    if (restore && browser) {
+      browser.scrollTop = restore.scrollTop
+      ctx.pendingScrollRestore = restore
+    }
+    ctx.refreshBtn?.click?.()
+  }
 }
 
 function createUploadSession() {
