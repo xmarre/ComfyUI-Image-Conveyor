@@ -92,6 +92,7 @@ async function drainSaves(node, controller) {
             `Image Conveyor: failed to autosave reference preset '${presetId}' after ${MAX_SAVE_ATTEMPTS} attempts.`,
             error
           )
+          if (controller.pending.size) scheduleRetry(node, controller, 1)
         }
         return
       }
