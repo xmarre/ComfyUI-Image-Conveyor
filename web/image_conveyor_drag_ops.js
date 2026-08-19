@@ -1,7 +1,12 @@
 import { app } from '../../scripts/app.js'
 import { api } from '../../scripts/api.js'
 import { normalizeReferenceSlots, referenceShelfHit } from './image_conveyor_math.mjs'
-import { cardIntentInsertionIndex, reorderSelectedItems } from './image_conveyor_drag_math.mjs'
+import {
+  cardIntentInsertionIndex,
+  libraryRefreshScrollRestore,
+  materializationNeedsLibraryRefresh,
+  reorderSelectedItems
+} from './image_conveyor_drag_math.mjs'
 
 const EXTENSION_NAME = 'Comfy.ImageConveyor.BatchDragOperations'
 const NODE_CLASSES = new Set(['ImageConveyor', 'SequentialBatchImageLoader'])
@@ -295,7 +300,24 @@ function rewriteLivePaths(replacements) {
 }
 
 function refreshInputs() {
-  for (const node of patchedNodes) node.__bil?.refreshBtn?.click?.()
+  for (const node of patchedNodes) {
+    const ctx = node.__bil
+    if (!ctx || ctx.removed) continue
+    const view = ctx.browser?.activeView
+    const browser = browserForView(ctx, view)
+    const restore = libraryRefreshScrollRestore(
+      view,
+      browser?.scrollTop,
+      ctx.list?.scrollTop,
+      ctx.list?.clientWidth,
+      ctx.list?.clientHeight
+    )
+    if (restore && browser) {
+      browser.scrollTop = restore.scrollTop
+      ctx.pendingScrollRestore = restore
+    }
+    ctx.refreshBtn?.click?.()
+  }
 }
 
 function createUploadSession() {
@@ -701,7 +723,12 @@ async function materializeCharacterDrop(node, startIndex, batch, externalFiles) 
   }
   next.reference_slots = slots
   commitState(node, next)
-  refreshInputs()
+
+  // Reference-slot assignment itself does not mutate a source collection. Only
+  // refresh library views when the materialization response proves that a file
+  // was physically relocated/deduplicated and the collection contents changed.
+  if (materializationNeedsLibraryRefresh(payload)) refreshInputs()
+
   if (uploadErrors.length) {
     window.alert(`${uploadErrors.length} image${uploadErrors.length === 1 ? '' : 's'} failed to import; successful images were kept.`)
   }

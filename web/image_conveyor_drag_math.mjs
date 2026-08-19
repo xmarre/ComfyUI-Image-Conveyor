@@ -45,3 +45,25 @@ export function cardIntentInsertionIndex(items, draggedId, targetId) {
   if (draggedIndex < 0 || targetIndex < 0 || draggedIndex === targetIndex) return -1
   return draggedIndex < targetIndex ? targetIndex + 1 : targetIndex
 }
+
+export function materializationNeedsLibraryRefresh(payload) {
+  return Array.isArray(payload?.moved) && payload.moved.length > 0
+}
+
+export function libraryRefreshScrollRestore(
+  view,
+  savedScrollTop,
+  liveScrollTop,
+  clientWidth,
+  clientHeight
+) {
+  const normalizedView = String(view ?? '')
+  if (!normalizedView) return null
+  const visible = Number(clientWidth) > 0 && Number(clientHeight) > 0
+  const live = Number(liveScrollTop)
+  const saved = Number(savedScrollTop)
+  const scrollTop = visible && Number.isFinite(live)
+    ? live
+    : (Number.isFinite(saved) ? saved : 0)
+  return { view: normalizedView, scrollTop: Math.max(0, scrollTop) }
+}
