@@ -78,72 +78,115 @@ function promptLink(value) {
 }
 
 /**
- * Remove disabled output branches from a freshly serialized ComfyUI API prompt.
- * Required consumers are pruned recursively until an optional input boundary is
- * reached; optional inputs are simply omitted. The workflow graph is never
- * mutated, so editor links remain connected and saved workflow topology is
- * unchanged.
+ * Remove branches that depend on disabled Image Conveyor outputs from a freshly
+ * serialized ComfyUI API prompt.
+ *
+ * Invariant: no surviving serialized node may have a required input removed by
+ * this pruner. Optional/unknown inputs are stopping boundaries; only the missing
+ * link is removed there. A consumer whose proven-required input is removed is
+ * unavailable as a whole, so all of its used outputs become unavailable and the
+ * consumer is removed from the API prompt after propagation completes.
+ *
+ * The workflow/editor graph is never mutated. Only the API prompt copy is
+ * changed, so disabled image-only output targets disappear while valid ref-only
+ * conditioning/output paths remain intact.
  */
 export function pruneDisabledOutputBranches(
   prompt,
   disabledOutputs,
-  isRequiredInput = () => true
+  isRequiredInput = () => null
 ) {
   if (!prompt || typeof prompt !== 'object' || Array.isArray(prompt)) return prompt
 
-  const disabled = new Set()
+  const downstreamLinks = new Map()
+  const usedOutputsByNode = new Map()
+
+  for (const [consumerNodeId, node] of Object.entries(prompt)) {
+    if (!node?.inputs || typeof node.inputs !== 'object') continue
+    for (const [inputName, value] of Object.entries(node.inputs)) {
+      const link = promptLink(value)
+      if (!link) continue
+
+      const key = `${link.nodeId}:${link.outputIndex}`
+      const consumers = downstreamLinks.get(key) ?? []
+      consumers.push({ nodeId: consumerNodeId, inputName })
+      downstreamLinks.set(key, consumers)
+
+      const used = usedOutputsByNode.get(link.nodeId) ?? new Set()
+      used.add(link.outputIndex)
+      usedOutputsByNode.set(link.nodeId, used)
+    }
+  }
+
+  const unavailableOutputs = new Set()
+  const unavailableNodes = new Set()
+  const queue = []
+
+  const enqueueOutput = (nodeId, outputIndex) => {
+    const id = String(nodeId ?? '')
+    const index = Number(outputIndex)
+    if (!id || !Number.isInteger(index)) return
+    const key = `${id}:${index}`
+    if (unavailableOutputs.has(key)) return
+    unavailableOutputs.add(key)
+    queue.push(key)
+  }
+
+  const markNodeUnavailable = (nodeId) => {
+    const id = String(nodeId ?? '')
+    if (!id || unavailableNodes.has(id) || !Object.hasOwn(prompt, id)) return
+    unavailableNodes.add(id)
+    for (const outputIndex of usedOutputsByNode.get(id) ?? []) {
+      enqueueOutput(id, outputIndex)
+    }
+  }
+
   for (const source of Array.isArray(disabledOutputs) ? disabledOutputs : []) {
     const nodeId = String(source?.nodeId ?? '')
     if (!nodeId) continue
     for (const value of Array.isArray(source?.outputIndexes) ? source.outputIndexes : []) {
-      const outputIndex = Number(value)
-      if (Number.isInteger(outputIndex)) disabled.add(`${nodeId}:${outputIndex}`)
+      enqueueOutput(nodeId, value)
     }
   }
-  if (!disabled.size) return prompt
+  if (!queue.length) return prompt
 
-  const deletionQueue = []
-  const queued = new Set()
-  const deleted = new Set()
-  const enqueue = (nodeId) => {
-    const id = String(nodeId)
-    if (!id || queued.has(id) || deleted.has(id)) return
-    queued.add(id)
-    deletionQueue.push(id)
-  }
-  const required = (nodeId, inputName) => {
+  const requirement = (nodeId, inputName) => {
     try {
-      return isRequiredInput(String(nodeId), String(inputName)) !== false
+      const value = isRequiredInput(String(nodeId), String(inputName))
+      if (value === true) return true
+      if (value === false) return false
+      return null
     } catch {
-      return true
+      return null
     }
   }
 
-  for (const [nodeId, node] of Object.entries(prompt)) {
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const unavailableKey = queue[cursor]
+    for (const consumer of downstreamLinks.get(unavailableKey) ?? []) {
+      const node = prompt[consumer.nodeId]
+      if (!node?.inputs || unavailableNodes.has(consumer.nodeId)) continue
+
+      const currentLink = promptLink(node.inputs[consumer.inputName])
+      if (!currentLink || `${currentLink.nodeId}:${currentLink.outputIndex}` !== unavailableKey) continue
+
+      delete node.inputs[consumer.inputName]
+      if (requirement(consumer.nodeId, consumer.inputName) === true) {
+        markNodeUnavailable(consumer.nodeId)
+      }
+    }
+  }
+
+  for (const nodeId of unavailableNodes) delete prompt[nodeId]
+
+  // Defensive final sweep: a removed required consumer must never leave a
+  // dangling serialized link if another extension rewrote the prompt while this
+  // filter was running.
+  for (const node of Object.values(prompt)) {
     if (!node?.inputs || typeof node.inputs !== 'object') continue
     for (const [inputName, value] of Object.entries(node.inputs)) {
       const link = promptLink(value)
-      if (!link || !disabled.has(`${link.nodeId}:${link.outputIndex}`)) continue
-      if (required(nodeId, inputName)) enqueue(nodeId)
-      else delete node.inputs[inputName]
-    }
-  }
-
-  while (deletionQueue.length) {
-    const sourceId = deletionQueue.shift()
-    queued.delete(sourceId)
-    if (deleted.has(sourceId)) continue
-    deleted.add(sourceId)
-    delete prompt[sourceId]
-
-    for (const [nodeId, node] of Object.entries(prompt)) {
-      if (!node?.inputs || typeof node.inputs !== 'object') continue
-      for (const [inputName, value] of Object.entries(node.inputs)) {
-        const link = promptLink(value)
-        if (!link || link.nodeId !== sourceId) continue
-        if (required(nodeId, inputName)) enqueue(nodeId)
-        else delete node.inputs[inputName]
-      }
+      if (link && !Object.hasOwn(prompt, link.nodeId)) delete node.inputs[inputName]
     }
   }
 

@@ -98,7 +98,7 @@ test('object-info input contracts distinguish required and optional sockets', ()
   assert.equal(inputRequiredFromNodeDef(null, 'first_frame'), null)
 })
 
-test('disabled main prompt pruning uses object-info contracts at the scaler-to-Continuum boundary', () => {
+test('disabled main pruning propagates through required preprocessing and stops at optional Continuum first_frame', () => {
   const prompt = {
     '164': { inputs: {}, class_type: 'ImageConveyor' },
     '123': {
@@ -113,7 +113,16 @@ test('disabled main prompt pruning uses object-info contracts at the scaler-to-C
       },
       class_type: 'H3ContinuumSamplerProduction'
     },
-    '300': { inputs: {}, class_type: 'ModelLoader' }
+    '210': {
+      inputs: { samples: ['200', 0], vae: ['301', 0] },
+      class_type: 'VAEDecode'
+    },
+    '220': {
+      inputs: { images: ['210', 0] },
+      class_type: 'VideoCombine'
+    },
+    '300': { inputs: {}, class_type: 'ModelLoader' },
+    '301': { inputs: {}, class_type: 'VAELoader' }
   }
   const nodeDefs = {
     ImageScaleToTotalPixelsX: {
@@ -134,7 +143,7 @@ test('disabled main prompt pruning uses object-info contracts at the scaler-to-C
   }
   const resolve = (nodeId, inputName) => {
     const classType = prompt[String(nodeId)]?.class_type
-    return inputRequiredFromNodeDef(nodeDefs[classType], inputName) ?? true
+    return inputRequiredFromNodeDef(nodeDefs[classType], inputName)
   }
 
   pruneDisabledOutputBranches(
@@ -143,15 +152,16 @@ test('disabled main prompt pruning uses object-info contracts at the scaler-to-C
     resolve
   )
 
-  assert.equal(prompt['123'], undefined)
+  assert.equal(Object.hasOwn(prompt, '123'), false)
   assert.equal(Object.hasOwn(prompt['200'].inputs, 'first_frame'), false)
   assert.deepEqual(prompt['200'].inputs.reference_image_1, ['164', 6])
   assert.deepEqual(prompt['200'].inputs.model, ['300', 0])
-  assert.ok(prompt['164'])
   assert.ok(prompt['200'])
+  assert.ok(prompt['210'])
+  assert.ok(prompt['220'])
 })
 
-test('disabled main prompt pruning removes image and mask consumers independently', () => {
+test('disabled main pruning removes required image and mask consumers and severs optional downstream links', () => {
   const prompt = {
     '1': { inputs: {}, class_type: 'ImageConveyor' },
     '2': { inputs: { image: ['1', 0] }, class_type: 'RequiredImageNode' },
@@ -165,21 +175,79 @@ test('disabled main prompt pruning removes image and mask consumers independentl
   pruneDisabledOutputBranches(
     prompt,
     [{ nodeId: 1, outputIndexes: [0, 1] }],
-    (nodeId, inputName) => nodeId === '2' || nodeId === '3'
+    (nodeId) => nodeId === '2' || nodeId === '3'
   )
 
-  assert.equal(prompt['2'], undefined)
-  assert.equal(prompt['3'], undefined)
+  assert.equal(Object.hasOwn(prompt, '2'), false)
+  assert.equal(Object.hasOwn(prompt, '3'), false)
   assert.deepEqual(prompt['4'].inputs, { keep: 1 })
 })
 
-test('unknown prompt input contracts fail closed as required', () => {
+test('all-required invalidation removes the terminal output target', () => {
   const prompt = {
     '1': { inputs: {}, class_type: 'ImageConveyor' },
-    '2': { inputs: { mystery: ['1', 0] }, class_type: 'UnknownNode' }
+    '2': { inputs: { image: ['1', 0] }, class_type: 'RequiredA' },
+    '3': { inputs: { image: ['2', 0] }, class_type: 'RequiredB' },
+    '4': { inputs: { images: ['3', 0] }, class_type: 'OutputNode' }
+  }
+
+  pruneDisabledOutputBranches(
+    prompt,
+    [{ nodeId: '1', outputIndexes: [0] }],
+    () => true
+  )
+
+  assert.deepEqual(Object.keys(prompt), ['1'])
+})
+
+test('unknown prompt input contracts remove only the disabled link and preserve the consumer', () => {
+  const prompt = {
+    '1': { inputs: {}, class_type: 'ImageConveyor' },
+    '2': { inputs: { mystery: ['1', 0], keep: 7 }, class_type: 'UnknownNode' }
   }
   pruneDisabledOutputBranches(prompt, [{ nodeId: '1', outputIndexes: [0] }])
-  assert.equal(prompt['2'], undefined)
+  assert.ok(prompt['2'])
+  assert.deepEqual(prompt['2'].inputs, { keep: 7 })
+})
+
+test('unknown first-frame contract cannot erase a ref2va output branch', () => {
+  const prompt = {
+    '1': { inputs: {}, class_type: 'ImageConveyor' },
+    '2': {
+      inputs: {
+        first_frame: ['1', 0],
+        reference_image_1: ['1', 6],
+        reference_image_2: ['1', 7],
+        reference_image_3: ['1', 8],
+        model: ['10', 0]
+      },
+      class_type: 'H3ContinuumSamplerProduction'
+    },
+    '3': {
+      inputs: { samples: ['2', 0], vae: ['11', 0] },
+      class_type: 'VAEDecode'
+    },
+    '4': {
+      inputs: { images: ['3', 0] },
+      class_type: 'VideoCombine'
+    },
+    '10': { inputs: {}, class_type: 'ModelLoader' },
+    '11': { inputs: {}, class_type: 'VAELoader' }
+  }
+
+  pruneDisabledOutputBranches(
+    prompt,
+    [{ nodeId: '1', outputIndexes: [0, 1] }],
+    () => null
+  )
+
+  assert.ok(prompt['2'])
+  assert.equal(Object.hasOwn(prompt['2'].inputs, 'first_frame'), false)
+  assert.deepEqual(prompt['2'].inputs.reference_image_1, ['1', 6])
+  assert.deepEqual(prompt['2'].inputs.reference_image_2, ['1', 7])
+  assert.deepEqual(prompt['2'].inputs.reference_image_3, ['1', 8])
+  assert.ok(prompt['3'])
+  assert.ok(prompt['4'])
 })
 
 test('toggle geometry stays between the shelf and output label and hit testing is exact', () => {
