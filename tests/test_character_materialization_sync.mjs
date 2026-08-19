@@ -79,3 +79,14 @@ test('character reconciliation waits for an in-flight Input refresh before rebui
   assert.match(syncSource, /if \(ctx\.browser\?\.input\?\.loading\)/)
   assert.match(syncSource, /characterEntriesFromIndex\(ctx\.icx\.allFiles, character\)/)
 })
+
+test('fallback Input refresh preserves the active library scroll state', () => {
+  assert.match(syncSource, /libraryRefreshScrollRestore\(/)
+  assert.match(syncSource, /ctx\.pendingScrollRestore = restore/)
+  assert.match(syncSource, /refreshInputPreservingView\(node\)/)
+})
+
+test('successful character materialization invalidates the private character metadata cache', () => {
+  assert.match(syncSource, /ctx\.icx\.presetSignature = null/)
+  assert.match(syncSource, /requestCharacterCacheRefresh\(node\)/)
+})
