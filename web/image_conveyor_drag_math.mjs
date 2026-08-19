@@ -45,3 +45,7 @@ export function cardIntentInsertionIndex(items, draggedId, targetId) {
   if (draggedIndex < 0 || targetIndex < 0 || draggedIndex === targetIndex) return -1
   return draggedIndex < targetIndex ? targetIndex + 1 : targetIndex
 }
+
+export function materializationNeedsLibraryRefresh(payload) {
+  return Array.isArray(payload?.moved) && payload.moved.length > 0
+}
