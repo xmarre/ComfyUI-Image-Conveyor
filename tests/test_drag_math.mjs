@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   cardIntentInsertionIndex,
+  materializationNeedsLibraryRefresh,
   reorderSelectedItems
 } from '../web/image_conveyor_drag_math.mjs'
 
@@ -62,4 +63,27 @@ test('card intent rejects identical or unknown ids', () => {
   assert.equal(cardIntentInsertionIndex(source, 'a', 'z'), -1)
   assert.equal(cardIntentInsertionIndex(source, 'z', 'a'), -1)
   assert.equal(cardIntentInsertionIndex(null, 'a', 'b'), -1)
+})
+
+test('reference-slot materialization does not refresh a library when no file moved', () => {
+  assert.equal(materializationNeedsLibraryRefresh(null), false)
+  assert.equal(materializationNeedsLibraryRefresh({ files: [] }), false)
+  assert.equal(materializationNeedsLibraryRefresh({ moved: [] }), false)
+  assert.equal(
+    materializationNeedsLibraryRefresh({
+      files: [{ relative_path: 'image_conveyor/characters/a/ref.png', moved: false, reused: true }],
+      shared: [{ relative_path: 'image_conveyor/characters/a/ref.png', moved: false, reused: true }],
+      moved: []
+    }),
+    false
+  )
+})
+
+test('reference-slot materialization refreshes libraries after a physical relocation', () => {
+  assert.equal(
+    materializationNeedsLibraryRefresh({
+      moved: [{ relative_path: 'old/ref.png', keep_path: 'image_conveyor/characters/a/ref.png' }]
+    }),
+    true
+  )
 })
