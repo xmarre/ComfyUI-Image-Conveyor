@@ -77,34 +77,19 @@ function promptLink(value) {
   return { nodeId, outputIndex }
 }
 
-function usedOutputIndexes(prompt, sourceNodeId) {
-  const sourceId = String(sourceNodeId)
-  const indexes = new Set()
-  for (const node of Object.values(prompt)) {
-    if (!node?.inputs || typeof node.inputs !== 'object') continue
-    for (const value of Object.values(node.inputs)) {
-      const link = promptLink(value)
-      if (link?.nodeId === sourceId) indexes.add(link.outputIndex)
-    }
-  }
-  return indexes
-}
-
 /**
- * Remove disabled output branches from a freshly serialized ComfyUI API prompt.
+ * Remove branches that depend on disabled Image Conveyor outputs from a freshly
+ * serialized ComfyUI API prompt.
  *
- * The important invariant is that pruning never deletes serialized nodes. A
- * disabled value is propagated through required-only transforms by marking the
- * transform's used outputs unavailable, then the connection is severed at the
- * first optional/unknown input boundary. The now-invalid required transforms are
- * left in the prompt but become unreachable from surviving output nodes, so
- * ComfyUI neither validates nor executes them.
+ * Invariant: no surviving serialized node may have a required input removed by
+ * this pruner. Optional/unknown inputs are stopping boundaries; only the missing
+ * link is removed there. A consumer whose proven-required input is removed is
+ * unavailable as a whole, so all of its used outputs become unavailable and the
+ * consumer is removed from the API prompt after propagation completes.
  *
- * This is deliberately less destructive than recursively deleting nodes. A
- * prompt transformer must not manufacture `prompt_no_outputs` simply because a
- * disabled first-frame branch happens to pass through required preprocessing.
- * The workflow graph itself is never mutated, so editor links remain connected
- * and saved workflow topology is unchanged.
+ * The workflow/editor graph is never mutated. Only the API prompt copy is
+ * changed, so disabled image-only output targets disappear while valid ref-only
+ * conditioning/output paths remain intact.
  */
 export function pruneDisabledOutputBranches(
   prompt,
@@ -113,16 +98,47 @@ export function pruneDisabledOutputBranches(
 ) {
   if (!prompt || typeof prompt !== 'object' || Array.isArray(prompt)) return prompt
 
-  const unavailable = new Set()
+  const downstreamLinks = new Map()
+  const usedOutputsByNode = new Map()
+
+  for (const [consumerNodeId, node] of Object.entries(prompt)) {
+    if (!node?.inputs || typeof node.inputs !== 'object') continue
+    for (const [inputName, value] of Object.entries(node.inputs)) {
+      const link = promptLink(value)
+      if (!link) continue
+
+      const key = `${link.nodeId}:${link.outputIndex}`
+      const consumers = downstreamLinks.get(key) ?? []
+      consumers.push({ nodeId: consumerNodeId, inputName })
+      downstreamLinks.set(key, consumers)
+
+      const used = usedOutputsByNode.get(link.nodeId) ?? new Set()
+      used.add(link.outputIndex)
+      usedOutputsByNode.set(link.nodeId, used)
+    }
+  }
+
+  const unavailableOutputs = new Set()
+  const unavailableNodes = new Set()
   const queue = []
+
   const enqueueOutput = (nodeId, outputIndex) => {
     const id = String(nodeId ?? '')
     const index = Number(outputIndex)
     if (!id || !Number.isInteger(index)) return
     const key = `${id}:${index}`
-    if (unavailable.has(key)) return
-    unavailable.add(key)
+    if (unavailableOutputs.has(key)) return
+    unavailableOutputs.add(key)
     queue.push(key)
+  }
+
+  const markNodeUnavailable = (nodeId) => {
+    const id = String(nodeId ?? '')
+    if (!id || unavailableNodes.has(id) || !Object.hasOwn(prompt, id)) return
+    unavailableNodes.add(id)
+    for (const outputIndex of usedOutputsByNode.get(id) ?? []) {
+      enqueueOutput(id, outputIndex)
+    }
   }
 
   for (const source of Array.isArray(disabledOutputs) ? disabledOutputs : []) {
@@ -147,23 +163,30 @@ export function pruneDisabledOutputBranches(
 
   for (let cursor = 0; cursor < queue.length; cursor += 1) {
     const unavailableKey = queue[cursor]
-    for (const [nodeId, node] of Object.entries(prompt)) {
-      if (!node?.inputs || typeof node.inputs !== 'object') continue
-      for (const [inputName, value] of Object.entries(node.inputs)) {
-        const link = promptLink(value)
-        if (!link || `${link.nodeId}:${link.outputIndex}` !== unavailableKey) continue
+    for (const consumer of downstreamLinks.get(unavailableKey) ?? []) {
+      const node = prompt[consumer.nodeId]
+      if (!node?.inputs || unavailableNodes.has(consumer.nodeId)) continue
 
-        // Always remove the unavailable link itself. If this was a required
-        // input, the consumer can no longer produce any valid output, so taint
-        // every output index from that consumer that is actually used by the
-        // serialized prompt. Optional/unknown inputs are the stopping boundary.
-        delete node.inputs[inputName]
-        if (requirement(nodeId, inputName) !== true) continue
+      const currentLink = promptLink(node.inputs[consumer.inputName])
+      if (!currentLink || `${currentLink.nodeId}:${currentLink.outputIndex}` !== unavailableKey) continue
 
-        for (const outputIndex of usedOutputIndexes(prompt, nodeId)) {
-          enqueueOutput(nodeId, outputIndex)
-        }
+      delete node.inputs[consumer.inputName]
+      if (requirement(consumer.nodeId, consumer.inputName) === true) {
+        markNodeUnavailable(consumer.nodeId)
       }
+    }
+  }
+
+  for (const nodeId of unavailableNodes) delete prompt[nodeId]
+
+  // Defensive final sweep: a removed required consumer must never leave a
+  // dangling serialized link if another extension rewrote the prompt while this
+  // filter was running.
+  for (const node of Object.values(prompt)) {
+    if (!node?.inputs || typeof node.inputs !== 'object') continue
+    for (const [inputName, value] of Object.entries(node.inputs)) {
+      const link = promptLink(value)
+      if (link && !Object.hasOwn(prompt, link.nodeId)) delete node.inputs[inputName]
     }
   }
 
