@@ -156,10 +156,27 @@ function refreshCharacterMetadata(node, presetId) {
 function ensureReferenceIndexContainsLiveSlots(node, inputRequestBefore) {
   const ctx = node.__bil
   if (!ctx?.icx || ctx.removed) return
-  if (Number(ctx.inputRequestId || 0) !== Number(inputRequestBefore || 0)) return
-  const slots = ctx.state?.reference_slots
-  if (!characterReferenceIndexNeedsRefresh(slots, ctx.icx.allFiles)) return
-  ctx.refreshBtn?.click?.()
+  const startedAt = performance.now()
+
+  const check = () => {
+    if (node.__bil !== ctx || !ctx?.icx || ctx.removed) return
+    if (Number(ctx.inputRequestId || 0) !== Number(inputRequestBefore || 0)) return
+    if (performance.now() - startedAt > RECONCILE_TIMEOUT_MS) {
+      console.warn('Image Conveyor: timed out while checking the character reference file index.')
+      return
+    }
+    if (ctx.browser?.input?.loading) {
+      setTimeout(check, 24)
+      return
+    }
+
+    syncSharedInputIndex(ctx)
+    const slots = ctx.state?.reference_slots
+    if (!characterReferenceIndexNeedsRefresh(slots, ctx.icx.allFiles)) return
+    ctx.refreshBtn?.click?.()
+  }
+
+  check()
 }
 
 function installNode(node, attempts = 0) {
@@ -192,6 +209,8 @@ function installNode(node, attempts = 0) {
     // A new local upload can already live in the target character folder, producing moved=[]
     // even though the frontend Input index is stale. Refresh only when no refresh was already
     // started and the live reference slots prove that the current index is missing a path.
+    // If another Input refresh was already running before this drop, let it finish first and
+    // only start a second request if its completed result still lacks the new reference path.
     ensureReferenceIndexContainsLiveSlots(node, inputRequestBefore)
 
     // Membership can change without a physical move (shared canonical references). Reconcile
