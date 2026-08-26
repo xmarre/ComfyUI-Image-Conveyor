@@ -30,13 +30,32 @@ test('followup lifecycle retains relocation synchronization for explicit file op
 })
 
 test('character preset auto-load is installed before drag-specific readiness is required', () => {
-  assert.match(
-    interactionSource,
-    /installPresetAutoLoad\(node, ctx\)\s*\n\s*const ext = ctx\.icx\s*\n\s*if \(!ext \|\| !ext\.batchWindowDrop\)/
+  const presetInstallIndex = interactionSource.indexOf('\n  installPresetAutoLoad(node, ctx)\n')
+  const dragReadinessIndex = interactionSource.indexOf(
+    '\n  const ext = ctx.icx\n  if (!ext || !ext.batchWindowDrop)',
+    presetInstallIndex
   )
+
+  assert.notEqual(presetInstallIndex, -1)
+  assert.ok(dragReadinessIndex > presetInstallIndex)
 })
 
 test('character preset auto-load owns cleanup independent of drag initialization', () => {
   assert.match(interactionSource, /presetAutoLoadHandlers\.set\(node, documentChange\)/)
   assert.match(interactionSource, /document\.removeEventListener\('change', documentChange, true\)/)
+})
+
+test('closed preview is not exposed as an active ARIA modal', () => {
+  assert.match(
+    interactionSource,
+    /if \(root\.hidden\) root\.removeAttribute\('aria-modal'\)/
+  )
+  assert.match(
+    interactionSource,
+    /else root\.setAttribute\('aria-modal', 'true'\)/
+  )
+  assert.match(
+    interactionSource,
+    /observer\.observe\(root, \{ attributes: true, attributeFilter: \['hidden'\] \}\)/
+  )
 })
