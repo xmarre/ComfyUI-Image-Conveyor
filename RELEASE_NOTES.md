@@ -1,54 +1,43 @@
-# Image Conveyor v1.7.2
+# Image Conveyor v1.7.3
 
-This hotfix fixes a second character-folder synchronization bug exposed by freshly created character presets: reference images could be assigned correctly, physically exist in the character folder, and appear in the Reference Shelf while the character **Folder** browser still showed an empty/stale collection.
+This hotfix fixes browser-dependent output switches disappearing beside the Reference Shelf, most visibly in Microsoft Edge.
+
+Affected controls could include the main `image` switch, `ref_image_1` through `ref_image_8`, and `last_frame`. The workflow state and outputs were still present; the frontend layout was deciding that there was not enough room to render the switch or create its hitbox.
 
 ## Root cause
 
-The character browser depends on two independent frontend data sources:
+Image Conveyor positioned each switch between the Reference Shelf and its output label. The shelf gutter was derived from rendered label widths, while the toggle code independently measured the label and required at least 18 px of usable space.
 
-1. the shared Input Folder file index (`ctx.icx.allFiles`), which supplies the actual image records rendered by the gallery;
-2. character membership metadata, which is required for canonical images shared across character presets even when they physically live in another managed character folder.
+For the widest label, the previous geometry could leave only about 5 px after the existing clearances, causing `calculateReferenceToggleRect()` to return `null`.
 
-The existing materialization path refreshed the Input libraries only when the backend returned a non-empty `moved` list. That is insufficient for local/external reference drops: those files are uploaded directly into the target character folder before materialization. Materialization then correctly reports `moved=[]` because the files are already in their destination, but the frontend Input index can still be the pre-upload snapshot. The resulting reference paths are valid and the files are present on disk, yet the character browser cannot resolve them and appears empty.
-
-Character membership can also change without a physical move, such as when another character shares an existing canonical file. That left the browser's private character metadata cache stale independently of the Input index.
+There was also a second browser-sensitive assumption: the shelf-side measurement and the toggle measurement were not guaranteed to use the same canvas font state. Current ComfyUI invokes node `onDrawForeground` before assigning the normal connection-slot font, while the toggle renderers explicitly use `node.innerFontStyle`. Browser/font differences could therefore change which controls crossed the cutoff.
 
 ## Fix
 
-v1.7.2 adds explicit post-materialization synchronization:
+v1.7.3 gives the output controls an explicit reserved lane:
 
-- after a successful character reference drop, Image Conveyor checks whether the normal materialization path already started an Input refresh;
-- when it did not, the live reference-slot paths are compared against the current shared Input index;
-- an Input refresh is started only when a live reference path is actually missing from that index;
-- if another Input refresh was already running before the drop, Image Conveyor waits for it to finish and only performs another refresh if the completed index is still missing the newly assigned reference path;
-- fallback refreshes preserve the current character/library scroll position rather than jumping the view to the top;
-- successful character materialization invalidates the private character metadata cache so the existing library layer performs one authoritative registry sync;
-- the visible character collection is also reconciled immediately from authoritative membership metadata plus physical files inside the managed character folder;
-- explicit **Folder** opens repeat that lightweight metadata reconciliation so a stale private membership cache cannot leave the view empty.
+- output labels are measured with `node.innerFontStyle`, matching the toggle renderers;
+- the widest current output label establishes the normal output gutter;
+- a fixed 28 px control lane is reserved on top of that gutter;
+- the cached Reference Shelf layout is invalidated and redrawn once when the label/font key changes;
+- the existing `<18 px` collision guard remains intact, so switches are not allowed to overlap the shelf or their labels;
+- generic Reference Shelf geometry and workflow/backend behavior are unchanged.
 
-## Performance and safety
-
-- No unconditional full Input Folder scan was added.
-- If the existing materialization path already triggered a refresh, v1.7.2 does not start another one.
-- If all live reference paths are already indexed, no Input rescan is performed.
-- Character metadata synchronization is a small registry request and does not enumerate the whole Input tree.
-- The synchronization layer does not call whole-character migration or bulk materialization endpoints and performs no additional filesystem mutation.
-- Existing scroll-restoration behavior is preserved when the fallback Input refresh is needed.
+The measurement is cached by output-label set and font style, so the fix does not add repeated per-frame label measurement after the layout stabilizes.
 
 ## Validation
 
-GitHub Actions covers the new synchronization logic in addition to the complete existing suite. Regression tests verify:
+Regression coverage verifies:
 
-- newly uploaded character references missing from an old Input index trigger synchronization;
-- already indexed/shared canonical references avoid unnecessary Input rescans;
-- character collections combine physical folder contents with authoritative shared membership;
-- missing registry members are omitted when the underlying file no longer exists;
-- an in-flight Input refresh is allowed to complete before deciding whether another refresh is necessary;
-- fallback refreshes preserve active library scroll state;
-- successful materialization invalidates the private character metadata cache;
-- the synchronization module never invokes migration or materialization endpoints itself;
-- JavaScript/Python syntax and whitespace validation continue to pass.
+- representative output-label widths from 52 to 110 px keep the full preferred 26 px switch;
+- the switch retains the existing 7 px clearances from both the shelf and label;
+- a deliberately mismatched foreground-font measurement reproduces the previous failure;
+- measuring with the same `node.innerFontStyle` used by the toggles restores the control;
+- shelf invalidation/redraw and stable-key caching are preserved;
+- Python tests, frontend pure-function tests, JavaScript syntax checks, Python syntax checks, and whitespace validation pass.
+
+The original affected Edge setup was also tested manually and the missing reference switches are visible and usable again.
 
 ## Upgrade notes
 
-Restart ComfyUI and hard-refresh/reload the frontend after updating so the new frontend synchronization module is loaded.
+Restart ComfyUI and hard-refresh/reload the frontend after updating so the new frontend extension is loaded.
