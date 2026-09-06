@@ -7,6 +7,7 @@ const INTERNAL_REFERENCE_MIME = 'application/x-image-conveyor-reference'
 const SERVER_INPUT_SOURCE_ID = '__image_conveyor_input__'
 const patchedNodes = new WeakSet()
 const presetAutoLoadHandlers = new WeakMap()
+const lightboxModalObservers = new WeakMap()
 
 function normalizePath(value) {
   const raw = String(value ?? '').trim().replace(/\\/g, '/')
@@ -379,6 +380,36 @@ function installPresetAutoLoad(node, ctx) {
   return documentChange
 }
 
+function installLightboxModalSemantics(node, ctx) {
+  const existing = lightboxModalObservers.get(node)
+  if (existing) return existing
+
+  const root = ctx.lightbox?.root
+  if (!(root instanceof HTMLElement)) return null
+
+  const sync = () => {
+    if (root.hidden) root.removeAttribute('aria-modal')
+    else root.setAttribute('aria-modal', 'true')
+  }
+  sync()
+
+  // The preview stays mounted while closed. Keep its ARIA modal state tied to the native
+  // `hidden` state so ComfyUI's global modal/keybinding gate never sees a closed preview as open.
+  const observer = new MutationObserver(sync)
+  observer.observe(root, { attributes: true, attributeFilter: ['hidden'] })
+  lightboxModalObservers.set(node, observer)
+
+  const previousRemoved = node.onRemoved
+  node.onRemoved = function (...args) {
+    if (lightboxModalObservers.get(node) === observer) {
+      observer.disconnect()
+      lightboxModalObservers.delete(node)
+    }
+    return previousRemoved?.apply(this, args)
+  }
+  return observer
+}
+
 function installNode(node, attempts = 0) {
   if (!node || node.__bil?.removed || attempts > 120) return
   const ctx = node.__bil
@@ -390,6 +421,7 @@ function installNode(node, attempts = 0) {
   // Install character-preset auto-load as soon as the core node context exists. It is unrelated
   // to batch dragging and must keep working even if the drag extension is delayed or unavailable.
   installPresetAutoLoad(node, ctx)
+  installLightboxModalSemantics(node, ctx)
 
   const ext = ctx.icx
   if (!ext || !ext.batchWindowDrop) {
