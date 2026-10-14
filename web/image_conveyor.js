@@ -2533,7 +2533,10 @@ function imagePropertyLines(properties, item) {
   const summary = []
   const width = Number(properties?.width)
   const height = Number(properties?.height)
-  if (width > 0 && height > 0) summary.push(`${width} × ${height}`)
+  const pixelCount = width * height
+  if (width > 0 && height > 0 && Number.isFinite(pixelCount)) {
+    summary.push(`${width} × ${height}`, `${(pixelCount / 1_000_000).toFixed(2)} MP`)
+  }
   const format = String(properties?.format || '').trim()
   if (format) summary.push(format)
   const bytes = Number(properties?.size ?? item?.size ?? item?.localFile?.size)
