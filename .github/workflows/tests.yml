@@ -41,6 +41,7 @@ jobs:
         run: |
           node --check web/image_conveyor.js
           node --check web/image_conveyor_math.mjs
+          node --check web/media_resolution_status.js
           node --check web/image_conveyor_library_ops.js
           node --check web/image_conveyor_drag_ops.js
           node --check web/image_conveyor_drag_math.mjs
