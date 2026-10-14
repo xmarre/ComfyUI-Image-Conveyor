@@ -3,6 +3,13 @@ import logging
 from . import image_conveyor as _image_conveyor
 from . import image_conveyor_drag_v2_ops as _image_conveyor_drag_v2_ops
 from .image_conveyor import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .media_resolution_router import (
+    NODE_CLASS_MAPPINGS as _MEDIA_NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as _MEDIA_NODE_DISPLAY_NAME_MAPPINGS,
+)
+
+NODE_CLASS_MAPPINGS.update(_MEDIA_NODE_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(_MEDIA_NODE_DISPLAY_NAME_MAPPINGS)
 from .image_conveyor_character_consistency import install_character_consistency
 from .image_conveyor_drag_v2_ops import register_drag_routes
 from .image_conveyor_library_ops import register_library_routes

@@ -19,6 +19,32 @@ New nodes default to **Persistent references** mode:
 
 Additional local folders can be opened as removable browser tabs. The gallery is virtualized and designed to remain responsive with very large collections.
 
+
+## Media Resolution (optional companion node)
+
+**Media Resolution — Image Conveyor** (`ImageConveyorMediaResolution`) replaces the
+separate Float controls, switches, and resizers commonly used to manage
+multiple reference images. It accepts Reference 1–8, first/last frames, and
+one optional video frame batch, and returns one resized IMAGE output per input.
+
+- `use_universal=false`: each input uses its own megapixel widget.
+- `use_universal=true`: the single `universal_megapixels` widget overrides all 11.
+- Float controls use **0.1 MP** increments; input aspect ratios remain independent.
+- `limit_to_source=true` (default) prevents enlarging any reference beyond the pixels present at the router input. When a requested MP value exceeds the native size, the node produces a centered, 32-pixel-aligned **view** of the original pixels without Lanczos interpolation or a full-size resampling allocation. For example, a 1008 × 1512 image (1.52 MP) requested at 1.8 MP is capped at 992 × 1504 (1.49 MP). An image already aligned to 32 pixels passes through unchanged.
+- A compact per-node execution status shows exactly which inputs were capped and their requested, resulting, and incoming native MP. The cap never changes the generation canvas. The opt-out setting allows intentional reference upscaling.
+- Inputs with an axis below 32 pixels cannot be aligned without enlarging that axis; with the cap enabled, the router passes those inputs through at native dimensions and reports the alignment exception. The cap uses the *incoming tensor dimensions*, so upstream enlargement cannot be detected.
+- Empty optional inputs stay `None` and are never passed to the resizer.
+- Cropping, Lanczos interpolation, and 32-pixel alignment use
+  [Scale Image to Total Pixels Advanced](https://github.com/BigStationW/ComfyUi-Scale-Image-to-Total-Pixels-Advanced),
+  which **must be installed** to use this node. Image Conveyor itself
+  remains usable without that optional package.
+- This node controls *conditioning media* dimensions, not the generated
+  output canvas, frame count, or frame rate. Aligned dimensions may remain
+  unchanged across very small megapixel adjustments.
+- Load-video nodes with no selected source should remain disconnected
+  until a file is chosen; wiring an empty loader into any live graph
+  can fail upstream validation.
+
 ## Reference Shelf
 
 The shelf contains eight persistent reference slots above the browser.
